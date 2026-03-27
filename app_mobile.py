@@ -1,3 +1,4 @@
+
 import itertools
 import re
 
@@ -9,7 +10,7 @@ from bs4 import BeautifulSoup
 st.set_page_config(page_title="競輪AI Mobile", layout="centered")
 
 st.title("🚴 競輪AI Mobile")
-st.caption("軽量＆高精度版")
+st.caption("軽量版 / URL読込 / アツバリ / チャッピー買い目")
 
 # ------------------------
 # 初期値
@@ -28,99 +29,222 @@ if "mobile_race_url_text" not in st.session_state:
 # URL読込
 # ------------------------
 
-def normalize_winticket_race_urls(url: str):
+def normalize_winticket_race_urls(url: str) -> tuple[str, str]:
+    url = url.strip()
     m = re.search(
         r"https?://www\.winticket\.jp/keirin/([^/]+)/(racecard|odds)/([^/]+)/([^/]+)/([^/?#]+)",
         url,
     )
     if not m:
-        raise ValueError("URL形式エラー")
+        raise ValueError("WINTICKETのレースURL形式を読み取れませんでした")
 
-    stadium, _, cup_id, day_no, race_no = m.groups()
+    stadium = m.group(1)
+    cup_id = m.group(3)
+    day_no = m.group(4)
+    race_no = m.group(5)
 
     racecard_url = f"https://www.winticket.jp/keirin/{stadium}/racecard/{cup_id}/{day_no}/{race_no}"
     odds_url = f"https://www.winticket.jp/keirin/{stadium}/odds/{cup_id}/{day_no}/{race_no}"
     return racecard_url, odds_url
 
 
-def fetch_html(url):
-    return requests.get(url, headers={"User-Agent": "Mozilla/5.0"}).text
+def fetch_html(url: str) -> str:
+    headers = {
+        "User-Agent": "Mozilla/5.0"
+    }
+    r = requests.get(url, headers=headers, timeout=15)
+    r.raise_for_status()
+    return r.text
 
 
-def extract_lines(html):
+def extract_lines_from_racecard_html(html: str) -> str:
     text = BeautifulSoup(html, "lxml").get_text("\n")
     lines = text.splitlines()
 
-    idx = next(i for i, l in enumerate(lines) if "並び予想" in l)
+    try:
+        idx = next(i for i, line in enumerate(lines) if "並び予想" in line)
+    except StopIteration:
+        raise ValueError("並び予想が見つかりませんでした")
 
-    result, current = [], []
+    buf = []
+    current = []
 
-    for s in lines[idx: idx + 60]:
-        s = s.strip()
-        if s.isdigit():
-            current.append(s)
-        elif s == "区切り":
+    for raw in lines[idx + 1 : idx + 80]:
+        s = raw.strip()
+        if not s:
+            continue
+
+        if s == "区切り":
             if current:
-                result.append("".join(current))
+                buf.append("".join(current))
                 current = []
+            continue
+
+        if re.fullmatch(r"[1-9]", s):
+            current.append(s)
+            continue
+
+        if "基本情報" in s or "オッズ一覧" in s or "投票" in s:
+            break
 
     if current:
-        result.append("".join(current))
+        buf.append("".join(current))
 
-    return "\n".join(result)
+    buf = [x for x in buf if x.isdigit()]
+    if not buf:
+        raise ValueError("並びを抽出できませんでした")
+
+    return "\n".join(buf)
 
 
-def extract_odds(html):
-    matches = re.findall(r"([1-9]-[1-9]-[1-9])\s+(\d+\.\d+)", html)
-    return "\n".join([f"{a} {b}" for a, b in matches[:50]])
+def extract_odds_from_odds_html(html: str, max_items: int = 80) -> str:
+    soup = BeautifulSoup(html, "lxml")
+    text = soup.get_text("\n")
+    script_text = "\n".join(s.get_text(" ", strip=True) for s in soup.find_all("script"))
+
+    candidates = []
+
+    pattern1 = re.findall(
+        r"([1-9])\s*-\s*([1-9])\s*-\s*([1-9])\s+(\d+(?:\.\d+)?)",
+        text
+    )
+    for a, b, c, odds in pattern1:
+        ticket = f"{a}-{b}-{c}"
+        candidates.append((ticket, float(odds)))
+
+    pattern2 = re.findall(
+        r"([1-9]-[1-9]-[1-9])\s+(\d+(?:\.\d+)?)",
+        text
+    )
+    for ticket, odds in pattern2:
+        candidates.append((ticket, float(odds)))
+
+    pattern3 = re.findall(
+        r"([1-9])\s*-\s*([1-9])\s*-\s*([1-9]).{0,80}?(\d+(?:\.\d+)?)",
+        script_text
+    )
+    for a, b, c, odds in pattern3:
+        ticket = f"{a}-{b}-{c}"
+        candidates.append((ticket, float(odds)))
+
+    odds_map = {}
+    for ticket, odds in candidates:
+        if ticket not in odds_map:
+            odds_map[ticket] = odds
+        else:
+            odds_map[ticket] = min(odds_map[ticket], odds)
+
+    cleaned = {}
+    for ticket, odds in odds_map.items():
+        if 1.0 <= odds <= 999999:
+            cleaned[ticket] = odds
+
+    if not cleaned:
+        return ""
+
+    items = sorted(cleaned.items(), key=lambda x: x[1])[:max_items]
+    return "\n".join(f"{ticket} {odds}" for ticket, odds in items)
+
+
+def load_winticket_race_from_url(url: str) -> tuple[str, str]:
+    racecard_url, odds_url = normalize_winticket_race_urls(url)
+    racecard_html = fetch_html(racecard_url)
+    odds_html = fetch_html(odds_url)
+
+    lines_text = extract_lines_from_racecard_html(racecard_html)
+    odds_text = extract_odds_from_odds_html(odds_html)
+
+    return lines_text, odds_text
 
 # ------------------------
-# データ処理
+# 基本処理
 # ------------------------
 
-def parse_lines(text):
-    return [l.strip() for l in text.splitlines() if l.strip()]
+def parse_lines(text: str) -> list[str]:
+    lines = []
+    for raw in text.splitlines():
+        raw = raw.strip().replace("-", "").replace(" ", "").replace("　", "")
+        if raw:
+            lines.append(raw)
+    return lines
 
 
-def parse_odds(text):
-    d = {}
-    for l in text.splitlines():
-        parts = l.split()
+def parse_odds(text: str) -> dict:
+    odds_dict = {}
+    for raw in text.splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+
+        parts = raw.split()
         if len(parts) >= 2:
-            d[parts[0]] = float(parts[1])
-    return d
+            ticket = parts[0]
+            try:
+                odds = float(parts[-1])
+                odds_dict[ticket] = odds
+            except ValueError:
+                pass
+
+    return odds_dict
 
 
-def build_df(lines, mode):
+def build_dataframe(lines: list[str], mode: str) -> pd.DataFrame:
     data = []
     line_no = 1
 
     for line in lines:
-        for i, r in enumerate(line):
+        for pos, r in enumerate(line):
             r = int(r)
-            score = 90 - i * 2
+
+            if mode == "通常モード":
+                score = 90 - pos * 2
+            elif mode == "混戦モード":
+                score = 92 - pos * 3
+            else:
+                score = 91 - pos * 2.5
 
             data.append({
                 "車番": r,
-                "評価": score,
+                "得点": score,
                 "ライン": line_no if len(line) > 1 else 0,
-                "ライン順": i + 1,
-                "人数": len(line)
+                "ライン順": pos + 1 if len(line) > 1 else 0,
+                "ライン人数": len(line)
             })
+
         line_no += 1
 
-    return pd.DataFrame(data)
+    df = pd.DataFrame(data)
+    df["評価"] = df["得点"]
 
-# ------------------------
-# ⭐強化済み予想ロジック
-# ------------------------
+    if mode == "通常モード":
+        df.loc[df["ライン順"] == 1, "評価"] += 5
+        df.loc[df["ライン順"] == 2, "評価"] += 6
+        df.loc[df["ライン順"] == 3, "評価"] += 2
+        df.loc[df["ライン人数"] == 3, "評価"] += 2
 
-def predict(df, mode, odds_dict):
+    elif mode == "混戦モード":
+        df.loc[df["ライン順"] == 1, "評価"] += 5
+        df.loc[df["ライン順"] == 2, "評価"] += 5
+        df.loc[df["ライン順"] == 3, "評価"] += 1
+        df.loc[df["ライン"] == 0, "評価"] += 2
 
-    top = df.sort_values("評価", ascending=False).head(6)
+    else:
+        df.loc[df["ライン順"] == 1, "評価"] += 4
+        df.loc[df["ライン順"] == 2, "評価"] += 4
+        df.loc[df["ライン順"] == 3, "評価"] += 2
+        df.loc[df["ライン"] == 0, "評価"] += 3
+        df.loc[df["ライン人数"] == 3, "評価"] += 1
+
+    return df
+
+
+def predict(df: pd.DataFrame, mode: str, odds_dict: dict) -> pd.DataFrame:
+    top_count = 6 if mode != "混戦モード" else 7
+
+    top = df.sort_values("評価", ascending=False).head(top_count)
     riders = top["車番"].tolist()
-
     tickets = list(itertools.permutations(riders, 3))
+
     result = []
 
     line_strength = df.groupby("ライン")["評価"].sum().to_dict()
@@ -132,62 +256,239 @@ def predict(df, mode, odds_dict):
         r2 = df[df["車番"] == t[1]].iloc[0]
         r3 = df[df["車番"] == t[2]].iloc[0]
 
-        score += r1["評価"] * 1.2
-        score += r2["評価"] * 0.9
-        score += r3["評価"] * 0.6
+        score += r1["評価"] * 1.20
+        score += r2["評価"] * 0.95
+        score += r3["評価"] * 0.65
 
-        # 🔥ライン強化
+        # ライン強弱補正
         if r1["ライン"] != 0:
             score += line_strength.get(r1["ライン"], 0) * 0.05
 
-        if r1["ライン"] == r2["ライン"]:
+        # 同ライン決着
+        if r1["ライン"] == r2["ライン"] and r1["ライン"] != 0:
             score += 10
-        if r2["ライン"] == r3["ライン"]:
+        if r2["ライン"] == r3["ライン"] and r2["ライン"] != 0:
             score += 5
 
-        # 🔥単騎
+        # 単騎強化
         if r1["ライン"] == 0:
             score += 6
         if r2["ライン"] == 0:
             score += 3
 
-        # 🔥ハサミ
+        # ハサミ・別線2着
         if r1["ライン"] != r2["ライン"]:
+            score += 4
+        if mode == "混戦モード" and r1["ライン"] != r2["ライン"]:
             score += 4
 
         ticket = f"{t[0]}-{t[1]}-{t[2]}"
         odds = odds_dict.get(ticket, None)
-        ev = score * odds if odds else None
+        expected = score * odds if odds is not None else None
 
-        result.append([ticket, score, odds, ev])
+        result.append([ticket, score, odds, expected])
 
-    df_res = pd.DataFrame(result, columns=["買い目", "AI評価", "オッズ", "期待値"])
-    return df_res.sort_values("AI評価", ascending=False)
+    result_df = pd.DataFrame(result, columns=["買い目", "AI評価", "オッズ", "期待値"])
+    return result_df.sort_values("AI評価", ascending=False).reset_index(drop=True)
+
+
+def classify_tickets(result: pd.DataFrame) -> pd.DataFrame:
+    ranked = result.copy()
+
+    ai_rank = ranked["AI評価"].rank(ascending=False, method="min")
+    if ranked["期待値"].notna().any():
+        ev_rank = ranked["期待値"].rank(ascending=False, method="min")
+    else:
+        ev_rank = pd.Series([999] * len(ranked), index=ranked.index)
+
+    labels = []
+    for i in range(len(ranked)):
+        a = ai_rank.iloc[i]
+        e = ev_rank.iloc[i]
+
+        if a <= 3 and e <= 5:
+            labels.append("🔥 AI推奨")
+        elif a <= 5:
+            labels.append("🟢 本命")
+        elif e <= 5:
+            labels.append("💰 期待値高")
+        elif a <= 12:
+            labels.append("🟡 穴")
+        else:
+            labels.append("⚪ その他")
+
+    ranked["ランク"] = labels
+    return ranked
+
+
+def build_final_tickets(ranked_result: pd.DataFrame, limit: int = 5) -> pd.DataFrame:
+    picks = []
+
+    for label in ["🔥 AI推奨", "🟢 本命", "💰 期待値高", "🟡 穴"]:
+        subset = ranked_result[ranked_result["ランク"] == label]
+        for _, row in subset.iterrows():
+            if row["買い目"] not in [p["買い目"] for p in picks]:
+                picks.append(row)
+
+    final_df = pd.DataFrame(picks)
+    if len(final_df) > limit:
+        final_df = final_df.head(limit)
+
+    return final_df
+
+
+def tickets_to_text(df: pd.DataFrame) -> str:
+    return "\n".join(df["買い目"].tolist())
+
+
+def get_atsubari_tickets(final_df: pd.DataFrame) -> pd.DataFrame:
+    if len(final_df) == 0:
+        return final_df.copy()
+
+    df2 = final_df.copy()
+    df2 = df2.sort_values(["ランク", "AI評価"], ascending=[True, False]).reset_index(drop=True)
+    return df2.head(2)
+
+
+def get_chappy_tickets(ranked_result: pd.DataFrame) -> pd.DataFrame:
+    if len(ranked_result) == 0:
+        return ranked_result.copy()
+
+    df2 = ranked_result.copy()
+
+    # チャッピー的に「本命1・穴1・期待値1」をバランスで拾う
+    picks = []
+
+    ai_push = df2[df2["ランク"] == "🔥 AI推奨"].head(1)
+    honmei = df2[df2["ランク"] == "🟢 本命"].head(1)
+    ana = df2[df2["ランク"] == "🟡 穴"].head(1)
+    ev = df2[df2["ランク"] == "💰 期待値高"].head(1)
+
+    for part in [ai_push, honmei, ana, ev]:
+        for _, row in part.iterrows():
+            if row["買い目"] not in [p["買い目"] for p in picks]:
+                picks.append(row)
+
+    if not picks:
+        return df2.head(3).copy()
+
+    return pd.DataFrame(picks).head(3)
+
+
+def show_rank_cards(ranked_result: pd.DataFrame):
+    st.markdown("## 🃏 買い目カード")
+
+    ai_push = ranked_result[ranked_result["ランク"] == "🔥 AI推奨"].head(2)
+    honmei = ranked_result[ranked_result["ランク"] == "🟢 本命"].head(2)
+    ana = ranked_result[ranked_result["ランク"] == "🟡 穴"].head(2)
+
+    for title, df_part in [
+        ("🔥 AI推奨", ai_push),
+        ("🟢 本命", honmei),
+        ("🟡 穴", ana),
+    ]:
+        st.markdown(f"### {title}")
+        if len(df_part) > 0:
+            for _, row in df_part.iterrows():
+                st.write(f"{row['買い目']}  | AI:{row['AI評価']:.1f}")
+        else:
+            st.write("該当なし")
 
 # ------------------------
 # UI
 # ------------------------
 
-mode = st.radio("モード", ["通常モード", "混戦モード", "穴モード"])
+mode = st.radio(
+    "モード",
+    ["通常モード", "混戦モード", "穴モード"],
+    horizontal=True,
+    key="mobile_mode"
+)
 
-url = st.text_input("WINTICKET URL")
+st.text_input(
+    "WINTICKETレースURL",
+    key="mobile_race_url_text",
+    placeholder="https://www.winticket.jp/keirin/..."
+)
 
-if st.button("読込"):
-    html1, html2 = normalize_winticket_race_urls(url)
-    st.session_state.mobile_lines_text = extract_lines(fetch_html(html1))
-    st.session_state.mobile_odds_text = extract_odds(fetch_html(html2))
+col1, col2 = st.columns(2)
 
-st.text_area("並び", key="mobile_lines_text")
+with col1:
+    if st.button("URL読込", use_container_width=True):
+        try:
+            loaded_lines, loaded_odds = load_winticket_race_from_url(st.session_state.mobile_race_url_text)
+            st.session_state.mobile_lines_text = loaded_lines
+            if loaded_odds:
+                st.session_state.mobile_odds_text = loaded_odds
+            st.success("読み込みOK")
+        except Exception as e:
+            st.error(f"失敗: {e}")
 
-if st.button("予想"):
+with col2:
+    run_button = st.button("予想する", use_container_width=True)
+
+st.text_area("並び", key="mobile_lines_text", height=120)
+
+if run_button:
     lines = parse_lines(st.session_state.mobile_lines_text)
-    odds = parse_odds(st.session_state.mobile_odds_text)
+    odds_dict = parse_odds(st.session_state.mobile_odds_text)
 
-    df = build_df(lines, mode)
-    res = predict(df, mode, odds)
+    if not lines:
+        st.error("並びを入力してください")
+    else:
+        df = build_dataframe(lines, mode)
+        result = predict(df, mode, odds_dict)
+        ranked_result = classify_tickets(result)
+        final_df = build_final_tickets(ranked_result, limit=5)
+        atsubari_df = get_atsubari_tickets(final_df)
+        chappy_df = get_chappy_tickets(ranked_result)
 
-    st.write("## 最終買い目")
-    st.dataframe(res.head(5))
+        st.markdown("## ✅ 最終買い目候補")
+        st.dataframe(
+            final_df[["買い目", "ランク", "AI評価", "オッズ", "期待値"]],
+            use_container_width=True,
+            hide_index=True
+        )
 
-    st.write("## ランキング")
-    st.dataframe(res.head(15))
+        st.text_area(
+            "最終買い目 コピー用",
+            value=tickets_to_text(final_df),
+            height=120
+        )
+
+        st.markdown("## 💥 アツバリ買い目")
+        st.dataframe(
+            atsubari_df[["買い目", "ランク", "AI評価", "オッズ", "期待値"]],
+            use_container_width=True,
+            hide_index=True
+        )
+
+        st.text_area(
+            "アツバリ コピー用",
+            value=tickets_to_text(atsubari_df),
+            height=80
+        )
+
+        st.markdown("## 😎 チャッピー買い目")
+        st.dataframe(
+            chappy_df[["買い目", "ランク", "AI評価", "オッズ", "期待値"]],
+            use_container_width=True,
+            hide_index=True
+        )
+
+        st.text_area(
+            "チャッピー買い目 コピー用",
+            value=tickets_to_text(chappy_df),
+            height=90
+        )
+
+        show_rank_cards(ranked_result)
+
+        st.markdown("## 🎯 買い目ランク")
+        st.dataframe(
+            ranked_result[["買い目", "ランク", "AI評価", "オッズ", "期待値"]].head(15),
+            use_container_width=True,
+            hide_index=True
+        )
+else:
+    st.info("URLを入れて『URL読込』→『予想する』")
