@@ -1,4 +1,3 @@
-
 import itertools
 import re
 
@@ -10,13 +9,14 @@ from bs4 import BeautifulSoup
 st.set_page_config(page_title="競輪AI Mobile", layout="centered")
 
 st.title("🚴 競輪AI Mobile")
-st.caption("軽量版 / URL読込 / アツバリ / チャッピー買い目")
+st.caption("事前精度UP版 / 軽量 / 7車9車対応 / ハサミ強化 / 単騎強化")
 
 # ------------------------
 # 初期値
 # ------------------------
 
 default_lines_7 = "147\n25\n3\n6"
+default_lines_9 = "123\n456\n78\n9"
 
 if "mobile_lines_text" not in st.session_state:
     st.session_state.mobile_lines_text = default_lines_7
@@ -24,6 +24,8 @@ if "mobile_odds_text" not in st.session_state:
     st.session_state.mobile_odds_text = ""
 if "mobile_race_url_text" not in st.session_state:
     st.session_state.mobile_race_url_text = ""
+if "mobile_race_size" not in st.session_state:
+    st.session_state.mobile_race_size = "7車"
 
 # ------------------------
 # URL読込
@@ -49,9 +51,7 @@ def normalize_winticket_race_urls(url: str) -> tuple[str, str]:
 
 
 def fetch_html(url: str) -> str:
-    headers = {
-        "User-Agent": "Mozilla/5.0"
-    }
+    headers = {"User-Agent": "Mozilla/5.0"}
     r = requests.get(url, headers=headers, timeout=15)
     r.raise_for_status()
     return r.text
@@ -69,7 +69,7 @@ def extract_lines_from_racecard_html(html: str) -> str:
     buf = []
     current = []
 
-    for raw in lines[idx + 1 : idx + 80]:
+    for raw in lines[idx + 1: idx + 80]:
         s = raw.strip()
         if not s:
             continue
@@ -97,7 +97,7 @@ def extract_lines_from_racecard_html(html: str) -> str:
     return "\n".join(buf)
 
 
-def extract_odds_from_odds_html(html: str, max_items: int = 80) -> str:
+def extract_odds_from_odds_html(html: str, max_items: int = 100) -> str:
     soup = BeautifulSoup(html, "lxml")
     text = soup.get_text("\n")
     script_text = "\n".join(s.get_text(" ", strip=True) for s in soup.find_all("script"))
@@ -109,8 +109,7 @@ def extract_odds_from_odds_html(html: str, max_items: int = 80) -> str:
         text
     )
     for a, b, c, odds in pattern1:
-        ticket = f"{a}-{b}-{c}"
-        candidates.append((ticket, float(odds)))
+        candidates.append((f"{a}-{b}-{c}", float(odds)))
 
     pattern2 = re.findall(
         r"([1-9]-[1-9]-[1-9])\s+(\d+(?:\.\d+)?)",
@@ -124,8 +123,7 @@ def extract_odds_from_odds_html(html: str, max_items: int = 80) -> str:
         script_text
     )
     for a, b, c, odds in pattern3:
-        ticket = f"{a}-{b}-{c}"
-        candidates.append((ticket, float(odds)))
+        candidates.append((f"{a}-{b}-{c}", float(odds)))
 
     odds_map = {}
     for ticket, odds in candidates:
@@ -150,23 +148,19 @@ def load_winticket_race_from_url(url: str) -> tuple[str, str]:
     racecard_url, odds_url = normalize_winticket_race_urls(url)
     racecard_html = fetch_html(racecard_url)
     odds_html = fetch_html(odds_url)
-
-    lines_text = extract_lines_from_racecard_html(racecard_html)
-    odds_text = extract_odds_from_odds_html(odds_html)
-
-    return lines_text, odds_text
+    return extract_lines_from_racecard_html(racecard_html), extract_odds_from_odds_html(odds_html)
 
 # ------------------------
 # 基本処理
 # ------------------------
 
 def parse_lines(text: str) -> list[str]:
-    lines = []
+    result = []
     for raw in text.splitlines():
-        raw = raw.strip().replace("-", "").replace(" ", "").replace("　", "")
-        if raw:
-            lines.append(raw)
-    return lines
+        s = raw.strip().replace("-", "").replace(" ", "").replace("　", "")
+        if s:
+            result.append(s)
+    return result
 
 
 def parse_odds(text: str) -> dict:
@@ -175,16 +169,12 @@ def parse_odds(text: str) -> dict:
         raw = raw.strip()
         if not raw:
             continue
-
         parts = raw.split()
         if len(parts) >= 2:
-            ticket = parts[0]
             try:
-                odds = float(parts[-1])
-                odds_dict[ticket] = odds
+                odds_dict[parts[0]] = float(parts[-1])
             except ValueError:
                 pass
-
     return odds_dict
 
 
@@ -210,7 +200,6 @@ def build_dataframe(lines: list[str], mode: str) -> pd.DataFrame:
                 "ライン順": pos + 1 if len(line) > 1 else 0,
                 "ライン人数": len(line)
             })
-
         line_no += 1
 
     df = pd.DataFrame(data)
@@ -221,13 +210,11 @@ def build_dataframe(lines: list[str], mode: str) -> pd.DataFrame:
         df.loc[df["ライン順"] == 2, "評価"] += 6
         df.loc[df["ライン順"] == 3, "評価"] += 2
         df.loc[df["ライン人数"] == 3, "評価"] += 2
-
     elif mode == "混戦モード":
         df.loc[df["ライン順"] == 1, "評価"] += 5
         df.loc[df["ライン順"] == 2, "評価"] += 5
         df.loc[df["ライン順"] == 3, "評価"] += 1
         df.loc[df["ライン"] == 0, "評価"] += 2
-
     else:
         df.loc[df["ライン順"] == 1, "評価"] += 4
         df.loc[df["ライン順"] == 2, "評価"] += 4
@@ -238,49 +225,86 @@ def build_dataframe(lines: list[str], mode: str) -> pd.DataFrame:
     return df
 
 
-def predict(df: pd.DataFrame, mode: str, odds_dict: dict) -> pd.DataFrame:
-    top_count = 6 if mode != "混戦モード" else 7
+def predict(df: pd.DataFrame, mode: str, race_size: str, odds_dict: dict) -> pd.DataFrame:
+    if mode == "通常モード":
+        top_count = 5 if race_size == "7車" else 6
+    elif mode == "混戦モード":
+        top_count = 7
+    else:
+        top_count = 6 if race_size == "7車" else 7
 
     top = df.sort_values("評価", ascending=False).head(top_count)
-    riders = top["車番"].tolist()
-    tickets = list(itertools.permutations(riders, 3))
+    riders_list = top["車番"].tolist()
+    tickets = list(itertools.permutations(riders_list, 3))
 
     result = []
-
     line_strength = df.groupby("ライン")["評価"].sum().to_dict()
 
-    for t in tickets:
-        score = 0
+    sorted_lines = sorted(
+        [(k, v) for k, v in line_strength.items() if k != 0],
+        key=lambda x: x[1],
+        reverse=True
+    )
+    line_gap = 0
+    if len(sorted_lines) >= 2:
+        line_gap = sorted_lines[0][1] - sorted_lines[1][1]
 
+    for t in tickets:
         r1 = df[df["車番"] == t[0]].iloc[0]
         r2 = df[df["車番"] == t[1]].iloc[0]
         r3 = df[df["車番"] == t[2]].iloc[0]
 
-        score += r1["評価"] * 1.20
-        score += r2["評価"] * 0.95
-        score += r3["評価"] * 0.65
+        weights = [1.2, 0.95, 0.65] if mode != "穴モード" else [1.15, 1.0, 0.75]
+        score = r1["評価"] * weights[0] + r2["評価"] * weights[1] + r3["評価"] * weights[2]
 
-        # ライン強弱補正
         if r1["ライン"] != 0:
             score += line_strength.get(r1["ライン"], 0) * 0.05
 
-        # 同ライン決着
         if r1["ライン"] == r2["ライン"] and r1["ライン"] != 0:
             score += 10
         if r2["ライン"] == r3["ライン"] and r2["ライン"] != 0:
             score += 5
 
-        # 単騎強化
-        if r1["ライン"] == 0:
+        if (
+            r1["ライン"] == r2["ライン"]
+            and r1["ライン"] != 0
+            and r1["ライン順"] == 1
+            and r2["ライン順"] == 2
+        ):
             score += 6
-        if r2["ライン"] == 0:
-            score += 3
 
-        # ハサミ・別線2着
-        if r1["ライン"] != r2["ライン"]:
-            score += 4
+        if r1["ライン"] == 0:
+            score += 2
+            if mode in ["混戦モード", "穴モード"]:
+                score += 3
+
+        if r2["ライン"] == 0:
+            score += 1
+            if mode in ["混戦モード", "穴モード"]:
+                score += 2
+
+        if (
+            r1["ライン"] != 0
+            and r2["ライン"] != 0
+            and r3["ライン"] != 0
+            and r1["ライン"] == r3["ライン"]
+            and r1["ライン"] != r2["ライン"]
+        ):
+            score += 7
+            if mode == "混戦モード":
+                score += 3
+
+        if line_gap < 8:
+            if r1["ライン"] != r2["ライン"]:
+                score += 3
+        if line_gap >= 12:
+            if r1["ライン"] == r2["ライン"] and r1["ライン"] != 0:
+                score += 4
+
         if mode == "混戦モード" and r1["ライン"] != r2["ライン"]:
-            score += 4
+            score += 3
+        if mode == "穴モード" and r1["ライン"] != r2["ライン"]:
+            score += 3
 
         ticket = f"{t[0]}-{t[1]}-{t[2]}"
         odds = odds_dict.get(ticket, None)
@@ -337,42 +361,34 @@ def build_final_tickets(ranked_result: pd.DataFrame, limit: int = 5) -> pd.DataF
     return final_df
 
 
-def tickets_to_text(df: pd.DataFrame) -> str:
-    return "\n".join(df["買い目"].tolist())
-
-
-def get_atsubari_tickets(final_df: pd.DataFrame) -> pd.DataFrame:
+def get_atsubari_tickets(final_df: pd.DataFrame, race_size: str) -> pd.DataFrame:
     if len(final_df) == 0:
         return final_df.copy()
-
-    df2 = final_df.copy()
-    df2 = df2.sort_values(["ランク", "AI評価"], ascending=[True, False]).reset_index(drop=True)
-    return df2.head(2)
+    pick_n = 2 if race_size == "7車" else 3
+    return final_df.sort_values(["ランク", "AI評価"], ascending=[True, False]).head(pick_n).reset_index(drop=True)
 
 
 def get_chappy_tickets(ranked_result: pd.DataFrame) -> pd.DataFrame:
     if len(ranked_result) == 0:
         return ranked_result.copy()
 
-    df2 = ranked_result.copy()
-
-    # チャッピー的に「本命1・穴1・期待値1」をバランスで拾う
     picks = []
-
-    ai_push = df2[df2["ランク"] == "🔥 AI推奨"].head(1)
-    honmei = df2[df2["ランク"] == "🟢 本命"].head(1)
-    ana = df2[df2["ランク"] == "🟡 穴"].head(1)
-    ev = df2[df2["ランク"] == "💰 期待値高"].head(1)
-
-    for part in [ai_push, honmei, ana, ev]:
-        for _, row in part.iterrows():
+    for label in ["🔥 AI推奨", "🟢 本命", "🟡 穴", "💰 期待値高"]:
+        subset = ranked_result[ranked_result["ランク"] == label].head(1)
+        for _, row in subset.iterrows():
             if row["買い目"] not in [p["買い目"] for p in picks]:
                 picks.append(row)
 
     if not picks:
-        return df2.head(3).copy()
+        return ranked_result.head(3).copy()
 
     return pd.DataFrame(picks).head(3)
+
+
+def tickets_to_text(df: pd.DataFrame) -> str:
+    if len(df) == 0:
+        return ""
+    return "\n".join(df["買い目"].tolist())
 
 
 def show_rank_cards(ranked_result: pd.DataFrame):
@@ -382,15 +398,11 @@ def show_rank_cards(ranked_result: pd.DataFrame):
     honmei = ranked_result[ranked_result["ランク"] == "🟢 本命"].head(2)
     ana = ranked_result[ranked_result["ランク"] == "🟡 穴"].head(2)
 
-    for title, df_part in [
-        ("🔥 AI推奨", ai_push),
-        ("🟢 本命", honmei),
-        ("🟡 穴", ana),
-    ]:
+    for title, df_part in [("🔥 AI推奨", ai_push), ("🟢 本命", honmei), ("🟡 穴", ana)]:
         st.markdown(f"### {title}")
         if len(df_part) > 0:
             for _, row in df_part.iterrows():
-                st.write(f"{row['買い目']}  | AI:{row['AI評価']:.1f}")
+                st.write(f"{row['買い目']} | AI:{row['AI評価']:.1f}")
         else:
             st.write("該当なし")
 
@@ -398,22 +410,14 @@ def show_rank_cards(ranked_result: pd.DataFrame):
 # UI
 # ------------------------
 
-mode = st.radio(
-    "モード",
-    ["通常モード", "混戦モード", "穴モード"],
-    horizontal=True,
-    key="mobile_mode"
-)
+race_size = st.radio("車立て", ["7車", "9車"], horizontal=True, key="mobile_race_size")
+mode = st.radio("モード", ["通常モード", "混戦モード", "穴モード"], horizontal=True, key="mobile_mode")
 
-st.text_input(
-    "WINTICKETレースURL",
-    key="mobile_race_url_text",
-    placeholder="https://www.winticket.jp/keirin/..."
-)
+st.text_input("WINTICKETレースURL", key="mobile_race_url_text", placeholder="https://www.winticket.jp/keirin/...")
 
-col1, col2 = st.columns(2)
+c1, c2, c3 = st.columns(3)
 
-with col1:
+with c1:
     if st.button("URL読込", use_container_width=True):
         try:
             loaded_lines, loaded_odds = load_winticket_race_from_url(st.session_state.mobile_race_url_text)
@@ -424,10 +428,19 @@ with col1:
         except Exception as e:
             st.error(f"失敗: {e}")
 
-with col2:
-    run_button = st.button("予想する", use_container_width=True)
+with c2:
+    if st.button("7車初期化", use_container_width=True):
+        st.session_state.mobile_lines_text = default_lines_7
+        st.session_state.mobile_race_size = "7車"
+
+with c3:
+    if st.button("9車初期化", use_container_width=True):
+        st.session_state.mobile_lines_text = default_lines_9
+        st.session_state.mobile_race_size = "9車"
 
 st.text_area("並び", key="mobile_lines_text", height=120)
+
+run_button = st.button("予想する", use_container_width=True)
 
 if run_button:
     lines = parse_lines(st.session_state.mobile_lines_text)
@@ -437,10 +450,10 @@ if run_button:
         st.error("並びを入力してください")
     else:
         df = build_dataframe(lines, mode)
-        result = predict(df, mode, odds_dict)
+        result = predict(df, mode, race_size, odds_dict)
         ranked_result = classify_tickets(result)
         final_df = build_final_tickets(ranked_result, limit=5)
-        atsubari_df = get_atsubari_tickets(final_df)
+        atsubari_df = get_atsubari_tickets(final_df, race_size)
         chappy_df = get_chappy_tickets(ranked_result)
 
         st.markdown("## ✅ 最終買い目候補")
@@ -450,11 +463,7 @@ if run_button:
             hide_index=True
         )
 
-        st.text_area(
-            "最終買い目 コピー用",
-            value=tickets_to_text(final_df),
-            height=120
-        )
+        st.text_area("最終買い目 コピー用", value=tickets_to_text(final_df), height=110)
 
         st.markdown("## 💥 アツバリ買い目")
         st.dataframe(
@@ -463,11 +472,7 @@ if run_button:
             hide_index=True
         )
 
-        st.text_area(
-            "アツバリ コピー用",
-            value=tickets_to_text(atsubari_df),
-            height=80
-        )
+        st.text_area("アツバリ コピー用", value=tickets_to_text(atsubari_df), height=80)
 
         st.markdown("## 😎 チャッピー買い目")
         st.dataframe(
@@ -476,19 +481,16 @@ if run_button:
             hide_index=True
         )
 
-        st.text_area(
-            "チャッピー買い目 コピー用",
-            value=tickets_to_text(chappy_df),
-            height=90
-        )
+        st.text_area("チャッピー買い目 コピー用", value=tickets_to_text(chappy_df), height=90)
 
         show_rank_cards(ranked_result)
 
         st.markdown("## 🎯 買い目ランク")
         st.dataframe(
-            ranked_result[["買い目", "ランク", "AI評価", "オッズ", "期待値"]].head(15),
+            ranked_result[["買い目", "ランク", "AI評価", "オッズ", "期待値"]].head(12),
             use_container_width=True,
             hide_index=True
         )
+
 else:
     st.info("URLを入れて『URL読込』→『予想する』")
