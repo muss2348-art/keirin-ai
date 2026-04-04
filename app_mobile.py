@@ -157,8 +157,7 @@ def parse_line_text(line_text: str):
         .replace("　", " ")
         .replace("-", " ")
         .replace("/", "|")
-        .replace("
-", "|")
+        .replace("", "|")
     )
     groups = [g.strip() for g in normalized.split("|") if g.strip()]
 
