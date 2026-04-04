@@ -157,7 +157,8 @@ def parse_line_text(line_text: str):
         .replace("　", " ")
         .replace("-", " ")
         .replace("/", "|")
-        .replace("", "|")
+        .replace("
+", "|")
     )
     groups = [g.strip() for g in normalized.split("|") if g.strip()]
 
@@ -240,7 +241,7 @@ def analyze_lines(line_text: str) -> tuple[pd.DataFrame, str]:
 
             rows.append({
                 "ライン": idx,
-                "車番": num,
+                "車番": str(num),
                 "位置": pos,
                 "役割": role,
                 "ライン人数": line_len,
@@ -288,8 +289,8 @@ def estimate_odds_from_structure(combo: str, line_text: str, mode_name: str) -> 
     pos_map = {}
     for line_idx, line in enumerate(lines, start=1):
         for pos_idx, num in enumerate(line, start=1):
-            line_map[num] = line_idx
-            pos_map[num] = pos_idx
+            line_map[str(num)] = line_idx
+            pos_map[str(num)] = pos_idx
 
     same_line_pairs = 0
     for a, b in [(nums[0], nums[1]), (nums[1], nums[2]), (nums[0], nums[2])]:
@@ -302,8 +303,10 @@ def estimate_odds_from_structure(combo: str, line_text: str, mode_name: str) -> 
     for n in nums:
         if pos_map.get(n) == 2:
             odds -= 4
-        if len(lines[line_map.get(n)-1]) == 1 if line_map.get(n) else False:
-            odds += 10
+        if line_map.get(n):
+            target_line = lines[line_map[n] - 1]
+            if len(target_line) == 1:
+                odds += 10
 
     if mode_name == "穴モード":
         odds += 20
@@ -340,8 +343,8 @@ def score_combo(combo: str, line_text: str, mode_name: str):
     pos_map = {}
     for line_idx, line in enumerate(lines, start=1):
         for pos_idx, num in enumerate(line, start=1):
-            line_map[num] = line_idx
-            pos_map[num] = pos_idx
+            line_map[str(num)] = line_idx
+            pos_map[str(num)] = pos_idx
 
     if line_map.get(a) == line_map.get(b):
         score += 14
@@ -354,13 +357,17 @@ def score_combo(combo: str, line_text: str, mode_name: str):
         score += 6
     if pos_map.get(a) == 1:
         score += 5
-    if len(lines[line_map.get(a)-1]) == 1 if line_map.get(a) else False:
-        score += 7
+    if line_map.get(a):
+        target_line = lines[line_map[a] - 1]
+        if len(target_line) == 1:
+            score += 7
 
     if mode_name == "通常モード" and pos_map.get(a) == 2:
         score += 2
-    if mode_name == "穴モード" and len(lines[line_map.get(a)-1]) == 1 if line_map.get(a) else False:
-        score += 6
+    if mode_name == "穴モード" and line_map.get(a):
+        target_line = lines[line_map[a] - 1]
+        if len(target_line) == 1:
+            score += 6
 
     odds = estimate_odds_from_structure(combo, line_text, mode_name)
     hit_rate = min(85.0, max(8.0, round(score * 0.9, 1)))
@@ -370,9 +377,27 @@ def score_combo(combo: str, line_text: str, mode_name: str):
 
 def generate_bets(mode_name: str, display_count: int, line_text: str):
     head_nums, second_nums, third_nums = pick_key_numbers(line_text)
-    if not head_nums or not second_nums or not third_nums:
+    rows = []
+
+    if head_nums and second_nums and third_nums:
+        candidate_set = set()
+        for a in head_nums[:5]:
+            for b in second_nums[:6]:
+                for c in third_nums[:7]:
+                    if len({a, b, c}) == 3:
+                        candidate_set.add(f"{a}-{b}-{c}")
+
+        for combo in candidate_set:
+            score, hit_rate, odds, value = score_combo(combo, line_text, mode_name)
+            rows.append({
+                "買い目": combo,
+                "AI評価": round(score, 1),
+                "的中率": hit_rate,
+                "想定オッズ": odds,
+                "期待値": value,
+            })
+    else:
         fallback = ["1-2-3", "1-3-2", "2-1-3", "2-3-1", "3-1-2", "3-2-1"]
-        rows = []
         for combo in fallback[:display_count]:
             score, hit_rate, odds, value = score_combo(combo, line_text, mode_name)
             rows.append({
@@ -382,25 +407,6 @@ def generate_bets(mode_name: str, display_count: int, line_text: str):
                 "想定オッズ": odds,
                 "期待値": value,
             })
-        return pd.DataFrame(rows)
-
-    candidate_set = set()
-    for a in head_nums[:5]:
-        for b in second_nums[:6]:
-            for c in third_nums[:7]:
-                if len({a, b, c}) == 3:
-                    candidate_set.add(f"{a}-{b}-{c}")
-
-    rows = []
-    for combo in candidate_set:
-        score, hit_rate, odds, value = score_combo(combo, line_text, mode_name)
-        rows.append({
-            "買い目": combo,
-            "AI評価": round(score, 1),
-            "的中率": hit_rate,
-            "想定オッズ": odds,
-            "期待値": value,
-        })
 
     df = pd.DataFrame(rows)
     if df.empty:
@@ -424,6 +430,100 @@ def build_rank_label(row):
     if row["的中率"] >= 40:
         return "🟢 本命"
     return "🟡 穴"
+
+
+def save_prediction_log(race_name, race_url, predict_type, mode_name, mode_reason, buy_points, bet_amount, final_bets, memo=""):
+    total_amount = buy_points * bet_amount
+    bet_text = " / ".join(final_bets) if final_bets else ""
+    save_id = datetime.now().strftime("%Y%m%d%H%M%S%f")
+
+    row = pd.DataFrame([{
+        "ID": save_id,
+        "保存日時": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "レース名": race_name,
+        "レースURL": race_url,
+        "券種": predict_type,
+        "モード": mode_name,
+        "モード判定理由": mode_reason,
+        "買い目点数": buy_points,
+        "1点金額": bet_amount,
+        "合計金額": total_amount,
+        "買い目一覧": bet_text,
+        "メモ": memo,
+        "並び": st.session_state.get("line_text", ""),
+        "AIサマリー": st.session_state.get("ai_summary", ""),
+    }])
+
+    old = pd.read_csv(LOG_PATH, encoding="utf-8-sig")
+    pd.concat([old, row], ignore_index=True).to_csv(LOG_PATH, index=False, encoding="utf-8-sig")
+    return save_id
+
+
+def load_prediction_log():
+    try:
+        df = pd.read_csv(LOG_PATH, encoding="utf-8-sig")
+        if df.empty:
+            return df
+        return df.sort_values("保存日時", ascending=False)
+    except Exception as e:
+        st.error(f"予想履歴の読込エラー: {e}")
+        return pd.DataFrame()
+
+
+def load_result_log():
+    try:
+        df = pd.read_csv(RESULT_LOG_PATH, encoding="utf-8-sig")
+        if df.empty:
+            return df
+        return df.sort_values("登録日時", ascending=False)
+    except Exception as e:
+        st.error(f"結果履歴の読込エラー: {e}")
+        return pd.DataFrame()
+
+
+def save_result_log(pred_id, race_name, rank1, rank2, rank3, payout, investment, hit):
+    row = pd.DataFrame([{
+        "予想ID": pred_id,
+        "登録日時": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "レース名": race_name,
+        "着順1": rank1,
+        "着順2": rank2,
+        "着順3": rank3,
+        "的中": "的中" if hit else "ハズレ",
+        "払戻": payout,
+        "投資額": investment,
+        "収支": payout - investment,
+    }])
+
+    old = pd.read_csv(RESULT_LOG_PATH, encoding="utf-8-sig")
+    pd.concat([old, row], ignore_index=True).to_csv(RESULT_LOG_PATH, index=False, encoding="utf-8-sig")
+
+
+def calc_summary(pred_df, result_df):
+    total_races = len(pred_df) if not pred_df.empty else 0
+    total_investment = 0
+    total_payout = 0
+    hit_count = 0
+
+    if not result_df.empty:
+        total_investment = pd.to_numeric(result_df["投資額"], errors="coerce").fillna(0).sum()
+        total_payout = pd.to_numeric(result_df["払戻"], errors="coerce").fillna(0).sum()
+        hit_count = (result_df["的中"] == "的中").sum()
+
+    hit_rate = (hit_count / len(result_df) * 100) if len(result_df) > 0 else 0
+    recovery_rate = (total_payout / total_investment * 100) if total_investment > 0 else 0
+    profit = total_payout - total_investment
+
+    return {
+        "総予想数": total_races,
+        "結果登録数": len(result_df),
+        "的中数": hit_count,
+        "的中率": hit_rate,
+        "投資額": total_investment,
+        "払戻": total_payout,
+        "回収率": recovery_rate,
+        "収支": profit,
+    }
 
 
 # =====================================
@@ -463,7 +563,6 @@ def fetch_line_from_winticket(url: str, car_count: str):
         parts = []
         used = set()
         total = 0
-
         for g in groups:
             nums = []
             for item in g:
@@ -475,7 +574,6 @@ def fetch_line_from_winticket(url: str, car_count: str):
                 total += len(nums)
             if total >= need:
                 break
-
         if total < need:
             return ""
 
@@ -489,7 +587,6 @@ def fetch_line_from_winticket(url: str, car_count: str):
             if seg:
                 trimmed.append(seg)
                 count += len(seg)
-
         if count != need:
             return ""
 
@@ -539,9 +636,7 @@ def fetch_line_from_winticket(url: str, car_count: str):
 
         candidates = dedupe_candidates(candidates)
         if candidates:
-            pd.DataFrame(candidates).sort_values(["y", "x"]).to_csv(
-                DEBUG_POS_PATH, index=False, encoding="utf-8-sig"
-            )
+            pd.DataFrame(candidates).sort_values(["y", "x"]).to_csv(DEBUG_POS_PATH, index=False, encoding="utf-8-sig")
 
         need = 7 if car_count == "7車" else 9
         y_groups = {}
@@ -747,16 +842,8 @@ def render_predict_screen():
                 buy_points=len(bet_list),
                 bet_amount=st.session_state.bet_amount,
                 final_bets=bet_list,
-                memo=st.session_state.memo_input + (f" / {st.session_state.ai_summary}" if st.session_state.ai_summary else ""),
+                memo=st.session_state.memo_input,
             )
-            # 保存後に追加列を更新
-            try:
-                pred_df = pd.read_csv(LOG_PATH, encoding="utf-8-sig")
-                pred_df.loc[pred_df.index[-1], "並び"] = st.session_state.line_text
-                pred_df.loc[pred_df.index[-1], "AIサマリー"] = st.session_state.ai_summary
-                pred_df.to_csv(LOG_PATH, index=False, encoding="utf-8-sig")
-            except Exception:
-                pass
             st.success("保存しました")
             st.session_state.screen = "結果一覧"
             st.session_state.memo_input = ""
@@ -817,7 +904,6 @@ def render_result_input_screen():
         rank3 = st.number_input("3着", min_value=1, max_value=9, value=3, step=1)
 
     payout = st.number_input("払戻金", min_value=0, step=100, value=0)
-
     result_combo = f"{rank1}-{rank2}-{rank3}"
     hit = result_combo in buy_list_text.split(" / ")
 
