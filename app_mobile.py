@@ -569,6 +569,164 @@ def calc_summary(pred_df, result_df):
 
 
 # =====================================
+# WINTICKET 並び取得
+# requests版（Cloud/iPhone向け）
+# =====================================
+def fetch_line_from_winticket(url: str, car_count: str):
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+
+    def clean_groups(groups):
+        result = []
+        for g in groups:
+            nums = [str(x) for x in g if str(x).isdigit()]
+            if nums:
+                result.append(nums)
+        return result
+
+    def valid_line(groups, need):
+        flat = [n for g in groups for n in g]
+        if len(flat) < need:
+            return ""
+        flat = flat[:need]
+
+        trimmed = []
+        count = 0
+        for g in groups:
+            remain = need - count
+            if remain <= 0:
+                break
+            seg = g[:remain]
+            if seg:
+                trimmed.append(seg)
+                count += len(seg)
+        if count != need:
+            return ""
+
+        return " / ".join(" ".join(seg) for seg in trimmed)
+
+    def parse_vertical_number_block(text, need):
+        lines = [line.strip() for line in text.splitlines()]
+        numeric_lines = [line for line in lines if re.fullmatch(r"[1-9]", line)]
+        if len(numeric_lines) < need:
+            return ""
+
+        for i in range(len(numeric_lines) - need + 1):
+            chunk = numeric_lines[i:i + need]
+            uniq = []
+            seen = set()
+            for x in chunk:
+                if x not in seen:
+                    uniq.append(x)
+                    seen.add(x)
+            if len(uniq) != need:
+                continue
+
+            if need == 7:
+                candidates = [
+                    [[uniq[0], uniq[1], uniq[2]], [uniq[3]], [uniq[4], uniq[5]], [uniq[6]]],
+                    [[uniq[0], uniq[1], uniq[2]], [uniq[3], uniq[4]], [uniq[5], uniq[6]]],
+                    [[uniq[0], uniq[1]], [uniq[2], uniq[3]], [uniq[4], uniq[5]], [uniq[6]]],
+                ]
+            else:
+                candidates = [
+                    [uniq[0:3], uniq[3:6], uniq[6:9]],
+                    [uniq[0:3], uniq[3:5], uniq[5:7], uniq[7:9]],
+                ]
+
+            for groups in candidates:
+                line = valid_line(clean_groups(groups), need)
+                if line:
+                    return line
+        return ""
+
+    def parse_jsonish_strings(text, need):
+        found = []
+
+        patterns = [
+            r"(?:line|formation|arrangement|並び|ライン)[^\[]{0,30}\[([^\]]{5,200})\]",
+            r"(?:line|formation|arrangement|並び|ライン)[^\{]{0,30}\{([^\}]{5,300})\}",
+            r"([1-9](?:\s+[1-9]){1,3}\s*/\s*[1-9](?:\s+[1-9]){0,3}(?:\s*/\s*[1-9](?:\s+[1-9]){0,3})*)",
+        ]
+
+        for pattern in patterns:
+            for m in re.finditer(pattern, text, re.IGNORECASE):
+                raw = m.group(1)
+                nums = re.findall(r"[1-9]", raw)
+                if len(nums) >= need:
+                    nums = nums[:need]
+                    if need == 7:
+                        candidates = [
+                            [[nums[0], nums[1], nums[2]], [nums[3]], [nums[4], nums[5]], [nums[6]]],
+                            [[nums[0], nums[1], nums[2]], [nums[3], nums[4]], [nums[5], nums[6]]],
+                        ]
+                    else:
+                        candidates = [[nums[0:3], nums[3:6], nums[6:9]]]
+
+                    for groups in candidates:
+                        line = valid_line(clean_groups(groups), need)
+                        if line and line not in found:
+                            found.append(line)
+        return found
+
+    try:
+        response = requests.get(url, headers=headers, timeout=20)
+        response.raise_for_status()
+        html = response.text
+
+        with open(DEBUG_HTML_PATH, "w", encoding="utf-8") as f:
+            f.write(html)
+
+        soup = BeautifulSoup(html, "lxml")
+        text = soup.get_text("\n", strip=True)
+        with open(DEBUG_TEXT_PATH, "w", encoding="utf-8") as f:
+            f.write(text)
+
+        need = 7 if car_count == "7車" else 9
+
+        line = parse_vertical_number_block(text, need)
+        if line:
+            return line, f"テキスト縦並びから抽出: {line}"
+
+        script_text = "\n".join([s.get_text(" ", strip=True) for s in soup.find_all("script")])
+        candidates = parse_jsonish_strings(script_text, need)
+        if candidates:
+            return candidates[0], f"script内データから抽出: {candidates[0]}"
+
+        candidates = parse_jsonish_strings(html, need)
+        if candidates:
+            return candidates[0], f"HTML内データから抽出: {candidates[0]}"
+
+        nums = re.findall(r"\b[1-9]\b", text)
+        uniq = []
+        seen = set()
+        for n in nums:
+            if n not in seen:
+                uniq.append(n)
+                seen.add(n)
+            if len(uniq) >= need:
+                break
+
+        if len(uniq) >= need:
+            if need == 7:
+                fallback_groups = [[uniq[0], uniq[1], uniq[2]], [uniq[3]], [uniq[4], uniq[5]], [uniq[6]]]
+            else:
+                fallback_groups = [uniq[0:3], uniq[3:6], uniq[6:9]]
+            fallback_line = valid_line(clean_groups(fallback_groups), need)
+            if fallback_line:
+                return fallback_line, f"最終保険で抽出: {fallback_line}"
+
+        return "", "requests版では並びを抽出できませんでした"
+
+    except Exception as e:
+        return "", f"取得エラー: {e}"
+
+
+# =====================================
 # UI 部品
 # =====================================
 def show_prediction_cards(pred_df: pd.DataFrame):
