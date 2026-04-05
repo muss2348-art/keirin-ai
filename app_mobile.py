@@ -1,24 +1,11 @@
 import re
-import time
 from pathlib import Path
 from datetime import datetime
-from itertools import permutations
 
 import pandas as pd
+import requests
 import streamlit as st
-
-# =====================================
-# selenium
-# =====================================
-try:
-    from selenium import webdriver
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.chrome.options import Options
-    from selenium.webdriver.support.ui import WebDriverWait
-    SELENIUM_AVAILABLE = True
-except Exception:
-    SELENIUM_AVAILABLE = False
-
+from bs4 import BeautifulSoup
 
 # =====================================
 # 基本設定
@@ -28,7 +15,7 @@ st.set_page_config(page_title="競輪AI mobile 真・完全版", layout="centere
 BASE_DIR = Path(__file__).resolve().parent
 LOG_PATH = BASE_DIR / "log.csv"
 RESULT_LOG_PATH = BASE_DIR / "result_log.csv"
-DEBUG_POS_PATH = BASE_DIR / "winticket_debug_positions.csv"
+DEBUG_HTML_PATH = BASE_DIR / "winticket_debug_source.html"
 DEBUG_TEXT_PATH = BASE_DIR / "winticket_debug_text.txt"
 
 st.markdown(
@@ -171,7 +158,7 @@ def parse_line_text(line_text: str):
         .replace("　", " ")
         .replace("-", " ")
         .replace("/", "|")
-        .replace("", "|")
+        .replace("\n", "|")
     )
     groups = [g.strip() for g in normalized.split("|") if g.strip()]
 
@@ -289,10 +276,11 @@ def pick_key_numbers(line_text: str):
     seconds = df[df["役割"].isin(["番手", "単騎"])].sort_values("ラインAI", ascending=False)
     thirds = df.sort_values("ラインAI", ascending=False)
 
-    head_nums = heads["車番"].astype(str).tolist()
-    second_nums = seconds["車番"].astype(str).tolist()
-    third_nums = thirds["車番"].astype(str).tolist()
-    return head_nums, second_nums, third_nums
+    return (
+        heads["車番"].astype(str).tolist(),
+        seconds["車番"].astype(str).tolist(),
+        thirds["車番"].astype(str).tolist(),
+    )
 
 
 # =====================================
@@ -352,8 +340,7 @@ def estimate_odds_from_structure(combo: str, line_text: str, mode_name: str):
         if line_map.get(a) == line_map.get(b):
             same_line_pairs += 1
 
-    odds = 55.0
-    odds -= same_line_pairs * 12
+    odds = 55.0 - same_line_pairs * 12
 
     for n in nums:
         if pos_map.get(n) == 2:
@@ -435,7 +422,6 @@ def score_combo(combo: str, line_text: str, mode_name: str):
 
 def generate_bets(mode_name: str, display_count: int, line_text: str):
     head_nums, second_nums, third_nums = pick_key_numbers(line_text)
-    rows = []
 
     if head_nums and second_nums and third_nums:
         candidate_set = set()
@@ -447,6 +433,7 @@ def generate_bets(mode_name: str, display_count: int, line_text: str):
     else:
         candidate_set = set(["1-2-3", "1-3-2", "2-1-3", "2-3-1", "3-1-2", "3-2-1"])
 
+    rows = []
     for combo in candidate_set:
         score, hit_rate, odds, value, learn_boost = score_combo(combo, line_text, mode_name)
         rows.append({
@@ -579,176 +566,6 @@ def calc_summary(pred_df, result_df):
         "回収率": recovery_rate,
         "収支": profit,
     }
-
-
-# =====================================
-# WINTICKET 並び取得
-# =====================================
-def fetch_line_from_winticket(url: str, car_count: str):
-    if not SELENIUM_AVAILABLE:
-        return "", "selenium未インストール"
-
-    def looks_like_single_number(text: str) -> bool:
-        return bool(re.fullmatch(r"[1-9]", text.strip()))
-
-    def dedupe_candidates(items):
-        seen = set()
-        result = []
-        for item in items:
-            key = (item["num"], round(item["x"], 1), round(item["y"], 1))
-            if key not in seen:
-                seen.add(key)
-                result.append(item)
-        return result
-
-    def cluster_by_gap(sorted_items, gap_threshold=22):
-        if not sorted_items:
-            return []
-        groups = [[sorted_items[0]]]
-        for item in sorted_items[1:]:
-            prev = groups[-1][-1]
-            if (item["x"] - prev["x"]) <= gap_threshold:
-                groups[-1].append(item)
-            else:
-                groups.append([item])
-        return groups
-
-    def build_line_from_row(row_items, need):
-        groups = cluster_by_gap(sorted(row_items, key=lambda v: v["x"]), gap_threshold=22)
-        parts = []
-        used = set()
-        total = 0
-        for g in groups:
-            nums = []
-            for item in g:
-                if item["num"] not in used:
-                    nums.append(item["num"])
-                    used.add(item["num"])
-            if nums:
-                parts.append(nums)
-                total += len(nums)
-            if total >= need:
-                break
-        if total < need:
-            return ""
-
-        trimmed = []
-        count = 0
-        for p in parts:
-            remain = need - count
-            if remain <= 0:
-                break
-            seg = p[:remain]
-            if seg:
-                trimmed.append(seg)
-                count += len(seg)
-        if count != need:
-            return ""
-
-        return " / ".join(" ".join(seg) for seg in trimmed)
-
-    driver = None
-    try:
-        options = Options()
-        options.add_argument("--headless=new")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--disable-gpu")
-        options.add_argument("--window-size=1400,2200")
-        options.add_argument("--lang=ja-JP")
-
-        driver = webdriver.Chrome(options=options)
-        driver.get(url)
-
-        WebDriverWait(driver, 20).until(lambda d: d.execute_script("return document.readyState") == "complete")
-        time.sleep(5)
-
-        body_text = driver.find_element(By.TAG_NAME, "body").text
-        with open(DEBUG_TEXT_PATH, "w", encoding="utf-8") as f:
-            f.write(body_text)
-
-        elements = driver.find_elements(By.XPATH, "//*")
-        candidates = []
-        for el in elements:
-            try:
-                txt = el.text.strip()
-                if not looks_like_single_number(txt):
-                    continue
-                rect = el.rect
-                x = float(rect.get("x", 0))
-                y = float(rect.get("y", 0))
-                w = float(rect.get("width", 0))
-                h = float(rect.get("height", 0))
-                if w <= 0 or h <= 0:
-                    continue
-                if w > 80 or h > 80:
-                    continue
-                candidates.append({"num": txt, "x": x, "y": y, "w": w, "h": h})
-            except Exception:
-                pass
-
-        candidates = dedupe_candidates(candidates)
-        if candidates:
-            pd.DataFrame(candidates).sort_values(["y", "x"]).to_csv(DEBUG_POS_PATH, index=False, encoding="utf-8-sig")
-
-        need = 7 if car_count == "7車" else 9
-        y_groups = {}
-        for c in candidates:
-            y_key = round(c["y"] / 8) * 8
-            y_groups.setdefault(y_key, []).append(c)
-
-        row_candidates = []
-        for y_key, group in y_groups.items():
-            group = sorted(group, key=lambda v: v["x"])
-            unique_nums = []
-            seen_nums = set()
-            for g in group:
-                if g["num"] not in seen_nums:
-                    unique_nums.append(g)
-                    seen_nums.add(g["num"])
-            if len(unique_nums) < 3:
-                continue
-            x_span = max(v["x"] for v in unique_nums) - min(v["x"] for v in unique_nums)
-            if x_span < 40:
-                continue
-            row_candidates.append((y_key, unique_nums))
-
-        row_candidates = sorted(row_candidates, key=lambda t: t[0])
-        for y_key, row in row_candidates[:8]:
-            line_text = build_line_from_row(row, need)
-            if line_text:
-                return line_text, f"上位横行から抽出: {line_text} (y={y_key})"
-
-        top_band = [c for c in candidates if 300 <= c["y"] <= 520]
-        top_band = sorted(top_band, key=lambda v: (round(v["y"] / 8) * 8, v["x"]))
-        top_y_groups = {}
-        for c in top_band:
-            y_key = round(c["y"] / 8) * 8
-            top_y_groups.setdefault(y_key, []).append(c)
-
-        for y_key in sorted(top_y_groups.keys()):
-            row = top_y_groups[y_key]
-            unique_row = []
-            seen_nums = set()
-            for r in sorted(row, key=lambda v: v["x"]):
-                if r["num"] not in seen_nums:
-                    unique_row.append(r)
-                    seen_nums.add(r["num"])
-            line_text = build_line_from_row(unique_row, need)
-            if line_text:
-                return line_text, f"上部帯から抽出: {line_text} (y={y_key})"
-
-        return "", "並びを正しく組めませんでした"
-
-    except Exception as e:
-        return "", f"取得エラー: {e}"
-
-    finally:
-        if driver is not None:
-            try:
-                driver.quit()
-            except Exception:
-                pass
 
 
 # =====================================
