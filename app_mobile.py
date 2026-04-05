@@ -592,7 +592,6 @@ def fetch_line_from_winticket(url: str, car_count: str):
         flat = [n for g in groups for n in g]
         if len(flat) < need:
             return ""
-        flat = flat[:need]
 
         trimmed = []
         count = 0
@@ -604,6 +603,7 @@ def fetch_line_from_winticket(url: str, car_count: str):
             if seg:
                 trimmed.append(seg)
                 count += len(seg)
+
         if count != need:
             return ""
 
