@@ -8,9 +8,6 @@ import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 
-# =====================================
-# selenium（PC高精度モード用）
-# =====================================
 try:
     from selenium import webdriver
     from selenium.webdriver.common.by import By
@@ -21,9 +18,6 @@ except Exception:
     SELENIUM_AVAILABLE = False
 
 
-# =====================================
-# 基本設定
-# =====================================
 st.set_page_config(page_title="競輪AI mobile ハイブリッド版", layout="centered")
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -56,9 +50,6 @@ st.markdown(
 )
 
 
-# =====================================
-# CSV 初期化
-# =====================================
 def ensure_csv_files():
     if not LOG_PATH.exists():
         pd.DataFrame(columns=[
@@ -94,9 +85,6 @@ def ensure_csv_files():
         ]).to_csv(RESULT_LOG_PATH, index=False, encoding="utf-8-sig")
 
 
-# =====================================
-# セッション初期化
-# =====================================
 def init_session():
     defaults = {
         "screen": "予想",
@@ -126,11 +114,9 @@ def init_session():
             st.session_state[k] = v
 
 
-# =====================================
-# 既存CSVの列補完
-# =====================================
 def upgrade_existing_csv():
     ensure_csv_files()
+
     try:
         pred_df = pd.read_csv(LOG_PATH, encoding="utf-8-sig")
         changed = False
@@ -160,9 +146,6 @@ init_session()
 upgrade_existing_csv()
 
 
-# =====================================
-# 基本ロジック
-# =====================================
 def parse_line_text(line_text: str):
     lines = []
     single_count = 0
@@ -222,9 +205,6 @@ def auto_detect_mode(line_text: str, car_count: str):
     return "通常モード", " / ".join(reasons) + " → 主力ラインがあり通常モード"
 
 
-# =====================================
-# ラインAI
-# =====================================
 def analyze_lines(line_text: str):
     lines, _ = parse_line_text(line_text)
     if not lines:
@@ -300,9 +280,6 @@ def pick_key_numbers(line_text: str):
     )
 
 
-# =====================================
-# 学習機能
-# =====================================
 def get_learning_stats():
     try:
         result_df = pd.read_csv(RESULT_LOG_PATH, encoding="utf-8-sig")
@@ -336,9 +313,6 @@ def get_learning_boost(combo: str):
     return float(row.iloc[0]["学習補正"])
 
 
-# =====================================
-# 期待値・スコア
-# =====================================
 def estimate_odds_from_structure(combo: str, line_text: str, mode_name: str):
     lines, _ = parse_line_text(line_text)
     if not lines:
@@ -486,9 +460,6 @@ def build_rank_label(row):
     return "🟡 穴"
 
 
-# =====================================
-# 保存・読込
-# =====================================
 def save_prediction_log(race_name, race_url, predict_type, mode_name, mode_reason, buy_points, bet_amount, final_bets, memo=""):
     total_amount = buy_points * bet_amount
     bet_text = " / ".join(final_bets) if final_bets else ""
@@ -585,10 +556,6 @@ def calc_summary(pred_df, result_df):
     }
 
 
-# =====================================
-# WINTICKET 並び取得（候補表示UI向け）
-# PC: selenium高精度 / iPhone: requests候補
-# =====================================
 def fetch_line_from_winticket_requests(url: str, car_count: str):
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -688,7 +655,6 @@ def fetch_line_from_winticket_requests(url: str, car_count: str):
         return candidates[:5], f"requests候補数: {len(candidates[:5])}"
     except Exception as e:
         return [], f"requests取得エラー: {e}"
-
 
 
 def fetch_line_from_winticket_selenium(url: str, car_count: str):
@@ -846,7 +812,6 @@ def fetch_line_from_winticket_selenium(url: str, car_count: str):
                 pass
 
 
-
 def fetch_line_candidates(url: str, car_count: str, fetch_mode: str):
     all_candidates = []
     logs = []
@@ -870,9 +835,6 @@ def fetch_line_candidates(url: str, car_count: str, fetch_mode: str):
     return all_candidates[:5], " / ".join(logs) if logs else "候補なし"
 
 
-# =====================================
-# UI 部品
-# =====================================
 def show_prediction_cards(pred_df: pd.DataFrame):
     if pred_df.empty:
         st.info("まだ予想履歴はありません")
@@ -908,9 +870,6 @@ def show_result_cards(result_df: pd.DataFrame):
             st.write(f"払戻: ¥{int(row['払戻']):,} / 収支: ¥{int(row['収支']):,}")
 
 
-# =====================================
-# 画面: 予想
-# =====================================
 def render_predict_screen():
     st.title("🚴 競輪AI mobile ハイブリッド版")
 
@@ -1050,9 +1009,6 @@ def render_predict_screen():
             st.rerun()
 
 
-# =====================================
-# 画面: 結果一覧
-# =====================================
 def render_results_list_screen():
     st.title("🧾 保存済み予想")
     pred_df = load_prediction_log()
@@ -1063,9 +1019,6 @@ def render_results_list_screen():
         st.rerun()
 
 
-# =====================================
-# 画面: 結果入力
-# =====================================
 def render_result_input_screen():
     st.title("🎯 結果入力")
 
@@ -1113,7 +1066,16 @@ def render_result_input_screen():
     c4, c5 = st.columns(2)
     with c4:
         if st.button("結果を保存する", type="primary"):
-            save_result_log(pred_id=selected_id, race_name=race_name, rank1=rank1, rank2=rank2, rank3=rank3, payout=payout, investment=investment, hit=hit)
+            save_result_log(
+                pred_id=selected_id,
+                race_name=race_name,
+                rank1=rank1,
+                rank2=rank2,
+                rank3=rank3,
+                payout=payout,
+                investment=investment,
+                hit=hit,
+            )
             st.success("結果を保存しました")
             st.session_state.screen = "結果履歴"
             st.rerun()
@@ -1123,9 +1085,6 @@ def render_result_input_screen():
             st.rerun()
 
 
-# =====================================
-# 画面: 結果履歴
-# =====================================
 def render_result_history_screen():
     st.title("📊 結果履歴")
 
@@ -1154,9 +1113,6 @@ def render_result_history_screen():
             st.rerun()
 
 
-# =====================================
-# 下部ナビ
-# =====================================
 def render_bottom_nav():
     st.divider()
     n1, n2, n3 = st.columns(3)
@@ -1174,9 +1130,6 @@ def render_bottom_nav():
             st.rerun()
 
 
-# =====================================
-# メイン描画
-# =====================================
 if st.session_state.screen == "予想":
     render_predict_screen()
 elif st.session_state.screen == "結果一覧":
@@ -1189,16 +1142,3 @@ else:
     render_predict_screen()
 
 render_bottom_nav()
-``` 
-
-- **自動取得しても、いきなり並び確定しない**
-- **候補1、候補2… を表示**
-- **「この候補を使う」で反映**
-- PCでは `selenium` 優先
-- iPhoneでは `requests` 候補表示中心
-
-つまり、
-**順番が怪しい時にそのまま事故らず、候補を見て選べる** ようになる。
-
-次に試して、
-候補がどう出るか見せてくれたらそこからさらに絞れる。
