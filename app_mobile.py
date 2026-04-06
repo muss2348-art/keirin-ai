@@ -1,4 +1,5 @@
 import re
+import time
 from pathlib import Path
 from datetime import datetime
 
@@ -8,15 +9,29 @@ import streamlit as st
 from bs4 import BeautifulSoup
 
 # =====================================
+# selenium（PC高精度モード用）
+# =====================================
+try:
+    from selenium import webdriver
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.support.ui import WebDriverWait
+    SELENIUM_AVAILABLE = True
+except Exception:
+    SELENIUM_AVAILABLE = False
+
+
+# =====================================
 # 基本設定
 # =====================================
-st.set_page_config(page_title="競輪AI mobile 真・完全版", layout="centered")
+st.set_page_config(page_title="競輪AI mobile ハイブリッド版", layout="centered")
 
 BASE_DIR = Path(__file__).resolve().parent
 LOG_PATH = BASE_DIR / "log.csv"
 RESULT_LOG_PATH = BASE_DIR / "result_log.csv"
 DEBUG_HTML_PATH = BASE_DIR / "winticket_debug_source.html"
 DEBUG_TEXT_PATH = BASE_DIR / "winticket_debug_text.txt"
+DEBUG_POS_PATH = BASE_DIR / "winticket_debug_positions.csv"
 
 st.markdown(
     """
@@ -95,6 +110,7 @@ def init_session():
         "bet_amount": 100,
         "line_text": "",
         "fetch_reason": "",
+        "fetch_candidates": [],
         "final_bets": [],
         "memo_input": "",
         "selected_pred_id": "",
@@ -103,6 +119,7 @@ def init_session():
         "ai_summary": "",
         "line_score_table": pd.DataFrame(),
         "learning_table": pd.DataFrame(),
+        "fetch_mode": "自動",
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -569,10 +586,10 @@ def calc_summary(pred_df, result_df):
 
 
 # =====================================
-# WINTICKET 並び取得
-# requests版（Cloud/iPhone向け）
+# WINTICKET 並び取得（候補表示UI向け）
+# PC: selenium高精度 / iPhone: requests候補
 # =====================================
-def fetch_line_from_winticket(url: str, car_count: str):
+def fetch_line_from_winticket_requests(url: str, car_count: str):
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
@@ -580,106 +597,34 @@ def fetch_line_from_winticket(url: str, car_count: str):
         "Pragma": "no-cache",
     }
 
-    def clean_groups(groups):
-        result = []
-        for g in groups:
-            nums = [str(x) for x in g if str(x).isdigit()]
-            if nums:
-                result.append(nums)
-        return result
-
     def valid_line(groups, need):
         flat = [n for g in groups for n in g]
-        if len(flat) < need:
+        if len(flat) != need:
             return ""
+        return " / ".join(" ".join(seg) for seg in groups if seg)
 
-        trimmed = []
-        count = 0
-        for g in groups:
-            remain = need - count
-            if remain <= 0:
-                break
-            seg = g[:remain]
-            if seg:
-                trimmed.append(seg)
-                count += len(seg)
-
-        if count != need:
-            return ""
-
-        return " / ".join(" ".join(seg) for seg in trimmed)
-
-    def parse_vertical_number_block(text, need):
-        lines = [line.strip() for line in text.splitlines()]
-        numeric_lines = [line for line in lines if re.fullmatch(r"[1-9]", line)]
-        if len(numeric_lines) < need:
-            return ""
-
-        for i in range(len(numeric_lines) - need + 1):
-            chunk = numeric_lines[i:i + need]
-
-            uniq = []
-            seen = set()
-            for x in chunk:
-                if x not in seen:
-                    uniq.append(x)
-                    seen.add(x)
-
-            if len(uniq) != need:
-                continue
-
-            # 区切りの保険候補を複数試す
-            if need == 7:
-                candidates = [
-                    [[uniq[0], uniq[1], uniq[2]], [uniq[3]], [uniq[4], uniq[5]], [uniq[6]]],
-                    [[uniq[0], uniq[1], uniq[2]], [uniq[3], uniq[4]], [uniq[5], uniq[6]]],
-                    [[uniq[0], uniq[1]], [uniq[2]], [uniq[3], uniq[4]], [uniq[5], uniq[6]]],
-                    [[uniq[0], uniq[1]], [uniq[2], uniq[3]], [uniq[4]], [uniq[5], uniq[6]]],
-                ]
-            else:
-                candidates = [
-                    [uniq[0:3], uniq[3:6], uniq[6:9]],
-                    [uniq[0:3], uniq[3:5], uniq[5:7], uniq[7:9]],
-                ]
-
-            for groups in candidates:
-                line = valid_line(clean_groups(groups), need)
-                if line:
-                    return line
-
-        return ""
-
-    def parse_jsonish_strings(text, need):
-        found = []
-
-        patterns = [
-            r"(?:line|formation|arrangement|並び|ライン)[^\[]{0,30}\[([^\]]{5,200})\]",
-            r"(?:line|formation|arrangement|並び|ライン)[^\{]{0,30}\{([^\}]{5,300})\}",
-            r"([1-9](?:\s+[1-9]){1,3}\s*/\s*[1-9](?:\s+[1-9]){0,3}(?:\s*/\s*[1-9](?:\s+[1-9]){0,3})*)",
-        ]
-
-        for pattern in patterns:
-            for m in re.finditer(pattern, text, re.IGNORECASE):
-                raw = m.group(1)
-                nums = re.findall(r"[1-9]", raw)
-                if len(nums) >= need:
-                    nums = nums[:need]
-
-                    if need == 7:
-                        candidates = [
-                            [[nums[0], nums[1], nums[2]], [nums[3]], [nums[4], nums[5]], [nums[6]]],
-                            [[nums[0], nums[1], nums[2]], [nums[3], nums[4]], [nums[5], nums[6]]],
-                        ]
-                    else:
-                        candidates = [
-                            [nums[0:3], nums[3:6], nums[6:9]]
-                        ]
-
-                    for groups in candidates:
-                        line = valid_line(clean_groups(groups), need)
-                        if line and line not in found:
-                            found.append(line)
-        return found
+    def build_candidates_from_seq(seq, need):
+        if len(seq) < need:
+            return []
+        seq = seq[:need]
+        candidates = []
+        if need == 7:
+            patterns = [
+                [[seq[0], seq[1], seq[2]], [seq[3]], [seq[4], seq[5]], [seq[6]]],
+                [[seq[0], seq[1], seq[2]], [seq[3], seq[4]], [seq[5], seq[6]]],
+                [[seq[0], seq[1]], [seq[2]], [seq[3], seq[4]], [seq[5], seq[6]]],
+                [[seq[0], seq[1]], [seq[2], seq[3]], [seq[4]], [seq[5], seq[6]]],
+            ]
+        else:
+            patterns = [
+                [seq[0:3], seq[3:6], seq[6:9]],
+                [seq[0:3], seq[3:5], seq[5:7], seq[7:9]],
+            ]
+        for p in patterns:
+            line = valid_line(p, need)
+            if line and line not in candidates:
+                candidates.append(line)
+        return candidates
 
     try:
         response = requests.get(url, headers=headers, timeout=20)
@@ -691,59 +636,238 @@ def fetch_line_from_winticket(url: str, car_count: str):
 
         soup = BeautifulSoup(html, "lxml")
         text = soup.get_text("\n", strip=True)
-
         with open(DEBUG_TEXT_PATH, "w", encoding="utf-8") as f:
             f.write(text)
 
         need = 7 if car_count == "7車" else 9
+        numeric_lines = [line.strip() for line in text.splitlines() if re.fullmatch(r"[1-9]", line.strip())]
 
-        # 1. テキスト縦並びから抽出
-        line = parse_vertical_number_block(text, need)
-        if line:
-            return line, f"テキスト縦並びから抽出: {line}"
+        candidates = []
+        for i in range(max(0, len(numeric_lines) - need + 1)):
+            chunk = numeric_lines[i:i + need]
+            uniq = []
+            seen = set()
+            for x in chunk:
+                if x not in seen:
+                    uniq.append(x)
+                    seen.add(x)
+            if len(uniq) == need:
+                for line in build_candidates_from_seq(uniq, need):
+                    if line not in candidates:
+                        candidates.append(line)
 
-        # 2. script から抽出
         script_text = "\n".join([s.get_text(" ", strip=True) for s in soup.find_all("script")])
-        candidates = parse_jsonish_strings(script_text, need)
-        if candidates:
-            return candidates[0], f"script内データから抽出: {candidates[0]}"
+        inline_nums = re.findall(r"\b[1-9]\b", script_text)
+        if inline_nums:
+            uniq = []
+            seen = set()
+            for x in inline_nums:
+                if x not in seen:
+                    uniq.append(x)
+                    seen.add(x)
+                if len(uniq) >= need:
+                    break
+            for line in build_candidates_from_seq(uniq, need):
+                if line not in candidates:
+                    candidates.append(line)
 
-        # 3. HTML全文から抽出
-        candidates = parse_jsonish_strings(html, need)
-        if candidates:
-            return candidates[0], f"HTML内データから抽出: {candidates[0]}"
+        body_nums = re.findall(r"\b[1-9]\b", text)
+        if body_nums:
+            uniq = []
+            seen = set()
+            for x in body_nums:
+                if x not in seen:
+                    uniq.append(x)
+                    seen.add(x)
+                if len(uniq) >= need:
+                    break
+            for line in build_candidates_from_seq(uniq, need):
+                if line not in candidates:
+                    candidates.append(line)
 
-        # 4. 最終保険
-        nums = re.findall(r"\b[1-9]\b", text)
+        return candidates[:5], f"requests候補数: {len(candidates[:5])}"
+    except Exception as e:
+        return [], f"requests取得エラー: {e}"
+
+
+
+def fetch_line_from_winticket_selenium(url: str, car_count: str):
+    if not SELENIUM_AVAILABLE:
+        return [], "selenium未インストール"
+
+    def looks_like_single_number(text: str):
+        return bool(re.fullmatch(r"[1-9]", text.strip()))
+
+    def dedupe_candidates(items):
+        seen = set()
+        result = []
+        for item in items:
+            key = (item["num"], round(item["x"], 1), round(item["y"], 1))
+            if key not in seen:
+                seen.add(key)
+                result.append(item)
+        return result
+
+    def line_from_row(row_items, need):
+        row_items = sorted(row_items, key=lambda v: v["x"])
         uniq = []
         seen = set()
-        for n in nums:
-            if n not in seen:
-                uniq.append(n)
-                seen.add(n)
-            if len(uniq) >= need:
-                break
+        for item in row_items:
+            if item["num"] not in seen:
+                uniq.append(item)
+                seen.add(item["num"])
+        if len(uniq) < need:
+            return ""
 
-        if len(uniq) >= need:
-            if need == 7:
-                fallback_candidates = [
-                    [[uniq[0], uniq[1], uniq[2]], [uniq[3]], [uniq[4], uniq[5]], [uniq[6]]],
-                    [[uniq[0], uniq[1], uniq[2]], [uniq[3], uniq[4]], [uniq[5], uniq[6]]],
-                ]
+        uniq = uniq[:need]
+        gaps = []
+        for i in range(len(uniq) - 1):
+            gaps.append(uniq[i + 1]["x"] - uniq[i]["x"])
+        if not gaps:
+            return ""
+
+        avg_gap = sum(gaps) / len(gaps)
+        threshold = max(18, avg_gap * 1.35)
+
+        parts = []
+        current = [uniq[0]["num"]]
+        for i, gap in enumerate(gaps):
+            if gap >= threshold:
+                parts.append(current)
+                current = [uniq[i + 1]["num"]]
             else:
-                fallback_candidates = [
-                    [uniq[0:3], uniq[3:6], uniq[6:9]]
-                ]
+                current.append(uniq[i + 1]["num"])
+        if current:
+            parts.append(current)
 
-            for groups in fallback_candidates:
-                fallback_line = valid_line(clean_groups(groups), need)
-                if fallback_line:
-                    return fallback_line, f"最終保険で抽出: {fallback_line}"
+        flat_count = sum(len(p) for p in parts)
+        if flat_count != need:
+            return ""
 
-        return "", "requests版では並びを抽出できませんでした"
+        if need == 7 and len(parts) == 1:
+            nums = [x["num"] for x in uniq]
+            parts = [[nums[0], nums[1], nums[2]], [nums[3]], [nums[4], nums[5]], [nums[6]]]
+        if need == 9 and len(parts) == 1:
+            nums = [x["num"] for x in uniq]
+            parts = [nums[0:3], nums[3:6], nums[6:9]]
 
+        return " / ".join(" ".join(seg) for seg in parts)
+
+    driver = None
+    try:
+        options = Options()
+        options.add_argument("--headless=new")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--window-size=1400,2400")
+        options.add_argument("--lang=ja-JP")
+
+        driver = webdriver.Chrome(options=options)
+        driver.get(url)
+        WebDriverWait(driver, 20).until(lambda d: d.execute_script("return document.readyState") == "complete")
+        time.sleep(5)
+
+        body_text = driver.find_element(By.TAG_NAME, "body").text
+        with open(DEBUG_TEXT_PATH, "w", encoding="utf-8") as f:
+            f.write(body_text)
+
+        elements = driver.find_elements(By.XPATH, "//*")
+        candidates = []
+        for el in elements:
+            try:
+                txt = el.text.strip()
+                if not looks_like_single_number(txt):
+                    continue
+                rect = el.rect
+                x = float(rect.get("x", 0))
+                y = float(rect.get("y", 0))
+                w = float(rect.get("width", 0))
+                h = float(rect.get("height", 0))
+                if w <= 0 or h <= 0:
+                    continue
+                if w > 90 or h > 90:
+                    continue
+                candidates.append({"num": txt, "x": x, "y": y, "w": w, "h": h})
+            except Exception:
+                pass
+
+        candidates = dedupe_candidates(candidates)
+        if candidates:
+            pd.DataFrame(candidates).sort_values(["y", "x"]).to_csv(DEBUG_POS_PATH, index=False, encoding="utf-8-sig")
+
+        need = 7 if car_count == "7車" else 9
+        row_groups = {}
+        for c in candidates:
+            y_key = round(c["y"] / 10) * 10
+            row_groups.setdefault(y_key, []).append(c)
+
+        ranked_rows = []
+        for y_key, group in row_groups.items():
+            group = sorted(group, key=lambda v: v["x"])
+            uniq = []
+            seen = set()
+            for g in group:
+                if g["num"] not in seen:
+                    uniq.append(g)
+                    seen.add(g["num"])
+            if len(uniq) < 3:
+                continue
+            x_span = max(v["x"] for v in uniq) - min(v["x"] for v in uniq)
+            if x_span < 45:
+                continue
+            ranked_rows.append((y_key, uniq, x_span))
+
+        ranked_rows = sorted(ranked_rows, key=lambda t: (t[0], -t[2]))
+        lines = []
+        for y_key, row, _ in ranked_rows[:12]:
+            line = line_from_row(row, need)
+            if line and line not in lines:
+                lines.append(line)
+
+        top_band = [c for c in candidates if 250 <= c["y"] <= 620]
+        top_rows = {}
+        for c in top_band:
+            y_key = round(c["y"] / 10) * 10
+            top_rows.setdefault(y_key, []).append(c)
+        for y_key in sorted(top_rows.keys()):
+            line = line_from_row(top_rows[y_key], need)
+            if line and line not in lines:
+                lines.append(line)
+
+        return lines[:5], f"selenium候補数: {len(lines[:5])}"
     except Exception as e:
-        return "", f"取得エラー: {e}"
+        return [], f"selenium取得エラー: {e}"
+    finally:
+        if driver is not None:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
+
+
+def fetch_line_candidates(url: str, car_count: str, fetch_mode: str):
+    all_candidates = []
+    logs = []
+
+    if fetch_mode in ["自動", "PC高精度"] and SELENIUM_AVAILABLE:
+        lines, log = fetch_line_from_winticket_selenium(url, car_count)
+        logs.append(log)
+        for line in lines:
+            if line not in all_candidates:
+                all_candidates.append(line)
+        if fetch_mode == "PC高精度":
+            return all_candidates[:5], " / ".join(logs)
+
+    if fetch_mode in ["自動", "iPhone安定"]:
+        lines, log = fetch_line_from_winticket_requests(url, car_count)
+        logs.append(log)
+        for line in lines:
+            if line not in all_candidates:
+                all_candidates.append(line)
+
+    return all_candidates[:5], " / ".join(logs) if logs else "候補なし"
 
 
 # =====================================
@@ -788,16 +912,20 @@ def show_result_cards(result_df: pd.DataFrame):
 # 画面: 予想
 # =====================================
 def render_predict_screen():
-    st.title("🚴 競輪AI mobile 真・完全版")
+    st.title("🚴 競輪AI mobile ハイブリッド版")
 
     st.session_state.race_name = st.text_input("レース名", value=st.session_state.race_name, placeholder="例: 宇都宮 4R")
     st.session_state.race_url = st.text_input("レースURL", value=st.session_state.race_url, placeholder="WINTICKETのURL")
 
-    c1, c2 = st.columns(2)
+    c1, c2, c3 = st.columns(3)
     with c1:
         st.session_state.car_count = st.selectbox("車立て", ["7車", "9車"], index=["7車", "9車"].index(st.session_state.car_count))
     with c2:
         st.session_state.mode_setting = st.selectbox("モード", ["自動判定", "手動選択"], index=["自動判定", "手動選択"].index(st.session_state.mode_setting))
+    with c3:
+        fetch_options = ["自動", "PC高精度", "iPhone安定"] if SELENIUM_AVAILABLE else ["自動", "iPhone安定"]
+        current_fetch = st.session_state.fetch_mode if st.session_state.fetch_mode in fetch_options else fetch_options[0]
+        st.session_state.fetch_mode = st.selectbox("取得方式", fetch_options, index=fetch_options.index(current_fetch))
 
     if st.session_state.mode_setting == "手動選択":
         st.session_state.mode = st.selectbox("手動モード", ["通常モード", "混戦モード", "穴モード"], index=["通常モード", "混戦モード", "穴モード"].index(st.session_state.mode))
@@ -826,22 +954,35 @@ def render_predict_screen():
     st.caption(final_reason)
     st.caption(f"ラインAI: {ai_summary}")
 
-    if st.button("並び自動取得"):
+    if st.button("並び候補を取得"):
         if not st.session_state.race_url.strip():
             st.warning("URLを入力してね")
         else:
-            with st.spinner("WINTICKETから並び取得中..."):
-                line_result, reason = fetch_line_from_winticket(st.session_state.race_url, st.session_state.car_count)
+            with st.spinner("WINTICKETから並び候補取得中..."):
+                candidates, reason = fetch_line_candidates(
+                    st.session_state.race_url,
+                    st.session_state.car_count,
+                    st.session_state.fetch_mode,
+                )
             st.session_state.fetch_reason = reason
-            if line_result:
-                st.session_state.line_text = line_result
-                st.success(f"並び取得: {line_result}")
-                st.rerun()
+            st.session_state.fetch_candidates = candidates
+            if candidates:
+                st.success("並び候補を取得しました")
             else:
                 st.error(reason)
 
     if st.session_state.fetch_reason:
         st.caption(f"取得ログ: {st.session_state.fetch_reason}")
+
+    if st.session_state.fetch_candidates:
+        st.subheader("取得候補")
+        for i, candidate in enumerate(st.session_state.fetch_candidates, start=1):
+            with st.container(border=True):
+                st.write(f"候補{i}: {candidate}")
+                if st.button(f"候補{i}を使う", key=f"apply_candidate_{i}"):
+                    st.session_state.line_text = candidate
+                    st.success(f"候補{i}を反映しました: {candidate}")
+                    st.rerun()
 
     with st.expander("ラインAI 詳細"):
         if not line_df.empty:
@@ -855,12 +996,12 @@ def render_predict_screen():
         else:
             st.info("結果を保存していくと学習補正が溜まります")
 
-    c3, c4 = st.columns(2)
-    with c3:
+    c4, c5 = st.columns(2)
+    with c4:
         display_options = [5, 10, 15, 20]
         current_display = st.session_state.display_count if st.session_state.display_count in display_options else 10
         st.session_state.display_count = st.selectbox("表示点数", display_options, index=display_options.index(current_display))
-    with c4:
+    with c5:
         st.session_state.bet_amount = st.number_input("1点金額", min_value=100, max_value=10000, step=100, value=st.session_state.bet_amount)
 
     if st.button("予想生成", type="primary"):
@@ -1048,3 +1189,18 @@ else:
     render_predict_screen()
 
 render_bottom_nav()
+``` 
+
+これで変わるのはここ。
+
+- **自動取得しても、いきなり並び確定しない**
+- **候補1、候補2… を表示**
+- **「この候補を使う」で反映**
+- PCでは `selenium` 優先
+- iPhoneでは `requests` 候補表示中心
+
+つまり、
+**順番が怪しい時にそのまま事故らず、候補を見て選べる** ようになる。
+
+次に試して、
+候補がどう出るか見せてくれたらそこからさらに絞れる。
