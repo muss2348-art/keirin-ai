@@ -1,24 +1,11 @@
 import re
-import time
 from pathlib import Path
 from datetime import datetime
-from itertools import permutations
 
 import pandas as pd
+import requests
 import streamlit as st
-
-# =====================================
-# selenium
-# =====================================
-try:
-    from selenium import webdriver
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.chrome.options import Options
-    from selenium.webdriver.support.ui import WebDriverWait
-    SELENIUM_AVAILABLE = True
-except Exception:
-    SELENIUM_AVAILABLE = False
-
+from bs4 import BeautifulSoup
 
 # =====================================
 # 基本設定
@@ -28,7 +15,7 @@ st.set_page_config(page_title="競輪AI mobile 真・完全版", layout="centere
 BASE_DIR = Path(__file__).resolve().parent
 LOG_PATH = BASE_DIR / "log.csv"
 RESULT_LOG_PATH = BASE_DIR / "result_log.csv"
-DEBUG_POS_PATH = BASE_DIR / "winticket_debug_positions.csv"
+DEBUG_HTML_PATH = BASE_DIR / "winticket_debug_source.html"
 DEBUG_TEXT_PATH = BASE_DIR / "winticket_debug_text.txt"
 
 st.markdown(
@@ -171,25 +158,7 @@ def parse_line_text(line_text: str):
         .replace("　", " ")
         .replace("-", " ")
         .replace("/", "|")
-        .replace("", "|")
-    )
-    groups = [g.strip() for g in normalized.split("|") if g.strip()]
-
-    for group in groups:
-        nums = [x for x in group.split() if x.isdigit()]
-        if nums:
-            lines.append(nums)
-            if len(nums) == 1:
-                single_count += 1
-
-    return lines, single_count
-
-    normalized = (
-        line_text
-        .replace("　", " ")
-        .replace("-", " ")
-        .replace("/", "|")
-        .replace("", "|")
+        .replace("\n", "|")
     )
     groups = [g.strip() for g in normalized.split("|") if g.strip()]
 
@@ -307,10 +276,11 @@ def pick_key_numbers(line_text: str):
     seconds = df[df["役割"].isin(["番手", "単騎"])].sort_values("ラインAI", ascending=False)
     thirds = df.sort_values("ラインAI", ascending=False)
 
-    head_nums = heads["車番"].astype(str).tolist()
-    second_nums = seconds["車番"].astype(str).tolist()
-    third_nums = thirds["車番"].astype(str).tolist()
-    return head_nums, second_nums, third_nums
+    return (
+        heads["車番"].astype(str).tolist(),
+        seconds["車番"].astype(str).tolist(),
+        thirds["車番"].astype(str).tolist(),
+    )
 
 
 # =====================================
@@ -370,8 +340,7 @@ def estimate_odds_from_structure(combo: str, line_text: str, mode_name: str):
         if line_map.get(a) == line_map.get(b):
             same_line_pairs += 1
 
-    odds = 55.0
-    odds -= same_line_pairs * 12
+    odds = 55.0 - same_line_pairs * 12
 
     for n in nums:
         if pos_map.get(n) == 2:
@@ -453,7 +422,6 @@ def score_combo(combo: str, line_text: str, mode_name: str):
 
 def generate_bets(mode_name: str, display_count: int, line_text: str):
     head_nums, second_nums, third_nums = pick_key_numbers(line_text)
-    rows = []
 
     if head_nums and second_nums and third_nums:
         candidate_set = set()
@@ -465,6 +433,7 @@ def generate_bets(mode_name: str, display_count: int, line_text: str):
     else:
         candidate_set = set(["1-2-3", "1-3-2", "2-1-3", "2-3-1", "3-1-2", "3-2-1"])
 
+    rows = []
     for combo in candidate_set:
         score, hit_rate, odds, value, learn_boost = score_combo(combo, line_text, mode_name)
         rows.append({
@@ -601,76 +570,36 @@ def calc_summary(pred_df, result_df):
 
 # =====================================
 # WINTICKET 並び取得
+# requests版（Cloud/iPhone向け）
 # =====================================
 def fetch_line_from_winticket(url: str, car_count: str):
-    if not SELENIUM_AVAILABLE:
-        return "", "selenium未インストール"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
 
-    def looks_like_single_number(text: str) -> bool:
-        return bool(re.fullmatch(r"[1-9]", text.strip()))
-
-    def dedupe_candidates(items):
-        seen = set()
+    def clean_groups(groups):
         result = []
-        for item in items:
-            key = (item["num"], round(item["x"], 1), round(item["y"], 1))
-            if key not in seen:
-                seen.add(key)
-                result.append(item)
+        for g in groups:
+            nums = [str(x) for x in g if str(x).isdigit()]
+            if nums:
+                result.append(nums)
         return result
 
-    def cluster_x(items, gap_threshold=26):
-        if not items:
-            return []
-        items = sorted(items, key=lambda v: v["x"])
-        groups = [[items[0]]]
-        for item in items[1:]:
-            prev = groups[-1][-1]
-            if (item["x"] - prev["x"]) <= gap_threshold:
-                groups[-1].append(item)
-            else:
-                groups.append([item])
-        return groups
-
-    def merge_same_row(candidates):
-        row_groups = {}
-        for c in candidates:
-            y_key = round(c["y"] / 10) * 10
-            row_groups.setdefault(y_key, []).append(c)
-        return row_groups
-
-    def line_from_row(row_items, need):
-        row_items = sorted(row_items, key=lambda v: v["x"])
-        uniq = []
-        seen = set()
-        for item in row_items:
-            if item["num"] not in seen:
-                uniq.append(item)
-                seen.add(item["num"])
-        if len(uniq) < need:
-            return ""
-
-        x_groups = cluster_x(uniq, gap_threshold=26)
-        parts = []
-        total = 0
-        for g in x_groups:
-            nums = [v["num"] for v in g]
-            if nums:
-                parts.append(nums)
-                total += len(nums)
-            if total >= need:
-                break
-
-        if total < need:
+    def valid_line(groups, need):
+        flat = [n for g in groups for n in g]
+        if len(flat) < need:
             return ""
 
         trimmed = []
         count = 0
-        for p in parts:
+        for g in groups:
             remain = need - count
             if remain <= 0:
                 break
-            seg = p[:remain]
+            seg = g[:remain]
             if seg:
                 trimmed.append(seg)
                 count += len(seg)
@@ -680,94 +609,141 @@ def fetch_line_from_winticket(url: str, car_count: str):
 
         return " / ".join(" ".join(seg) for seg in trimmed)
 
-    driver = None
+    def parse_vertical_number_block(text, need):
+        lines = [line.strip() for line in text.splitlines()]
+        numeric_lines = [line for line in lines if re.fullmatch(r"[1-9]", line)]
+        if len(numeric_lines) < need:
+            return ""
+
+        for i in range(len(numeric_lines) - need + 1):
+            chunk = numeric_lines[i:i + need]
+
+            uniq = []
+            seen = set()
+            for x in chunk:
+                if x not in seen:
+                    uniq.append(x)
+                    seen.add(x)
+
+            if len(uniq) != need:
+                continue
+
+            # 区切りの保険候補を複数試す
+            if need == 7:
+                candidates = [
+                    [[uniq[0], uniq[1], uniq[2]], [uniq[3]], [uniq[4], uniq[5]], [uniq[6]]],
+                    [[uniq[0], uniq[1], uniq[2]], [uniq[3], uniq[4]], [uniq[5], uniq[6]]],
+                    [[uniq[0], uniq[1]], [uniq[2]], [uniq[3], uniq[4]], [uniq[5], uniq[6]]],
+                    [[uniq[0], uniq[1]], [uniq[2], uniq[3]], [uniq[4]], [uniq[5], uniq[6]]],
+                ]
+            else:
+                candidates = [
+                    [uniq[0:3], uniq[3:6], uniq[6:9]],
+                    [uniq[0:3], uniq[3:5], uniq[5:7], uniq[7:9]],
+                ]
+
+            for groups in candidates:
+                line = valid_line(clean_groups(groups), need)
+                if line:
+                    return line
+
+        return ""
+
+    def parse_jsonish_strings(text, need):
+        found = []
+
+        patterns = [
+            r"(?:line|formation|arrangement|並び|ライン)[^\[]{0,30}\[([^\]]{5,200})\]",
+            r"(?:line|formation|arrangement|並び|ライン)[^\{]{0,30}\{([^\}]{5,300})\}",
+            r"([1-9](?:\s+[1-9]){1,3}\s*/\s*[1-9](?:\s+[1-9]){0,3}(?:\s*/\s*[1-9](?:\s+[1-9]){0,3})*)",
+        ]
+
+        for pattern in patterns:
+            for m in re.finditer(pattern, text, re.IGNORECASE):
+                raw = m.group(1)
+                nums = re.findall(r"[1-9]", raw)
+                if len(nums) >= need:
+                    nums = nums[:need]
+
+                    if need == 7:
+                        candidates = [
+                            [[nums[0], nums[1], nums[2]], [nums[3]], [nums[4], nums[5]], [nums[6]]],
+                            [[nums[0], nums[1], nums[2]], [nums[3], nums[4]], [nums[5], nums[6]]],
+                        ]
+                    else:
+                        candidates = [
+                            [nums[0:3], nums[3:6], nums[6:9]]
+                        ]
+
+                    for groups in candidates:
+                        line = valid_line(clean_groups(groups), need)
+                        if line and line not in found:
+                            found.append(line)
+        return found
+
     try:
-        options = Options()
-        options.add_argument("--headless=new")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--disable-gpu")
-        options.add_argument("--window-size=1400,2400")
-        options.add_argument("--lang=ja-JP")
+        response = requests.get(url, headers=headers, timeout=20)
+        response.raise_for_status()
+        html = response.text
 
-        driver = webdriver.Chrome(options=options)
-        driver.get(url)
-        WebDriverWait(driver, 20).until(lambda d: d.execute_script("return document.readyState") == "complete")
-        time.sleep(5)
+        with open(DEBUG_HTML_PATH, "w", encoding="utf-8") as f:
+            f.write(html)
 
-        body_text = driver.find_element(By.TAG_NAME, "body").text
+        soup = BeautifulSoup(html, "lxml")
+        text = soup.get_text("\n", strip=True)
+
         with open(DEBUG_TEXT_PATH, "w", encoding="utf-8") as f:
-            f.write(body_text)
-
-        elements = driver.find_elements(By.XPATH, "//*")
-        candidates = []
-        for el in elements:
-            try:
-                txt = el.text.strip()
-                if not looks_like_single_number(txt):
-                    continue
-                rect = el.rect
-                x = float(rect.get("x", 0))
-                y = float(rect.get("y", 0))
-                w = float(rect.get("width", 0))
-                h = float(rect.get("height", 0))
-                if w <= 0 or h <= 0:
-                    continue
-                if w > 90 or h > 90:
-                    continue
-                candidates.append({"num": txt, "x": x, "y": y, "w": w, "h": h})
-            except Exception:
-                pass
-
-        candidates = dedupe_candidates(candidates)
-        if candidates:
-            pd.DataFrame(candidates).sort_values(["y", "x"]).to_csv(DEBUG_POS_PATH, index=False, encoding="utf-8-sig")
+            f.write(text)
 
         need = 7 if car_count == "7車" else 9
 
-        # 1) まず上側の横一列を優先
-        row_groups = merge_same_row(candidates)
-        ranked_rows = []
-        for y_key, group in row_groups.items():
-            group = sorted(group, key=lambda v: v["x"])
-            uniq_nums = []
-            seen = set()
-            for g in group:
-                if g["num"] not in seen:
-                    uniq_nums.append(g)
-                    seen.add(g["num"])
-            if len(uniq_nums) < 3:
-                continue
-            x_span = max(v["x"] for v in uniq_nums) - min(v["x"] for v in uniq_nums)
-            if x_span < 45:
-                continue
-            ranked_rows.append((y_key, uniq_nums, x_span))
+        # 1. テキスト縦並びから抽出
+        line = parse_vertical_number_block(text, need)
+        if line:
+            return line, f"テキスト縦並びから抽出: {line}"
 
-        ranked_rows = sorted(ranked_rows, key=lambda t: (t[0], -t[2]))
-        for y_key, row, _ in ranked_rows[:12]:
-            line_text = line_from_row(row, need)
-            if line_text:
-                return line_text, f"横並び優先抽出: {line_text} (y={y_key})"
+        # 2. script から抽出
+        script_text = "\n".join([s.get_text(" ", strip=True) for s in soup.find_all("script")])
+        candidates = parse_jsonish_strings(script_text, need)
+        if candidates:
+            return candidates[0], f"script内データから抽出: {candidates[0]}"
 
-        # 2) 上部帯だけで再試行
-        top_band = [c for c in candidates if 250 <= c["y"] <= 620]
-        top_rows = merge_same_row(top_band)
-        for y_key in sorted(top_rows.keys()):
-            line_text = line_from_row(top_rows[y_key], need)
-            if line_text:
-                return line_text, f"上部帯抽出: {line_text} (y={y_key})"
+        # 3. HTML全文から抽出
+        candidates = parse_jsonish_strings(html, need)
+        if candidates:
+            return candidates[0], f"HTML内データから抽出: {candidates[0]}"
 
-        return "", "並びを正しく組めませんでした"
+        # 4. 最終保険
+        nums = re.findall(r"\b[1-9]\b", text)
+        uniq = []
+        seen = set()
+        for n in nums:
+            if n not in seen:
+                uniq.append(n)
+                seen.add(n)
+            if len(uniq) >= need:
+                break
+
+        if len(uniq) >= need:
+            if need == 7:
+                fallback_candidates = [
+                    [[uniq[0], uniq[1], uniq[2]], [uniq[3]], [uniq[4], uniq[5]], [uniq[6]]],
+                    [[uniq[0], uniq[1], uniq[2]], [uniq[3], uniq[4]], [uniq[5], uniq[6]]],
+                ]
+            else:
+                fallback_candidates = [
+                    [uniq[0:3], uniq[3:6], uniq[6:9]]
+                ]
+
+            for groups in fallback_candidates:
+                fallback_line = valid_line(clean_groups(groups), need)
+                if fallback_line:
+                    return fallback_line, f"最終保険で抽出: {fallback_line}"
+
+        return "", "requests版では並びを抽出できませんでした"
 
     except Exception as e:
         return "", f"取得エラー: {e}"
-
-    finally:
-        if driver is not None:
-            try:
-                driver.quit()
-            except Exception:
-                pass
 
 
 # =====================================
