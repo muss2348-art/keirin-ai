@@ -1,23 +1,43 @@
 import streamlit as st
 import pandas as pd
+import requests
 
 
 def fetch_race_data(race_url):
     """
-    仮の出走表取得関数
-    今はまだ固定データを返すだけ
-    次のステップで実サイト取得に置き換える
+    Step3：HTML取得テスト
     """
-    df = pd.DataFrame([
-        {"車番": 1, "選手名": "選手A", "競走得点": 98.5, "脚質": "逃"},
-        {"車番": 2, "選手名": "選手B", "競走得点": 95.2, "脚質": "追"},
-        {"車番": 3, "選手名": "選手C", "競走得点": 92.8, "脚質": "両"},
-        {"車番": 4, "選手名": "選手D", "競走得点": 90.1, "脚質": "追"},
-        {"車番": 5, "選手名": "選手E", "競走得点": 89.7, "脚質": "逃"},
-        {"車番": 6, "選手名": "選手F", "競走得点": 87.3, "脚質": "両"},
-        {"車番": 7, "選手名": "選手G", "競走得点": 85.9, "脚質": "追"},
-    ])
-    return df
+
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+        }
+
+        response = requests.get(race_url, headers=headers)
+
+        if response.status_code != 200:
+            st.error(f"取得失敗：ステータスコード {response.status_code}")
+            return pd.DataFrame()
+
+        html = response.text
+
+        st.success("HTML取得成功！")
+        st.write("文字数:", len(html))
+
+        # デバッグ表示（最初の1000文字）
+        st.text(html[:1000])
+
+        # まだ解析しないので仮データ返す
+        df = pd.DataFrame([
+            {"車番": 1, "選手名": "テストA", "競走得点": 100, "脚質": "逃"},
+            {"車番": 2, "選手名": "テストB", "競走得点": 95, "脚質": "追"},
+        ])
+
+        return df
+
+    except Exception as e:
+        st.error(f"エラー発生：{e}")
+        return pd.DataFrame()
 
 
 st.set_page_config(page_title="競輪AIモバイル", layout="centered")
@@ -67,7 +87,7 @@ if load_button:
         st.write("1点金額:", bet_amount)
         st.write("モード:", mode)
 
-        # 出走表取得
+        # 出走表取得（まだテスト）
         df = fetch_race_data(race_url)
 
         st.subheader("出走表")
