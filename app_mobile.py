@@ -1,6 +1,25 @@
 import streamlit as st
 import pandas as pd
 
+
+def fetch_race_data(race_url):
+    """
+    仮の出走表取得関数
+    今はまだ固定データを返すだけ
+    次のステップで実サイト取得に置き換える
+    """
+    df = pd.DataFrame([
+        {"車番": 1, "選手名": "選手A", "競走得点": 98.5, "脚質": "逃"},
+        {"車番": 2, "選手名": "選手B", "競走得点": 95.2, "脚質": "追"},
+        {"車番": 3, "選手名": "選手C", "競走得点": 92.8, "脚質": "両"},
+        {"車番": 4, "選手名": "選手D", "競走得点": 90.1, "脚質": "追"},
+        {"車番": 5, "選手名": "選手E", "競走得点": 89.7, "脚質": "逃"},
+        {"車番": 6, "選手名": "選手F", "競走得点": 87.3, "脚質": "両"},
+        {"車番": 7, "選手名": "選手G", "競走得点": 85.9, "脚質": "追"},
+    ])
+    return df
+
+
 st.set_page_config(page_title="競輪AIモバイル", layout="centered")
 
 st.title("🚴 競輪AI予想 モバイル版")
@@ -36,7 +55,7 @@ mode = st.selectbox(
 load_button = st.button("出走表を読み込む")
 
 # ========================
-# 仮の処理
+# 処理
 # ========================
 if load_button:
     if not race_url:
@@ -48,22 +67,14 @@ if load_button:
         st.write("1点金額:", bet_amount)
         st.write("モード:", mode)
 
-        # 仮の出走表
-        dummy_data = pd.DataFrame([
-            {"車番": 1, "選手名": "選手A", "競走得点": 98.5, "脚質": "逃"},
-            {"車番": 2, "選手名": "選手B", "競走得点": 95.2, "脚質": "追"},
-            {"車番": 3, "選手名": "選手C", "競走得点": 92.8, "脚質": "両"},
-            {"車番": 4, "選手名": "選手D", "競走得点": 90.1, "脚質": "追"},
-            {"車番": 5, "選手名": "選手E", "競走得点": 89.7, "脚質": "逃"},
-            {"車番": 6, "選手名": "選手F", "競走得点": 87.3, "脚質": "両"},
-            {"車番": 7, "選手名": "選手G", "競走得点": 85.9, "脚質": "追"},
-        ])
+        # 出走表取得
+        df = fetch_race_data(race_url)
 
         st.subheader("出走表")
-        st.dataframe(dummy_data, use_container_width=True)
+        st.dataframe(df, use_container_width=True)
 
-        # 仮の車立て判定
-        num_racers = len(dummy_data)
+        # 車立て判定
+        num_racers = len(df)
         if num_racers == 7:
             race_type = "7車"
         elif num_racers == 9:
