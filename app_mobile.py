@@ -1,11 +1,15 @@
 import streamlit as st
 import pandas as pd
 import requests
+from bs4 import BeautifulSoup
 
 
 def fetch_race_data(race_url):
     """
-    Step3：HTML取得テスト
+    Step4：HTML解析の準備
+    - requestsで取得
+    - BeautifulSoupで読む
+    - titleとtable数を確認
     """
 
     try:
@@ -13,7 +17,7 @@ def fetch_race_data(race_url):
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
         }
 
-        response = requests.get(race_url, headers=headers)
+        response = requests.get(race_url, headers=headers, timeout=10)
 
         if response.status_code != 200:
             st.error(f"取得失敗：ステータスコード {response.status_code}")
@@ -24,10 +28,24 @@ def fetch_race_data(race_url):
         st.success("HTML取得成功！")
         st.write("文字数:", len(html))
 
-        # デバッグ表示（最初の1000文字）
-        st.text(html[:1000])
+        soup = BeautifulSoup(html, "html.parser")
 
-        # まだ解析しないので仮データ返す
+        # ページタイトル確認
+        page_title = soup.title.string.strip() if soup.title and soup.title.string else "タイトル不明"
+        st.write("ページタイトル:", page_title)
+
+        # table数を確認
+        tables = soup.find_all("table")
+        st.write("table数:", len(tables))
+
+        # デバッグ用に最初のtableを少し表示
+        if tables:
+            st.subheader("最初のtable（デバッグ）")
+            st.text(str(tables[0])[:1500])
+        else:
+            st.warning("tableが見つからなかったよ")
+
+        # まだ本抽出しないので仮データ返す
         df = pd.DataFrame([
             {"車番": 1, "選手名": "テストA", "競走得点": 100, "脚質": "逃"},
             {"車番": 2, "選手名": "テストB", "競走得点": 95, "脚質": "追"},
@@ -87,7 +105,7 @@ if load_button:
         st.write("1点金額:", bet_amount)
         st.write("モード:", mode)
 
-        # 出走表取得（まだテスト）
+        # 出走表取得（解析準備）
         df = fetch_race_data(race_url)
 
         st.subheader("出走表")
