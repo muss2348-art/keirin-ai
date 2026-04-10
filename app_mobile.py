@@ -3,6 +3,7 @@ import itertools
 import math
 import os
 import re
+import unicodedata
 from datetime import datetime
 
 import requests
@@ -13,6 +14,22 @@ from bs4 import BeautifulSoup
 st.set_page_config(page_title="競輪AIモバイル", layout="centered")
 
 LOG_FILE = "race_result_log.csv"
+
+
+# =========================================
+# 共通整形
+# =========================================
+def normalize_text(text):
+    if not text:
+        return ""
+    text = unicodedata.normalize("NFKC", text)
+    text = text.replace("　", " ")
+    return text
+
+
+def clean_lines(text):
+    text = normalize_text(text)
+    return [line.strip() for line in text.splitlines() if line.strip()]
 
 
 # =========================================
@@ -77,6 +94,8 @@ def parse_lineup(text):
     if not text:
         return groups
 
+    text = normalize_text(text)
+
     for part in text.split("/"):
         members = [x.strip() for x in part.strip().split("-") if x.strip()]
         if members:
@@ -85,7 +104,7 @@ def parse_lineup(text):
 
 
 def detect_race_size(lineup_text):
-    nums = re.findall(r"\d+", lineup_text or "")
+    nums = re.findall(r"\d+", normalize_text(lineup_text or ""))
     count = len(set(nums))
     if count == 9:
         return 9
@@ -132,22 +151,30 @@ def judge_mode(line_groups):
 
 
 # =========================================
-# 選手データ入力（得点・脚質）
+# 選手データ整形
 # 入力例:
-# 1,92.3,逃
+# 1 92.3 逃
 # 2,88.1,追
-# 3,90.7,両
+# 3　90.7　両
 # =========================================
+def normalize_style(style):
+    s = normalize_text(style).strip()
+    if s in ["逃", "先", "先行"]:
+        return "逃"
+    if s in ["捲", "まくり"]:
+        return "捲"
+    if s in ["差", "差し"]:
+        return "差"
+    if s in ["追", "追込", "追い込み"]:
+        return "追"
+    if s in ["両", "自在"]:
+        return "両"
+    return s
+
+
 def parse_rider_data(text):
     rider_data = {}
-    if not text.strip():
-        return rider_data
-
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-
+    for line in clean_lines(text):
         parts = [p.strip() for p in re.split(r"[,\s]+", line) if p.strip()]
         if len(parts) < 3:
             continue
@@ -155,6 +182,9 @@ def parse_rider_data(text):
         num = parts[0]
         score_text = parts[1]
         style = parts[2]
+
+        if not num.isdigit():
+            continue
 
         try:
             score_val = float(score_text)
@@ -169,19 +199,49 @@ def parse_rider_data(text):
     return rider_data
 
 
-def normalize_style(style):
-    s = style.strip()
-    if s in ["逃", "先", "先行"]:
-        return "逃"
-    if s in ["捲", "まくり"]:
-        return "捲"
-    if s in ["差", "差し"]:
-        return "差"
-    if s in ["追", "追込", "追い込み"]:
-        return "追"
-    if s in ["両", "自在"]:
-        return "両"
-    return s
+def format_rider_data_preview(text):
+    rider_data = parse_rider_data(text)
+    lines = []
+    for num in sorted(rider_data.keys(), key=lambda x: int(x)):
+        info = rider_data[num]
+        lines.append(f"{num}: 得点 {info['score']} / 脚質 {info['style']}")
+    return rider_data, lines
+
+
+# =========================================
+# オッズ整形
+# 入力例:
+# 4-2-6 12.5
+# 5-3-1,18.2
+# 7-4-2　55
+# =========================================
+def parse_odds_text(text):
+    odds_map = {}
+
+    for line in clean_lines(text):
+        parts = [p.strip() for p in re.split(r"[,\s]+", line) if p.strip()]
+        if len(parts) < 2:
+            continue
+
+        ticket = parts[0]
+        ticket = normalize_text(ticket)
+
+        try:
+            odds_val = float(parts[1])
+        except ValueError:
+            continue
+
+        odds_map[ticket] = odds_val
+
+    return odds_map
+
+
+def format_odds_preview(text):
+    odds_map = parse_odds_text(text)
+    lines = []
+    for k, v in odds_map.items():
+        lines.append(f"{k}: {v}")
+    return odds_map, lines
 
 
 # =========================================
@@ -208,7 +268,7 @@ def get_single_nums(line_groups):
 
 
 # =========================================
-# 得点・脚質込み基本点
+# 基本点
 # =========================================
 def make_base_scores(line_groups, rider_data=None):
     rider_data = rider_data or {}
@@ -225,16 +285,13 @@ def make_base_scores(line_groups, rider_data=None):
         elif len(group) == 1:
             scores[group[0]] = 82
 
-    # 得点補正
     for num, info in rider_data.items():
         if num not in scores:
             scores[num] = 70
 
-        # 競走得点 80～100あたりを想定して補正
         score_val = info.get("score", 0)
         scores[num] += (score_val - 85.0) * 1.8
 
-        # 脚質補正
         style = info.get("style", "")
         if style == "逃":
             scores[num] += 6
@@ -261,13 +318,10 @@ def score_sanrentan(ticket, line_groups, rider_data=None, mode="標準", mix_sty
     single_nums = get_single_nums(line_groups)
 
     score = 0.0
-
-    # 基本能力
     score += base_scores.get(a, 60) * 1.00
     score += base_scores.get(b, 60) * 0.72
     score += base_scores.get(c, 60) * 0.52
 
-    # ライン評価
     if pair_same_line(a, b, line_index_map):
         score += 22
     if pair_same_line(b, c, line_index_map):
@@ -275,15 +329,11 @@ def score_sanrentan(ticket, line_groups, rider_data=None, mode="標準", mix_sty
     if pair_same_line(a, c, line_index_map):
         score += 6
 
-    # 先頭頭を厚め
     if pos_map.get(a) == 0:
         score += 18
-
-    # 番手頭も残す
     if pos_map.get(a) == 1:
         score += 8
 
-    # 単騎頭をしっかり拾う
     if a in single_nums:
         score += 16
     if b in single_nums:
@@ -291,7 +341,6 @@ def score_sanrentan(ticket, line_groups, rider_data=None, mode="標準", mix_sty
     if c in single_nums:
         score += 2
 
-    # 並び順自然さ
     if pair_same_line(a, b, line_index_map):
         if pos_map.get(a, 9) < pos_map.get(b, 9):
             score += 8
@@ -304,7 +353,6 @@ def score_sanrentan(ticket, line_groups, rider_data=None, mode="標準", mix_sty
         else:
             score -= 2
 
-    # 脚質追加補正
     rider_data = rider_data or {}
     a_style = rider_data.get(a, {}).get("style", "")
     b_style = rider_data.get(b, {}).get("style", "")
@@ -321,7 +369,6 @@ def score_sanrentan(ticket, line_groups, rider_data=None, mode="標準", mix_sty
     elif b_style == "追":
         score += 2
 
-    # モード補正
     if mode == "固め":
         if pair_same_line(a, b, line_index_map):
             score += 12
@@ -329,7 +376,6 @@ def score_sanrentan(ticket, line_groups, rider_data=None, mode="標準", mix_sty
             score += 6
         if a in single_nums:
             score -= 6
-
     elif mode == "混戦":
         if a in single_nums:
             score += 16
@@ -337,14 +383,12 @@ def score_sanrentan(ticket, line_groups, rider_data=None, mode="標準", mix_sty
             score += 9
         if not pair_same_line(b, c, line_index_map):
             score += 5
-
     else:
         if pair_same_line(a, b, line_index_map):
             score += 7
         if a in single_nums:
             score += 6
 
-    # 買い方補正
     if mix_style == "固め穴目ミックス":
         if a in single_nums:
             score += 5
@@ -365,7 +409,6 @@ def score_nishatan(ticket, line_groups, rider_data=None, mode="標準", mix_styl
     single_nums = get_single_nums(line_groups)
 
     score = 0.0
-
     score += base_scores.get(a, 60) * 1.00
     score += base_scores.get(b, 60) * 0.78
 
@@ -374,7 +417,6 @@ def score_nishatan(ticket, line_groups, rider_data=None, mode="標準", mix_styl
 
     if pos_map.get(a) == 0:
         score += 16
-
     if pos_map.get(a) == 1:
         score += 7
 
@@ -410,13 +452,11 @@ def score_nishatan(ticket, line_groups, rider_data=None, mode="標準", mix_styl
             score += 12
         if a in single_nums:
             score -= 6
-
     elif mode == "混戦":
         if a in single_nums:
             score += 18
         if not pair_same_line(a, b, line_index_map):
             score += 10
-
     else:
         if a in single_nums:
             score += 7
@@ -439,7 +479,6 @@ def softmax_probabilities(items):
 
     scores = [x["スコア"] for x in items]
     max_score = max(scores)
-
     exps = [math.exp((s - max_score) / 12.0) for s in scores]
     total = sum(exps)
 
@@ -447,37 +486,6 @@ def softmax_probabilities(items):
     for item, e in zip(items, exps):
         probs[item["買い目"]] = e / total if total else 0
     return probs
-
-
-def parse_odds_text(text):
-    """
-    入力例:
-    4-2-6 12.5
-    5-3-1 18.2
-    7-4-2 55
-    """
-    odds_map = {}
-    if not text.strip():
-        return odds_map
-
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-
-        parts = [p.strip() for p in re.split(r"[,\s]+", line) if p.strip()]
-        if len(parts) < 2:
-            continue
-
-        ticket = parts[0]
-        try:
-            odds_val = float(parts[1])
-        except ValueError:
-            continue
-
-        odds_map[ticket] = odds_val
-
-    return odds_map
 
 
 def assign_ranks(items, odds_map=None):
@@ -499,16 +507,14 @@ def assign_ranks(items, odds_map=None):
         elif idx <= 2:
             rank = "🟢 対抗"
 
-        enriched_item = {
+        enriched.append({
             **item,
             "推定確率": round(prob * 100, 1),
             "オッズ": odds,
             "期待値": ev,
             "ランク": rank
-        }
-        enriched.append(enriched_item)
+        })
 
-    # オッズがある場合、期待値高いものに 💰 を付ける
     if odds_map:
         ev_sorted = [x for x in enriched if x["期待値"] is not None]
         ev_sorted = sorted(ev_sorted, key=lambda x: x["期待値"], reverse=True)
@@ -531,7 +537,6 @@ def select_mixed_tickets(scored_tickets, ticket_count):
     hole_n = ticket_count - safe_n
 
     safe_part = scored_tickets[:safe_n]
-
     start = safe_n
     end = min(len(scored_tickets), safe_n + max(hole_n * 4, hole_n))
     hole_pool = scored_tickets[start:end]
@@ -562,10 +567,7 @@ def generate_sanrentan(line_groups, rider_data=None, mode="標準", ticket_count
     else:
         selected = sorted(scored, key=lambda x: x[1], reverse=True)[:ticket_count]
 
-    return [
-        {"買い目": "-".join(ticket), "スコア": score}
-        for ticket, score in selected
-    ]
+    return [{"買い目": "-".join(ticket), "スコア": score} for ticket, score in selected]
 
 
 def generate_nishatan(line_groups, rider_data=None, mode="標準", ticket_count=10, mix_style="固め穴目ミックス"):
@@ -581,10 +583,7 @@ def generate_nishatan(line_groups, rider_data=None, mode="標準", ticket_count=
     else:
         selected = sorted(scored, key=lambda x: x[1], reverse=True)[:ticket_count]
 
-    return [
-        {"買い目": "-".join(ticket), "スコア": score}
-        for ticket, score in selected
-    ]
+    return [{"買い目": "-".join(ticket), "スコア": score} for ticket, score in selected]
 
 
 # =========================================
@@ -597,20 +596,9 @@ def save_result_to_csv(data, file_path=LOG_FILE):
         writer = csv.DictWriter(
             f,
             fieldnames=[
-                "保存日時",
-                "レース名",
-                "URL",
-                "車立て",
-                "券種",
-                "モード",
-                "買い方",
-                "並び",
-                "選手データ",
-                "買い目点数",
-                "買い目一覧",
-                "オッズ入力",
-                "レース結果",
-                "的中買い目"
+                "保存日時", "レース名", "URL", "車立て", "券種", "モード", "買い方",
+                "並び", "選手データ", "買い目点数", "買い目一覧", "オッズ入力",
+                "レース結果", "的中買い目"
             ]
         )
 
@@ -621,23 +609,17 @@ def save_result_to_csv(data, file_path=LOG_FILE):
 
 
 def find_hit_tickets(tickets, result_text):
-    result_text = result_text.strip()
-    hits = []
-
+    result_text = normalize_text(result_text).strip()
     if not result_text:
-        return hits
-
-    for t in tickets:
-        if t["買い目"] == result_text:
-            hits.append(t["買い目"])
-
-    return hits
+        return []
+    return [t["買い目"] for t in tickets if t["買い目"] == result_text]
 
 
 # =========================================
 # UI
 # =========================================
 st.title("🚴 競輪AI モバイル版")
+st.caption("CSVなし・コピペ最適化版")
 
 st.markdown("### 🔽 並び自動取得")
 race_name = st.text_input("レース名（任意）", key="race_name")
@@ -663,7 +645,6 @@ if "kari_narabi" in st.session_state:
         "並び",
         value=st.session_state["kari_narabi"]
     )
-
     st.info(f"現在の並び: {st.session_state['kari_narabi']}")
 
     if st.button("並びをクリア"):
@@ -673,46 +654,51 @@ if "kari_narabi" in st.session_state:
         st.rerun()
 
 st.markdown("### ⚙️ 設定")
-
 default_race_size = detect_race_size(st.session_state.get("kari_narabi", ""))
 race_size = st.selectbox("車立て", [7, 9], index=0 if default_race_size == 7 else 1)
-
 bet_type = st.selectbox("券種", ["3連単", "2車単"])
 ticket_count = st.selectbox("買い目点数", list(range(3, 21)), index=7)
 mix_style = st.selectbox("買い方", ["固め穴目ミックス", "本線重視"])
 manual_mode = st.selectbox("モード", ["自動判定", "固め", "標準", "混戦"])
 
-st.markdown("### 🧠 選手データ（任意）")
-st.caption("入力例: 1,92.3,逃  /  2,88.1,追  /  3,90.7,両")
+st.markdown("### 🧠 選手データをコピペ")
+st.caption("例: 1 92.3 逃 / 2,88.1,追 / 3 90.7 両")
 rider_text = st.text_area(
-    "車番,競走得点,脚質 を1行ずつ",
-    height=120,
-    placeholder="1,92.3,逃\n2,88.1,追\n3,90.7,両"
+    "車番 得点 脚質",
+    height=110,
+    placeholder="1 92.3 逃\n2 88.1 追\n3 90.7 両"
 )
 
-st.markdown("### 💰 オッズ入力（任意）")
-st.caption("買い目とオッズを1行ずつ。期待値計算に使います")
+rider_data, rider_preview = format_rider_data_preview(rider_text)
+if rider_preview:
+    st.write("読込プレビュー:")
+    for line in rider_preview:
+        st.write(line)
+
+st.markdown("### 💰 オッズをコピペ")
+st.caption("例: 4-2-6 12.5 / 5-3-1,18.2")
 odds_text = st.text_area(
     "買い目 オッズ",
-    height=120,
-    placeholder="4-2-6 12.5\n5-3-1 18.2\n7-4-2 55"
+    height=110,
+    placeholder="4-2-6 12.5\n5-3-1 18.2"
 )
+
+odds_map, odds_preview = format_odds_preview(odds_text)
+if odds_preview:
+    st.write("オッズプレビュー:")
+    for line in odds_preview[:10]:
+        st.write(line)
 
 if "kari_narabi" in st.session_state:
     line_groups = parse_lineup(st.session_state["kari_narabi"])
     auto_mode = judge_mode(line_groups)
     mode = auto_mode if manual_mode == "自動判定" else manual_mode
-    rider_data = parse_rider_data(rider_text)
-    odds_map = parse_odds_text(odds_text)
 
     st.markdown("### 📊 判定")
     st.write(f"車立て: {race_size}車")
     st.write(f"自動モード判定: {auto_mode}")
     st.write(f"使用モード: {mode}")
     st.write(f"ライン構成: {line_groups}")
-
-    if rider_data:
-        st.write("選手データ:", rider_data)
 
     if st.button("買い目生成"):
         if bet_type == "3連単":
@@ -747,7 +733,6 @@ if "generated_tickets" in st.session_state:
 
     for i, t in enumerate(st.session_state["generated_tickets"], 1):
         line = f"{i}. {t['ランク']}  {t['買い目']}"
-
         extras = [f"AI評価 {t['スコア']}", f"推定確率 {t['推定確率']}%"]
 
         if t["オッズ"] is not None:
