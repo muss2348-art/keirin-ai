@@ -616,10 +616,65 @@ def find_hit_tickets(tickets, result_text):
 
 
 # =========================================
+# ログ分析
+# =========================================
+def load_result_log(file_path=LOG_FILE):
+    rows = []
+    if not os.path.exists(file_path):
+        return rows
+
+    try:
+        with open(file_path, "r", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                rows.append(row)
+    except Exception:
+        return []
+
+    rows.reverse()
+    return rows
+
+
+def is_hit_row(row):
+    return bool(normalize_text(row.get("的中買い目", "")).strip())
+
+
+def summarize_by_key(rows, key_name):
+    stats = {}
+    for row in rows:
+        key = normalize_text(row.get(key_name, "")).strip() or "未設定"
+        if key not in stats:
+            stats[key] = {"件数": 0, "的中": 0}
+
+        stats[key]["件数"] += 1
+        if is_hit_row(row):
+            stats[key]["的中"] += 1
+
+    result = []
+    for key, val in stats.items():
+        count = val["件数"]
+        hit = val["的中"]
+        rate = round(hit / count * 100, 1) if count else 0.0
+        result.append({
+            key_name: key,
+            "保存件数": count,
+            "的中件数": hit,
+            "的中率": f"{rate}%"
+        })
+
+    result.sort(key=lambda x: x["保存件数"], reverse=True)
+    return result
+
+
+def get_hit_rows(rows):
+    return [row for row in rows if is_hit_row(row)]
+
+
+# =========================================
 # UI
 # =========================================
 st.title("🚴 競輪AI モバイル版")
-st.caption("CSVなし・コピペ最適化版")
+st.caption("CSVなし・コピペ最適化版 + ログ分析")
 
 st.markdown("### 🔽 並び自動取得")
 race_name = st.text_input("レース名（任意）", key="race_name")
@@ -777,3 +832,57 @@ if "generated_tickets" in st.session_state:
                 st.success("結果を保存しました。今回は的中なしです。")
         except Exception as e:
             st.error(f"保存エラー: {e}")
+
+
+# =========================================
+# ログ分析表示
+# =========================================
+st.markdown("---")
+st.markdown("## 📈 成績分析")
+
+log_rows = load_result_log()
+
+if not log_rows:
+    st.info("まだ保存ログがありません。")
+else:
+    total_count = len(log_rows)
+    hit_rows = get_hit_rows(log_rows)
+    hit_count = len(hit_rows)
+    hit_rate = round(hit_count / total_count * 100, 1) if total_count else 0.0
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("保存件数", total_count)
+    c2.metric("的中件数", hit_count)
+    c3.metric("的中率", f"{hit_rate}%")
+
+    st.markdown("### 券種別成績")
+    bet_stats = summarize_by_key(log_rows, "券種")
+    for row in bet_stats:
+        st.write(f"{row['券種']}：{row['保存件数']}件 / 的中 {row['的中件数']}件 / 的中率 {row['的中率']}")
+
+    st.markdown("### モード別成績")
+    mode_stats = summarize_by_key(log_rows, "モード")
+    for row in mode_stats:
+        st.write(f"{row['モード']}：{row['保存件数']}件 / 的中 {row['的中件数']}件 / 的中率 {row['的中率']}")
+
+    st.markdown("### 的中ログ")
+    if hit_rows:
+        for row in hit_rows[:10]:
+            label = row.get("レース名", "") or row.get("保存日時", "")
+            st.write(
+                f"✅ {label} / {row.get('券種', '')} / "
+                f"結果 {row.get('レース結果', '')} / 的中 {row.get('的中買い目', '')}"
+            )
+    else:
+        st.write("まだ的中ログはありません。")
+
+    st.markdown("### 直近ログ")
+    show_n = st.selectbox("表示件数", [5, 10, 20, 50], index=1)
+    for row in log_rows[:show_n]:
+        label = row.get("レース名", "") or "レース名なし"
+        hit_mark = "✅" if is_hit_row(row) else "—"
+        st.write(
+            f"{hit_mark} {row.get('保存日時', '')} / {label} / "
+            f"{row.get('券種', '')} / {row.get('モード', '')} / "
+            f"結果 {row.get('レース結果', '')}"
+        )
