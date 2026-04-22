@@ -48,6 +48,20 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 LOG_PATH = SCRIPT_DIR / "log.csv"
 SAVED_RACES_PATH = SCRIPT_DIR / "saved_races.json"
 
+PREFECTURES = [
+    "北海道",
+    "青森", "岩手", "宮城", "秋田", "山形", "福島",
+    "茨城", "栃木", "群馬", "埼玉", "千葉", "東京", "神奈川",
+    "新潟", "富山", "石川", "福井",
+    "山梨", "長野",
+    "岐阜", "静岡", "愛知", "三重",
+    "滋賀", "京都", "大阪", "兵庫", "奈良", "和歌山",
+    "鳥取", "島根", "岡山", "広島", "山口",
+    "徳島", "香川", "愛媛", "高知",
+    "福岡", "佐賀", "長崎", "熊本", "大分", "宮崎", "鹿児島", "沖縄",
+]
+PREF_PATTERN = "|".join(sorted(PREFECTURES, key=len, reverse=True))
+
 
 # =========================================================
 # 共通
@@ -105,10 +119,11 @@ def normalize_ticket(ticket: str) -> str:
 
 def is_valid_player_name(name: str) -> bool:
     name = normalize_text(name)
-
     if not name:
         return False
     if re.fullmatch(r"\d+", name):
+        return False
+    if name in ["勝率", "本命", "対抗", "単穴", "連下", "単騎で", "コメント", "ギヤ", "倍率"]:
         return False
     if not re.search(r"[一-龥ぁ-んァ-ヶ々]", name):
         return False
@@ -132,7 +147,6 @@ def format_saved_hit_ticket(item: dict) -> str:
 # =========================================================
 def rank_base_amount(rank_label: str, unit_bet: int) -> int:
     unit = max(100, int(unit_bet))
-
     if rank_label == "🔥 AI推奨":
         return unit * 3
     if rank_label == "🟢 本命":
@@ -784,7 +798,11 @@ def extract_players_section(page_text: str) -> str:
     text = normalize_text(page_text)
 
     start_keywords = ["AI 競走得点", "競走得点", "脚質"]
-    end_keywords = ["並び予想", "予想並び", "並び", "オッズ一覧", "人気順", "2車単", "3連単"]
+    end_keywords = [
+        "並び予想", "予想並び", "並び",
+        "オッズ一覧", "人気順",
+        "2車単", "3連単", "2車複", "3連複"
+    ]
 
     start_pos = -1
     for kw in start_keywords:
@@ -798,11 +816,230 @@ def extract_players_section(page_text: str) -> str:
 
     end_pos = len(text)
     for kw in end_keywords:
-        pos = text.find(kw, start_pos)
+        pos = text.find(kw, start_pos + 1)
         if pos != -1:
             end_pos = min(end_pos, pos)
 
-    return normalize_text(text[start_pos:end_pos])
+    section = normalize_text(text[start_pos:end_pos])
+
+    if len(section) < 300:
+        return text
+
+    return section
+
+
+def extract_name_from_block(block: str) -> str:
+    b = normalize_text(block)
+
+    m = re.search(rf'([一-龥ぁ-んァ-ヶ々]{{2,12}})\s+(?:{PREF_PATTERN})', b)
+    if m:
+        cand = normalize_text(m.group(1))
+        if is_valid_player_name(cand):
+            return cand
+
+    candidates = re.findall(r'([一-龥ぁ-んァ-ヶ々]{2,12})', b)
+    ng_words = set(PREFECTURES + ["本命", "対抗", "単穴", "連下", "勝率", "コメント", "倍率", "ギヤ", "単騎で"])
+
+    for cand in candidates:
+        cand = normalize_text(cand)
+        if cand in ng_words:
+            continue
+        if is_valid_player_name(cand):
+            return cand
+
+    return ""
+
+
+def extract_score_from_block(block: str) -> float:
+    b = normalize_text(block)
+
+    m = re.search(
+        r'\d{2,3}期\s+(?:本命|対抗|単穴|連下)?\s*([5-9]\d(?:\.\d{1,3})?)\s+\d+\s+\d+\s+\d+\s+(?:逃|捲|追|両|自)',
+        b
+    )
+    if m:
+        v = safe_float(m.group(1), 0.0)
+        if 50 <= v <= 130:
+            return v
+
+    m = re.search(
+        r'\d{2,3}期\s+(?:本命|対抗|単穴|連下)?\s*([5-9]\d(?:\.\d{1,3})?)',
+        b
+    )
+    if m:
+        v = safe_float(m.group(1), 0.0)
+        if 50 <= v <= 130:
+            return v
+
+    strong_patterns = [
+        re.compile(r'([5-9]\d(?:\.\d{1,3})?)\s+\d+\s+\d+\s+\d+\s+(逃|捲|追|両|自)'),
+        re.compile(r'([5-9]\d(?:\.\d{1,3})?)\s+\d+\s+\d+\s+(逃|捲|追|両|自)'),
+        re.compile(r'([5-9]\d(?:\.\d{1,3})?)\s+\d+\s+(逃|捲|追|両|自)'),
+    ]
+    for pat in strong_patterns:
+        m = pat.search(b)
+        if m:
+            v = safe_float(m.group(1), 0.0)
+            if 50 <= v <= 130:
+                return v
+
+    m = re.search(r'([5-9]\d(?:\.\d{1,3})?).{0,20}(逃|捲|追|両|自)', b)
+    if m:
+        v = safe_float(m.group(1), 0.0)
+        if 50 <= v <= 130:
+            return v
+
+    candidates = []
+    for m in re.finditer(r'([5-9]\d(?:\.\d{1,3})?)', b):
+        raw = m.group(1)
+        v = safe_float(raw, 0.0)
+        if not (50 <= v <= 130):
+            continue
+
+        before = b[max(0, m.start() - 3):m.start()]
+        after = b[m.end():m.end() + 3]
+
+        if "期" in before or "期" in after:
+            continue
+        if "歳" in before or "歳" in after:
+            continue
+
+        candidates.append(v)
+
+    if candidates:
+        return candidates[-1]
+
+    return 0.0
+
+
+def extract_style_from_block(block: str) -> str:
+    b = normalize_text(block)
+
+    patterns = [
+        re.compile(r'(?:本命|対抗|単穴|連下)?\s*[5-9]\d(?:\.\d{1,3})?\s+\d+\s+\d+\s+\d+\s+(逃|捲|追|両|自)'),
+        re.compile(r'[5-9]\d(?:\.\d{1,3})?(?:\s+\d+){0,6}\s+(逃|捲|追|両|自)'),
+    ]
+
+    for pat in patterns:
+        m = pat.search(b)
+        if m:
+            return normalize_text(m.group(1))
+
+    m = re.search(r'(逃|捲|追|両|自)', b)
+    if m:
+        return normalize_text(m.group(1))
+
+    return ""
+
+
+def extract_single_player_by_car(text: str, car: int):
+    s = normalize_text(text)
+
+    patterns = [
+        re.compile(
+            rf'(?<!\d){car}\s+{car}\s+'
+            rf'([一-龥ぁ-んァ-ヶ々]{{2,12}})\s+'
+            rf'({PREF_PATTERN})\s+'
+            rf'([ALS]\d)\s+'
+            rf'(\d{{2}})歳\s+'
+            rf'(\d{{2,3}})期\s+'
+            rf'(?:本命|対抗|単穴|連下)?\s*'
+            rf'([5-9]\d(?:\.\d{{1,3}})?)\s+'
+            rf'(?:\d+\s+){{2,5}}'
+            rf'(逃|捲|追|両|自)'
+        ),
+        re.compile(
+            rf'(?<!\d){car}\s+'
+            rf'([一-龥ぁ-んァ-ヶ々]{{2,12}})\s+'
+            rf'({PREF_PATTERN})\s+'
+            rf'([ALS]\d)\s+'
+            rf'(\d{{2}})歳\s+'
+            rf'(\d{{2,3}})期\s+'
+            rf'(?:本命|対抗|単穴|連下)?\s*'
+            rf'([5-9]\d(?:\.\d{{1,3}})?)\s+'
+            rf'(?:\d+\s+){{2,5}}'
+            rf'(逃|捲|追|両|自)'
+        ),
+        re.compile(
+            rf'(?<!\d){car}\s+{car}\s+'
+            rf'([一-龥ぁ-んァ-ヶ々]{{2,12}})\s+'
+            rf'({PREF_PATTERN})\s+'
+            rf'[ALS]\d\s+\d{{2}}歳\s+\d{{2,3}}期'
+            rf'.{{0,120}}?'
+            rf'(逃|捲|追|両|自)'
+        ),
+        re.compile(
+            rf'(?<!\d){car}\s+'
+            rf'([一-龥ぁ-んァ-ヶ々]{{2,12}})\s+'
+            rf'({PREF_PATTERN})\s+'
+            rf'[ALS]\d\s+\d{{2}}歳\s+\d{{2,3}}期'
+            rf'.{{0,120}}?'
+            rf'(逃|捲|追|両|自)'
+        ),
+    ]
+
+    for idx, pat in enumerate(patterns, start=1):
+        m = pat.search(s)
+        if not m:
+            continue
+
+        if idx in [1, 2]:
+            name = normalize_text(m.group(1))
+            score = safe_float(m.group(5), 0.0)
+            style = normalize_text(m.group(6))
+        else:
+            name = normalize_text(m.group(1))
+            style = normalize_text(m.group(3))
+            block = normalize_text(m.group(0))
+            score = extract_score_from_block(block)
+
+        if is_valid_player_name(name) and 50.0 <= score <= 130.0 and style in ["逃", "捲", "追", "両", "自"]:
+            return {
+                "車番": car,
+                "選手名": name,
+                "競走得点": score,
+                "脚質": style,
+                "source": f"single_pattern_{idx}",
+            }
+
+    next_car = car + 1
+    block_patterns = []
+
+    if next_car <= 9:
+        block_patterns.append(
+            re.compile(
+                rf'(?<!\d){car}\s+{car}\s+(.*?)(?=(?<!\d){next_car}\s+{next_car}\s+|$)'
+            )
+        )
+        block_patterns.append(
+            re.compile(
+                rf'(?<!\d){car}\s+(.*?)(?=(?<!\d){next_car}\s+{next_car}\s+|$)'
+            )
+        )
+    else:
+        block_patterns.append(re.compile(rf'(?<!\d){car}\s+{car}\s+(.*)$'))
+        block_patterns.append(re.compile(rf'(?<!\d){car}\s+(.*)$'))
+
+    for bpat in block_patterns:
+        mm = bpat.search(s)
+        if not mm:
+            continue
+
+        block = normalize_text(mm.group(1))
+        name = extract_name_from_block(block)
+        score = extract_score_from_block(block)
+        style = extract_style_from_block(block)
+
+        if is_valid_player_name(name) and 50.0 <= score <= 130.0 and style in ["逃", "捲", "追", "両", "自"]:
+            return {
+                "車番": car,
+                "選手名": name,
+                "競走得点": score,
+                "脚質": style,
+                "source": "single_block",
+            }
+
+    return None
 
 
 def extract_players_with_regex(text: str, num_riders: int):
@@ -811,183 +1048,113 @@ def extract_players_with_regex(text: str, num_riders: int):
     preview = []
     seen = set()
 
-    patterns = [
-        re.compile(
-            r'(?<!\d)([1-9])\s+([1-9])\s+(?:【\d+†)?([^\]】\s]{2,12})(?:】)?\s+[^\s]{2,4}\s+A\d\s+\d{2}歳\s+\d{2,3}期\s+(?:本命|対抗|単穴|連下)?\s*([5-9]\d\.\d{1,2}).{0,20}?([逃捲追両自])'
-        ),
-        re.compile(
-            r'(?<!\d)([1-9])\s+([1-9])\s+([一-龥ぁ-んァ-ヶ々]{2,12}).{0,120}?([5-9]\d\.\d{1,2}).{0,30}?([逃捲追両自])'
-        ),
-    ]
+    entry_pattern = re.compile(
+        rf'(?<!\d)'
+        rf'([1-9])\s+\1\s+'
+        rf'([一-龥ぁ-んァ-ヶ々]{{2,12}})\s+'
+        rf'({PREF_PATTERN})\s+'
+        rf'([ALS]\d)\s+'
+        rf'(\d{{2}})歳\s+'
+        rf'(\d{{2,3}})期\s+'
+        rf'(?:本命|対抗|単穴|連下)?\s*'
+        rf'([5-9]\d(?:\.\d{{1,3}})?)\s+'
+        rf'(\d+)\s+(\d+)\s+(\d+)\s+'
+        rf'(逃|捲|追|両|自)'
+    )
 
-    for pat in patterns:
-        for m in pat.finditer(s):
-            car = safe_int(m.group(2))
-            name = normalize_text(m.group(3))
-            score = safe_float(m.group(4))
-            style = normalize_text(m.group(5))
+    for m in entry_pattern.finditer(s):
+        car = safe_int(m.group(1))
+        name = normalize_text(m.group(2))
+        score = safe_float(m.group(7), 0.0)
+        style = normalize_text(m.group(11))
 
-            if (
-                1 <= car <= num_riders
-                and score >= 50.0
-                and style in ["逃", "捲", "追", "両", "自"]
-                and is_valid_player_name(name)
-            ):
-                if car not in seen:
-                    seen.add(car)
-                    rows.append(
-                        {
-                            "車番": car,
-                            "選手名": name,
-                            "競走得点": score,
-                            "脚質": style,
-                        }
-                    )
-                    preview.append(
-                        {
-                            "車番": car,
-                            "選手名": name,
-                            "競走得点": score,
-                            "脚質": style,
-                            "source": "regex",
-                        }
-                    )
+        if (
+            1 <= car <= num_riders
+            and car not in seen
+            and is_valid_player_name(name)
+            and 50.0 <= score <= 130.0
+            and style in ["逃", "捲", "追", "両", "自"]
+        ):
+            seen.add(car)
+            rows.append(
+                {
+                    "車番": car,
+                    "選手名": name,
+                    "競走得点": score,
+                    "脚質": style,
+                }
+            )
+            preview.append(
+                {
+                    "車番": car,
+                    "選手名": name,
+                    "競走得点": score,
+                    "脚質": style,
+                    "source": "entry_pattern",
+                }
+            )
+
+    if len(rows) < num_riders:
+        for car in range(1, num_riders + 1):
+            if car in seen:
+                continue
+
+            hit = extract_single_player_by_car(s, car)
+            if hit:
+                seen.add(car)
+                rows.append(
+                    {
+                        "車番": hit["車番"],
+                        "選手名": hit["選手名"],
+                        "競走得点": hit["競走得点"],
+                        "脚質": hit["脚質"],
+                    }
+                )
+                preview.append(hit)
 
     if not rows:
         return pd.DataFrame(), {"hit_count": 0, "preview": []}
 
     df = pd.DataFrame(rows).groupby("車番", as_index=False).first()
+    df = df.sort_values("車番").reset_index(drop=True)
+
     return df[["車番", "選手名", "競走得点", "脚質"]].copy(), {
         "hit_count": len(df),
         "preview": preview[:10],
     }
 
 
-def build_sequential_player_blocks(section_text: str, num_riders: int):
+def extract_missing_players_by_car_blocks(section_text, num_riders, existing_cars):
     s = normalize_text(section_text)
-    starts = []
-    cursor = 0
 
-    for car in range(1, num_riders + 1):
-        patterns = [
-            re.compile(rf'(?<!\d)[1-9]\s+{car}\s+'),
-            re.compile(rf'(?<!\d){car}\s+'),
-        ]
-
-        found = None
-        for pat in patterns:
-            m = pat.search(s, cursor)
-            if m:
-                found = m
-                break
-
-        if not found:
-            continue
-
-        starts.append((car, found.start(), found.end()))
-        cursor = found.end()
-
-    if not starts:
-        return []
-
-    blocks = []
-    for i, (car, start, match_end) in enumerate(starts):
-        if i < len(starts) - 1:
-            end = starts[i + 1][1]
-        else:
-            end = len(s)
-            for kw in ["並び予想", "予想並び", "並び", "オッズ一覧", "人気順", "2車単", "3連単"]:
-                pos = s.find(kw, start)
-                if pos != -1:
-                    end = min(end, pos)
-
-        block = normalize_text(s[start:end])
-        blocks.append({"車番": car, "block": block})
-
-    return blocks
-
-
-def parse_player_from_block(car: int, block: str):
-    b = normalize_text(block)
-
-    name = ""
-    score = 0.0
-    style = ""
-
-    name_patterns = [
-        re.compile(rf'(?<!\d)[1-9]\s+{car}\s+(?:【\d+†)?([^\]】\s]{{2,12}})(?:】)?\s+[^\s]{{2,4}}\s+A\d'),
-        re.compile(rf'(?<!\d)[1-9]\s+{car}\s+([一-龥ぁ-んァ-ヶ々]{{2,12}})'),
-        re.compile(rf'(?<!\d){car}\s+(?:【\d+†)?([一-龥ぁ-んァ-ヶ々]{{2,12}})(?:】)?'),
-    ]
-
-    for pat in name_patterns:
-        m = pat.search(b)
-        if m:
-            candidate = normalize_text(m.group(1))
-            if is_valid_player_name(candidate):
-                name = candidate
-                break
-
-    score_m = re.search(r'([5-9]\d\.\d{1,2})', b)
-    if score_m:
-        score = safe_float(score_m.group(1))
-
-    style_patterns = [
-        re.compile(r'([5-9]\d\.\d{1,2}).{0,30}?([逃捲追両自])'),
-        re.compile(r'([逃捲追両自])'),
-    ]
-
-    for pat in style_patterns:
-        m = pat.search(b)
-        if m:
-            if len(m.groups()) == 2:
-                style = normalize_text(m.group(2))
-            else:
-                style = normalize_text(m.group(1))
-            break
-
-    if not (
-        is_valid_player_name(name)
-        and score >= 50.0
-        and style in ["逃", "捲", "追", "両", "自"]
-    ):
-        return None
-
-    return {
-        "車番": car,
-        "選手名": name,
-        "競走得点": score,
-        "脚質": style,
-    }
-
-
-def extract_missing_players_by_car_blocks(section_text: str, num_riders: int, existing_cars: set[int]):
-    blocks = build_sequential_player_blocks(section_text, num_riders)
     rows = []
     preview = []
 
-    for item in blocks:
-        car = item["車番"]
+    for car in range(1, num_riders + 1):
         if car in existing_cars:
             continue
 
-        parsed = parse_player_from_block(car, item["block"])
-        if parsed:
-            rows.append(parsed)
-            preview.append(
-                {
-                    "車番": parsed["車番"],
-                    "選手名": parsed["選手名"],
-                    "競走得点": parsed["競走得点"],
-                    "脚質": parsed["脚質"],
-                    "source": "block_rescue",
-                }
-            )
+        hit = extract_single_player_by_car(s, car)
+        if not hit:
+            continue
+
+        rows.append(
+            {
+                "車番": hit["車番"],
+                "選手名": hit["選手名"],
+                "競走得点": hit["競走得点"],
+                "脚質": hit["脚質"],
+            }
+        )
+        preview.append(hit)
 
     if not rows:
         return pd.DataFrame(), {"hit_count": 0, "preview": []}
 
-    df = pd.DataFrame(rows).groupby("車番", as_index=False).first()
+    df = pd.DataFrame(rows)
+    df = df.groupby("車番", as_index=False).first()
+    df = df.sort_values("車番").reset_index(drop=True)
+
     return df[["車番", "選手名", "競走得点", "脚質"]].copy(), {
         "hit_count": len(df),
         "preview": preview[:10],
@@ -1031,7 +1198,31 @@ def fetch_players_from_winticket(url: str, num_riders: int):
                 existing_cars,
             )
 
-            final_df = merge_player_dfs(chosen_df, rescue_df)
+            after_section_merge = merge_player_dfs(chosen_df, rescue_df)
+            existing_after_section = set(after_section_merge["車番"].tolist()) if not after_section_merge.empty else set()
+
+            rescue_df_full, rescue_dbg_full = extract_missing_players_by_car_blocks(
+                full_text,
+                num_riders,
+                existing_after_section,
+            )
+
+            final_df = merge_player_dfs(after_section_merge, rescue_df_full)
+
+            final_existing = set(final_df["車番"].tolist()) if not final_df.empty else set()
+            for car in range(1, num_riders + 1):
+                if car in final_existing:
+                    continue
+                hit = extract_single_player_by_car(full_text, car)
+                if hit:
+                    add_df = pd.DataFrame([{
+                        "車番": hit["車番"],
+                        "選手名": hit["選手名"],
+                        "競走得点": hit["競走得点"],
+                        "脚質": hit["脚質"],
+                    }])
+                    final_df = merge_player_dfs(final_df, add_df)
+                    rescue_dbg_full.setdefault("preview", []).append(hit)
 
             debug_items.append(
                 {
@@ -1040,11 +1231,15 @@ def fetch_players_from_winticket(url: str, num_riders: int):
                     "title": fetched["title"],
                     "section_hits": len(df_section),
                     "full_hits": len(df_full),
-                    "rescue_hits": len(rescue_df),
+                    "rescue_hits": len(rescue_df) + len(rescue_df_full),
                     "chosen_hits": len(chosen_df),
                     "final_hits": len(final_df),
                     "missing_before_rescue": sorted(list(missing_cars)),
-                    "preview": chosen_dbg.get("preview", [])[:7] + rescue_dbg.get("preview", [])[:4],
+                    "preview": (
+                        chosen_dbg.get("preview", [])[:7]
+                        + rescue_dbg.get("preview", [])[:4]
+                        + rescue_dbg_full.get("preview", [])[:6]
+                    ),
                     "section_head": section_text[:300],
                 }
             )
@@ -1082,7 +1277,7 @@ def apply_players_to_df(df: pd.DataFrame, players_df: pd.DataFrame) -> pd.DataFr
             out.loc[out["車番"] == car, "選手名"] = name
 
         score = safe_float(row.get("競走得点", 0.0))
-        if score >= 50.0:
+        if 50.0 <= score <= 130.0:
             out.loc[out["車番"] == car, "競走得点"] = score
 
         style = normalize_text(row.get("脚質", ""))
@@ -1360,7 +1555,7 @@ def render_prediction_cards(pred_df: pd.DataFrame):
         st.caption("まだ買い目は出していません。")
         return
 
-    for i, row in pred_df.reset_index(drop=True).iterrows():
+    for _, row in pred_df.reset_index(drop=True).iterrows():
         with st.container(border=True):
             st.markdown(f"### {row.get('買い目ランク', '')} {row.get('買い目', '')}")
             c1, c2 = st.columns(2)
@@ -1525,7 +1720,13 @@ with st.expander("👥 出走表編集", expanded=False):
             name = st.text_input(f"選手名_{i}", value=str(row["選手名"]))
             c1, c2 = st.columns(2)
             score = c1.number_input(f"競走得点_{i}", min_value=0.0, max_value=200.0, value=float(row["競走得点"]), step=0.1)
-            style = c2.selectbox(f"脚質_{i}", options=["", "逃", "捲", "追", "両", "自"], index=["", "逃", "捲", "追", "両", "自"].index(str(row["脚質"]) if str(row["脚質"]) in ["", "逃", "捲", "追", "両", "自"] else ""))
+            style = c2.selectbox(
+                f"脚質_{i}",
+                options=["", "逃", "捲", "追", "両", "自"],
+                index=["", "逃", "捲", "追", "両", "自"].index(
+                    str(row["脚質"]) if str(row["脚質"]) in ["", "逃", "捲", "追", "両", "自"] else ""
+                ),
+            )
             c3, c4, c5 = st.columns(3)
             line_id = c3.number_input(f"ライン_{i}", min_value=0, max_value=9, value=int(row["ライン"]), step=1)
             line_order = c4.number_input(f"ライン順_{i}", min_value=0, max_value=9, value=int(row["ライン順"]), step=1)
