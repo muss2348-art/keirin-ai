@@ -4,11 +4,24 @@ import pandas as pd
 
 
 # =========================================
+# 共通
+# =========================================
+def safe_float(v, default=0.0):
+    try:
+        if v is None or v == "":
+            return float(default)
+        if isinstance(v, str):
+            v = v.replace(",", "").strip()
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+# =========================================
 # モード判定
 # =========================================
 def auto_detect_mode(df: pd.DataFrame) -> str:
     line_counts = df["ライン"].value_counts()
-
     single_count = int((df["単騎"] == 1).sum())
 
     if single_count >= 3:
@@ -29,23 +42,18 @@ def auto_detect_mode(df: pd.DataFrame) -> str:
 def get_single_bonus_weights(df: pd.DataFrame, mode: str):
     single_count = int((df["単騎"] == 1).sum())
 
-    # 単騎が少ない時は強め
     if single_count <= 1:
         head_bonus = 20
         second_bonus = 8
         third_bonus = 4
         strong_bonus = 14
         chaos_bonus = 18
-
-    # 単騎2車ならやや抑える
     elif single_count == 2:
         head_bonus = 12
         second_bonus = 6
         third_bonus = 3
         strong_bonus = 8
         chaos_bonus = 10
-
-    # 単騎3車以上ならかなり抑える
     else:
         head_bonus = 6
         second_bonus = 4
@@ -53,7 +61,6 @@ def get_single_bonus_weights(df: pd.DataFrame, mode: str):
         strong_bonus = 4
         chaos_bonus = 5
 
-    # 通常モードはさらに少し抑える
     if mode == "通常モード":
         head_bonus = max(4, head_bonus - 2)
         strong_bonus = max(2, strong_bonus - 2)
@@ -72,10 +79,6 @@ def get_single_bonus_weights(df: pd.DataFrame, mode: str):
 # レース全体評価
 # =========================================
 def calc_race_balance_factor(df: pd.DataFrame) -> float:
-    """
-    ライン型の本線が強いレースならライン寄り、
-    単騎・分散なら混戦寄りに寄せる
-    """
     line_only = df[df["ライン"] > 0].copy()
     if line_only.empty:
         return 0.9
@@ -85,33 +88,30 @@ def calc_race_balance_factor(df: pd.DataFrame) -> float:
     single_count = int((df["単騎"] == 1).sum())
 
     if max_line >= 3 and single_count <= 1:
-        return 1.12  # ライン本線を少し優遇
+        return 1.12
 
     if single_count >= 3:
-        return 0.93  # 単騎偏重を少し抑える
+        return 0.93
 
     return 1.0
 
 
 # =========================================
-# 個別スコア計算
+# 3連単スコア
 # =========================================
 def calc_score_3tan(r1, r2, r3, mode, bonus_cfg, race_balance_factor):
     score = 0.0
 
-    # ===== 基本点 =====
     score += r1["競走得点"] * 1.45
     score += r2["競走得点"] * 1.00
     score += r3["競走得点"] * 0.72
 
-    # ===== ライン評価 =====
     if r1["ライン"] == r2["ライン"] and r1["ライン"] != 0:
         score += 15
 
     if r2["ライン"] == r3["ライン"] and r2["ライン"] != 0:
         score += 8
 
-    # ライン1-2-3の綺麗な並び
     if (
         r1["ライン"] != 0
         and r1["ライン"] == r2["ライン"] == r3["ライン"]
@@ -121,31 +121,25 @@ def calc_score_3tan(r1, r2, r3, mode, bonus_cfg, race_balance_factor):
     ):
         score += 10
 
-    # 番手
     if r2["ライン順"] == 2:
         score += 8
 
-    # 先行型
     if r1["脚質"] == "逃":
         score += 7
     elif r1["脚質"] == "両":
         score += 5
 
-    # 差し追い込み2着3着
     if r2["脚質"] in ["追", "両"]:
         score += 4
     if r3["脚質"] in ["追", "両"]:
         score += 2
 
-    # ===== 単騎評価（人数に応じて可変）=====
     if r1["単騎"] == 1:
         score += bonus_cfg["head_bonus"]
 
-        # 強い単騎だけ追加
         if r1["競走得点"] >= 90:
             score += bonus_cfg["strong_bonus"]
 
-        # 混戦では上乗せするが、単騎人数が多いと自動で弱い
         if mode == "混戦モード":
             score += bonus_cfg["chaos_bonus"]
 
@@ -155,8 +149,6 @@ def calc_score_3tan(r1, r2, r3, mode, bonus_cfg, race_balance_factor):
     if r3["単騎"] == 1:
         score += bonus_cfg["third_bonus"]
 
-    # ===== 単騎過多の抑制 =====
-    # 単騎が多いのに 1-2-3 全部単騎寄りなら少し下げる
     if bonus_cfg["single_count"] >= 2:
         single_in_ticket = int(r1["単騎"] == 1) + int(r2["単騎"] == 1) + int(r3["単騎"] == 1)
         if single_in_ticket >= 2:
@@ -164,13 +156,15 @@ def calc_score_3tan(r1, r2, r3, mode, bonus_cfg, race_balance_factor):
         if single_in_ticket == 3:
             score -= 14
 
-    # ===== ライン本線の生存補正 =====
     if r1["ライン"] != 0 and r1["ライン"] == r2["ライン"]:
         score *= race_balance_factor
 
     return score
 
 
+# =========================================
+# 2車単スコア
+# =========================================
 def calc_score_2tan(r1, r2, mode, bonus_cfg, race_balance_factor):
     score = 0.0
 
@@ -190,8 +184,10 @@ def calc_score_2tan(r1, r2, mode, bonus_cfg, race_balance_factor):
 
     if r1["単騎"] == 1:
         score += bonus_cfg["head_bonus"]
+
         if r1["競走得点"] >= 90:
             score += bonus_cfg["strong_bonus"]
+
         if mode == "混戦モード":
             score += bonus_cfg["chaos_bonus"]
 
@@ -315,7 +311,7 @@ def evaluate_race(df: pd.DataFrame, pred_df: pd.DataFrame, mode: str):
 
 
 # =========================================
-# 単騎頭の偏りを抑える
+# 単騎頭の偏り抑制
 # =========================================
 def rebalance_single_head_tickets(df: pd.DataFrame, result_df: pd.DataFrame, ticket_type: str, top_n: int):
     if result_df.empty:
@@ -328,7 +324,7 @@ def rebalance_single_head_tickets(df: pd.DataFrame, result_df: pd.DataFrame, tic
         return result_df.head(top_n).copy()
 
     out_rows = []
-    max_single_head = max(2, int(top_n * 0.4))  # 上位の4割まで
+    max_single_head = max(2, int(top_n * 0.4))
     current_single_head = 0
 
     for _, row in result_df.iterrows():
@@ -348,7 +344,6 @@ def rebalance_single_head_tickets(df: pd.DataFrame, result_df: pd.DataFrame, tic
         if len(out_rows) >= top_n:
             break
 
-    # もし足りない場合は残りを埋める
     if len(out_rows) < top_n:
         used_tickets = {str(r["買い目"]) for r in out_rows}
         for _, row in result_df.iterrows():
@@ -396,7 +391,6 @@ def generate_predictions(
             ticket = f"{r1['車番']}-{r2['車番']}"
             score = calc_score_2tan(r1, r2, mode, bonus_cfg, race_balance_factor)
 
-        # 天候補正
         if weather == "雨":
             if r1["脚質"] in ["逃", "両"]:
                 score -= 4
@@ -429,13 +423,11 @@ def generate_predictions(
         axis=1
     )
 
-    # まずスコアと期待値の両方を見る
     result_df = result_df.sort_values(
         ["スコア", "期待値", "オッズ"],
         ascending=[False, False, True]
     ).reset_index(drop=True)
 
-    # 単騎頭の偏りを抑える
     result_df = rebalance_single_head_tickets(df, result_df, ticket_type, top_n)
 
     race_info = evaluate_race(df, result_df, mode)
