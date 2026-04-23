@@ -3,6 +3,9 @@ import itertools
 import pandas as pd
 
 
+# =========================================
+# 共通
+# =========================================
 def safe_float(v, default=0.0):
     try:
         if v is None or v == "":
@@ -14,6 +17,9 @@ def safe_float(v, default=0.0):
         return float(default)
 
 
+# =========================================
+# モード判定
+# =========================================
 def auto_detect_mode(df: pd.DataFrame) -> str:
     line_counts = df["ライン"].value_counts()
     single_count = int((df["単騎"] == 1).sum())
@@ -30,6 +36,9 @@ def auto_detect_mode(df: pd.DataFrame) -> str:
     return "混戦モード"
 
 
+# =========================================
+# 単騎人数に応じた補正
+# =========================================
 def get_single_bonus_weights(df: pd.DataFrame, mode: str):
     single_count = int((df["単騎"] == 1).sum())
 
@@ -66,6 +75,9 @@ def get_single_bonus_weights(df: pd.DataFrame, mode: str):
     }
 
 
+# =========================================
+# レース全体評価
+# =========================================
 def calc_race_balance_factor(df: pd.DataFrame) -> float:
     line_only = df[df["ライン"] > 0].copy()
     if line_only.empty:
@@ -84,6 +96,9 @@ def calc_race_balance_factor(df: pd.DataFrame) -> float:
     return 1.0
 
 
+# =========================================
+# 3連単スコア
+# =========================================
 def calc_score_3tan(r1, r2, r3, mode, bonus_cfg, race_balance_factor):
     score = 0.0
 
@@ -147,6 +162,9 @@ def calc_score_3tan(r1, r2, r3, mode, bonus_cfg, race_balance_factor):
     return score
 
 
+# =========================================
+# 2車単スコア
+# =========================================
 def calc_score_2tan(r1, r2, mode, bonus_cfg, race_balance_factor):
     score = 0.0
 
@@ -187,6 +205,9 @@ def calc_score_2tan(r1, r2, mode, bonus_cfg, race_balance_factor):
     return score
 
 
+# =========================================
+# ランク
+# =========================================
 def rank_ticket(score, odds):
     if odds is None or odds <= 0:
         if score >= 185:
@@ -207,6 +228,9 @@ def rank_ticket(score, odds):
         return "🟡 穴"
 
 
+# =========================================
+# AI評価
+# =========================================
 def ai_label(score):
     if score >= 210:
         return "S"
@@ -218,6 +242,9 @@ def ai_label(score):
         return "C"
 
 
+# =========================================
+# レース判定（強化版）
+# =========================================
 def evaluate_race(df: pd.DataFrame, pred_df: pd.DataFrame, mode: str):
     if pred_df.empty:
         return {
@@ -234,41 +261,49 @@ def evaluate_race(df: pd.DataFrame, pred_df: pd.DataFrame, mode: str):
     score = 50
     reasons = []
 
+    # モード評価
     if mode == "通常モード":
-        score += 10
-        reasons.append("通常モード")
+        score += 12
+        reasons.append("通常モード（安定）")
+    else:
+        score -= 5
+        reasons.append("混戦（荒れ）")
 
+    # 単騎評価
     if single_count == 0:
-        score += 8
+        score += 10
         reasons.append("単騎なし")
     elif single_count == 1:
-        score += 4
+        score += 5
         reasons.append("単騎1車")
     elif single_count >= 3:
-        score -= 10
-        reasons.append("単騎多め")
+        score -= 12
+        reasons.append("単騎多すぎ")
 
+    # 本線の強さ
     if top_score >= 205:
-        score += 12
-        reasons.append("本線強め")
-    elif top_score >= 185:
-        score += 6
-        reasons.append("軸はある")
-    else:
-        score -= 6
-        reasons.append("決め手弱め")
-
-    if mean_top5 >= 180:
+        score += 15
+        reasons.append("本線かなり強い")
+    elif top_score >= 190:
         score += 8
-        reasons.append("上位買い目安定")
+        reasons.append("本線あり")
     else:
-        score -= 4
-        reasons.append("買い目分散")
+        score -= 8
+        reasons.append("軸弱い")
 
-    if score >= 75:
+    # 上位の安定感
+    if mean_top5 >= 185:
+        score += 10
+        reasons.append("上位安定")
+    elif mean_top5 < 170:
+        score -= 6
+        reasons.append("バラけすぎ")
+
+    # 最終判定
+    if score >= 78:
         decision = "買い"
         hit_label = "高"
-    elif score >= 62:
+    elif score >= 65:
         decision = "様子見"
         hit_label = "中"
     else:
@@ -283,6 +318,9 @@ def evaluate_race(df: pd.DataFrame, pred_df: pd.DataFrame, mode: str):
     }
 
 
+# =========================================
+# 単騎頭の偏り抑制
+# =========================================
 def rebalance_single_head_tickets(df: pd.DataFrame, result_df: pd.DataFrame, ticket_type: str, top_n: int):
     if result_df.empty:
         return result_df
@@ -325,6 +363,9 @@ def rebalance_single_head_tickets(df: pd.DataFrame, result_df: pd.DataFrame, tic
     return pd.DataFrame(out_rows).reset_index(drop=True)
 
 
+# =========================================
+# メイン予想
+# =========================================
 def generate_predictions(
     df: pd.DataFrame,
     mode="通常モード",
