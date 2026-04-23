@@ -1,204 +1,101 @@
 # predict.py
-# -*- coding: utf-8 -*-
-
-import itertools
 import pandas as pd
+import itertools
 
 
-# ----------------------------------
-# 安全変換
-# ----------------------------------
-def to_int(v, default=0):
-    try:
-        if v is None or v == "":
-            return int(default)
-        return int(float(v))
-    except Exception:
-        return int(default)
+# =========================================
+# モード判定
+# =========================================
+def auto_detect_mode(df: pd.DataFrame) -> str:
+    line_counts = df["ライン"].value_counts()
 
+    # 単騎多い → 混戦
+    if (df["単騎"] == 1).sum() >= 3:
+        return "混戦モード"
 
-def to_float(v, default=0.0):
-    try:
-        if v is None or v == "":
-            return float(default)
-        return float(v)
-    except Exception:
-        return float(default)
+    # ラインがバラバラ
+    if len(line_counts) >= 4:
+        return "混戦モード"
 
-
-# ----------------------------------
-# モード自動判定
-# ----------------------------------
-def auto_detect_mode(df):
-    """
-    混戦モードを拾いやすくする判定
-    """
-
-    if df is None or len(df) == 0:
+    # 強い1ラインあり
+    if max(line_counts) >= 3:
         return "通常モード"
 
-    work = df.copy()
-
-    for col in ["ライン", "ライン順", "単騎", "脚質", "競走得点"]:
-        if col not in work.columns:
-            if col in ["ライン", "ライン順", "単騎"]:
-                work[col] = 0
-            elif col == "競走得点":
-                work[col] = 0.0
-            else:
-                work[col] = ""
-
-    work["ライン"] = work["ライン"].apply(to_int)
-    work["ライン順"] = work["ライン順"].apply(to_int)
-    work["単騎"] = work["単騎"].apply(to_int)
-    work["競走得点"] = work["競走得点"].apply(to_float)
-    work["脚質"] = work["脚質"].fillna("").astype(str)
-
-    tanki_cnt = int((work["単騎"] == 1).sum())
-
-    line_df = work[work["ライン"] != 0].copy()
-    line_counts = line_df.groupby("ライン").size().to_dict() if not line_df.empty else {}
-
-    line_cnt = len(line_counts)
-    two_line_cnt = sum(1 for _, cnt in line_counts.items() if cnt == 2)
-    head_df = work[(work["ライン"] != 0) & (work["ライン順"] == 1)].copy()
-    head_cnt = len(head_df)
-
-    attack_cnt = int(work["脚質"].isin(["逃", "捲"]).sum())
-    strong_heads = int((head_df["競走得点"] >= 68).sum()) if not head_df.empty else 0
-
-    if tanki_cnt >= 2:
-        return "混戦モード"
-
-    if line_cnt >= 3:
-        return "混戦モード"
-
-    if two_line_cnt >= 2:
-        return "混戦モード"
-
-    if head_cnt >= 3 and attack_cnt >= 3:
-        return "混戦モード"
-
-    if strong_heads >= 2:
-        return "混戦モード"
-
-    if tanki_cnt >= 1 and line_cnt >= 2 and two_line_cnt >= 1:
-        return "混戦モード"
-
-    if len(work) == 7 and tanki_cnt >= 1 and line_cnt >= 2 and attack_cnt >= 2:
-        return "混戦モード"
-
-    return "通常モード"
+    return "混戦モード"
 
 
-# ----------------------------------
+# =========================================
 # スコア計算
-# ----------------------------------
-def calc_score(a, b, c, mode, weather):
-    score = 0.0
+# =========================================
+def calc_score(r1, r2, r3, mode):
+    score = 0
 
-    # 競走得点
-    score += to_float(a["競走得点"]) * 0.45
-    score += to_float(b["競走得点"]) * 0.35
-    score += to_float(c["競走得点"]) * 0.20
+    # ===== 基本 =====
+    score += r1["競走得点"] * 1.5
+    score += r2["競走得点"] * 1.0
+    score += r3["競走得点"] * 0.7
 
-    # 同ライン評価
-    if to_int(a["ライン"]) != 0 and to_int(a["ライン"]) == to_int(b["ライン"]):
+    # ===== ライン =====
+    if r1["ライン"] == r2["ライン"] and r1["ライン"] != 0:
+        score += 15
+
+    if r2["ライン"] == r3["ライン"] and r2["ライン"] != 0:
         score += 8
 
-    if to_int(b["ライン"]) != 0 and to_int(b["ライン"]) == to_int(c["ライン"]):
-        score += 3
+    # ===== 番手強化 =====
+    if r2["ライン順"] == 2:
+        score += 10
 
-    # 番手優遇
-    if to_int(b["ライン順"]) == 2:
-        score += 4
+    # ===== 逃げ有利 =====
+    if r1["脚質"] == "逃":
+        score += 8
 
-    # 単騎頭
-    if to_int(a["単騎"]) == 1:
-        score += 5
+    # ===== 単騎 =====
+    if r1["単騎"] == 1:
+        score += 12   # ←かなり重要
 
-    # 脚質
-    if str(a["脚質"]) == "逃":
-        score += 5
-    if str(a["脚質"]) == "捲":
-        score += 4
-    if str(a["脚質"]) == "追":
-        score += 1
-
-    # 混戦モード補正
+    # =========================================
+    # モード別調整
+    # =========================================
     if mode == "混戦モード":
-        if to_int(a["単騎"]) == 1:
-            score += 8
+        # 単騎さらに強化
+        if r1["単騎"] == 1:
+            score += 20
 
-        if to_int(a["ライン"]) != to_int(b["ライン"]):
-            score += 6
+        # 別ライン絡み
+        if r1["ライン"] != r2["ライン"]:
+            score += 10
 
-        if str(a["脚質"]) in ["捲", "両"]:
-            score += 3
+        if r2["ライン"] != r3["ライン"]:
+            score += 5
 
-    # 天候補正
-    if weather == "風強":
-        if str(a["脚質"]) == "逃":
-            score -= 3
-        if str(a["脚質"]) == "追":
-            score += 3
-
-    if weather == "雨":
-        score *= 0.97
-
-    return round(score, 2)
+    return score
 
 
-# ----------------------------------
-# 相対ランク付け
-# ----------------------------------
-def assign_relative_ranks(pred: pd.DataFrame) -> pd.DataFrame:
-    """
-    固定閾値ではなく、今回の候補内で相対的にランク分けする
-    """
-    if pred is None or pred.empty:
-        return pred
+# =========================================
+# ランク付け
+# =========================================
+def rank_ticket(score, odds):
+    if odds == 0:
+        return "🟡 穴"
 
-    out = pred.copy().reset_index(drop=True)
-    n = len(out)
+    ev = score * odds
 
-    if n == 1:
-        out["買い目ランク"] = ["🔥 AI推奨"]
-        out["AI評価"] = ["S"]
-        return out
-
-    # 上位から順にランクを振る
-    rank_labels = []
-    ai_labels = []
-
-    top_ai = max(1, int(round(n * 0.15)))
-    top_main = max(1, int(round(n * 0.30)))
-    top_value = max(1, int(round(n * 0.60)))
-
-    for i in range(n):
-        if i < top_ai:
-            rank_labels.append("🔥 AI推奨")
-            ai_labels.append("S")
-        elif i < top_main:
-            rank_labels.append("🟢 本命")
-            ai_labels.append("A")
-        elif i < top_value:
-            rank_labels.append("💰 期待値高")
-            ai_labels.append("B")
-        else:
-            rank_labels.append("🟡 穴")
-            ai_labels.append("C")
-
-    out["買い目ランク"] = rank_labels
-    out["AI評価"] = ai_labels
-    return out
+    if ev > 8000:
+        return "🔥 AI推奨"
+    elif ev > 4000:
+        return "🟢 本命"
+    elif ev > 2000:
+        return "💰 期待値高"
+    else:
+        return "🟡 穴"
 
 
-# ----------------------------------
-# 買い目生成
-# ----------------------------------
+# =========================================
+# メイン予想
+# =========================================
 def generate_predictions(
-    df,
+    df: pd.DataFrame,
     mode="通常モード",
     weather="晴",
     top_n=10,
@@ -208,70 +105,84 @@ def generate_predictions(
     if odds_dict is None:
         odds_dict = {}
 
-    rows = []
-    players = df.to_dict("records")
+    results = []
 
-    # ------------------------
-    # 2車単
-    # ------------------------
-    if ticket_type == "2車単":
-        for a, b in itertools.permutations(players, 2):
-            ticket = f"{a['車番']}-{b['車番']}"
+    riders = df.to_dict("records")
 
-            dummy_c = a
-
-            score = calc_score(
-                a, b, dummy_c,
-                mode,
-                weather
-            )
-
-            odds = float(odds_dict.get(ticket, 10))
-            ev = round(score * odds / 10, 1)
-
-            rows.append(
-                {
-                    "買い目": ticket,
-                    "score": score,
-                    "期待値": ev,
-                    "オッズ": odds
-                }
-            )
-
-    # ------------------------
-    # 3連単
-    # ------------------------
+    # =========================================
+    # 組み合わせ生成
+    # =========================================
+    if ticket_type == "3連単":
+        combos = itertools.permutations(riders, 3)
     else:
-        for a, b, c in itertools.permutations(players, 3):
-            ticket = f"{a['車番']}-{b['車番']}-{c['車番']}"
+        combos = itertools.permutations(riders, 2)
 
-            score = calc_score(
-                a, b, c,
-                mode,
-                weather
-            )
+    for combo in combos:
+        if ticket_type == "3連単":
+            r1, r2, r3 = combo
+            ticket = f"{r1['車番']}-{r2['車番']}-{r3['車番']}"
+            score = calc_score(r1, r2, r3, mode)
+        else:
+            r1, r2 = combo
+            ticket = f"{r1['車番']}-{r2['車番']}"
+            score = r1["競走得点"] * 1.5 + r2["競走得点"]
 
-            odds = float(odds_dict.get(ticket, 30))
-            ev = round(score * odds / 10, 1)
+        odds = odds_dict.get(ticket, 0)
 
-            rows.append(
-                {
-                    "買い目": ticket,
-                    "score": score,
-                    "期待値": ev,
-                    "オッズ": odds
-                }
-            )
+        results.append({
+            "買い目": ticket,
+            "スコア": score,
+            "オッズ": odds,
+        })
 
-    pred = pd.DataFrame(rows)
+    result_df = pd.DataFrame(results)
 
-    pred = pred.sort_values(
-        ["score", "期待値"],
-        ascending=False
-    ).head(top_n)
+    # =========================================
+    # スコア順
+    # =========================================
+    result_df = result_df.sort_values("スコア", ascending=False)
 
-    pred = pred.reset_index(drop=True)
+    # =========================================
+    # 期待値
+    # =========================================
+    result_df["期待値"] = result_df["スコア"] * result_df["オッズ"]
 
-    pred = assign_relative_ranks(pred)
+    # =========================================
+    # ランク
+    # =========================================
+    result_df["買い目ランク"] = result_df.apply(
+        lambda x: rank_ticket(x["スコア"], x["オッズ"]),
+        axis=1
+    )
 
-    return pred
+    # =========================================
+    # AI評価（見やすさ）
+    # =========================================
+    def ai_label(score):
+        if score > 250:
+            return "S"
+        elif score > 200:
+            return "A"
+        elif score > 150:
+            return "B"
+        else:
+            return "C"
+
+    result_df["AI評価"] = result_df["スコア"].apply(ai_label)
+
+    # =========================================
+    # 上位抽出（バランス）
+    # =========================================
+    main = result_df.head(int(top_n * 0.6))
+    mid = result_df.iloc[int(top_n * 0.6):int(top_n * 1.2)]
+    mid = mid.sample(min(len(mid), int(top_n * 0.4))) if len(mid) > 0 else mid
+
+    final_df = pd.concat([main, mid]).drop_duplicates()
+
+    # =========================================
+    # 最終整形
+    # =========================================
+    final_df = final_df.sort_values("期待値", ascending=False)
+    final_df = final_df.head(top_n)
+
+    return final_df.reset_index(drop=True)
