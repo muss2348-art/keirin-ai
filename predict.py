@@ -1,6 +1,6 @@
 # predict.py
-import pandas as pd
 import itertools
+import pandas as pd
 
 
 # =========================================
@@ -9,86 +9,356 @@ import itertools
 def auto_detect_mode(df: pd.DataFrame) -> str:
     line_counts = df["ライン"].value_counts()
 
-    # 単騎多い → 混戦
-    if (df["単騎"] == 1).sum() >= 3:
+    single_count = int((df["単騎"] == 1).sum())
+
+    if single_count >= 3:
         return "混戦モード"
 
-    # ラインがバラバラ
     if len(line_counts) >= 4:
         return "混戦モード"
 
-    # 強い1ラインあり
-    if max(line_counts) >= 3:
+    if len(line_counts) > 0 and max(line_counts) >= 3:
         return "通常モード"
 
     return "混戦モード"
 
 
 # =========================================
-# スコア計算
+# 単騎人数に応じた補正
 # =========================================
-def calc_score(r1, r2, r3, mode):
-    score = 0
+def get_single_bonus_weights(df: pd.DataFrame, mode: str):
+    single_count = int((df["単騎"] == 1).sum())
 
-    # ===== 基本 =====
-    score += r1["競走得点"] * 1.5
-    score += r2["競走得点"] * 1.0
-    score += r3["競走得点"] * 0.7
+    # 単騎が少ない時は強め
+    if single_count <= 1:
+        head_bonus = 20
+        second_bonus = 8
+        third_bonus = 4
+        strong_bonus = 14
+        chaos_bonus = 18
 
-    # ===== ライン =====
+    # 単騎2車ならやや抑える
+    elif single_count == 2:
+        head_bonus = 12
+        second_bonus = 6
+        third_bonus = 3
+        strong_bonus = 8
+        chaos_bonus = 10
+
+    # 単騎3車以上ならかなり抑える
+    else:
+        head_bonus = 6
+        second_bonus = 4
+        third_bonus = 2
+        strong_bonus = 4
+        chaos_bonus = 5
+
+    # 通常モードはさらに少し抑える
+    if mode == "通常モード":
+        head_bonus = max(4, head_bonus - 2)
+        strong_bonus = max(2, strong_bonus - 2)
+
+    return {
+        "single_count": single_count,
+        "head_bonus": head_bonus,
+        "second_bonus": second_bonus,
+        "third_bonus": third_bonus,
+        "strong_bonus": strong_bonus,
+        "chaos_bonus": chaos_bonus,
+    }
+
+
+# =========================================
+# レース全体評価
+# =========================================
+def calc_race_balance_factor(df: pd.DataFrame) -> float:
+    """
+    ライン型の本線が強いレースならライン寄り、
+    単騎・分散なら混戦寄りに寄せる
+    """
+    line_only = df[df["ライン"] > 0].copy()
+    if line_only.empty:
+        return 0.9
+
+    line_sizes = line_only.groupby("ライン").size().tolist()
+    max_line = max(line_sizes) if line_sizes else 0
+    single_count = int((df["単騎"] == 1).sum())
+
+    if max_line >= 3 and single_count <= 1:
+        return 1.12  # ライン本線を少し優遇
+
+    if single_count >= 3:
+        return 0.93  # 単騎偏重を少し抑える
+
+    return 1.0
+
+
+# =========================================
+# 個別スコア計算
+# =========================================
+def calc_score_3tan(r1, r2, r3, mode, bonus_cfg, race_balance_factor):
+    score = 0.0
+
+    # ===== 基本点 =====
+    score += r1["競走得点"] * 1.45
+    score += r2["競走得点"] * 1.00
+    score += r3["競走得点"] * 0.72
+
+    # ===== ライン評価 =====
     if r1["ライン"] == r2["ライン"] and r1["ライン"] != 0:
         score += 15
 
     if r2["ライン"] == r3["ライン"] and r2["ライン"] != 0:
         score += 8
 
-    # ===== 番手強化 =====
-    if r2["ライン順"] == 2:
+    # ライン1-2-3の綺麗な並び
+    if (
+        r1["ライン"] != 0
+        and r1["ライン"] == r2["ライン"] == r3["ライン"]
+        and r1["ライン順"] == 1
+        and r2["ライン順"] == 2
+        and r3["ライン順"] == 3
+    ):
         score += 10
 
-    # ===== 逃げ有利 =====
-    if r1["脚質"] == "逃":
+    # 番手
+    if r2["ライン順"] == 2:
         score += 8
 
-    # ===== 単騎 =====
+    # 先行型
+    if r1["脚質"] == "逃":
+        score += 7
+    elif r1["脚質"] == "両":
+        score += 5
+
+    # 差し追い込み2着3着
+    if r2["脚質"] in ["追", "両"]:
+        score += 4
+    if r3["脚質"] in ["追", "両"]:
+        score += 2
+
+    # ===== 単騎評価（人数に応じて可変）=====
     if r1["単騎"] == 1:
-        score += 12   # ←かなり重要
+        score += bonus_cfg["head_bonus"]
 
-    # =========================================
-    # モード別調整
-    # =========================================
-    if mode == "混戦モード":
-        # 単騎さらに強化
-        if r1["単騎"] == 1:
-            score += 20
+        # 強い単騎だけ追加
+        if r1["競走得点"] >= 90:
+            score += bonus_cfg["strong_bonus"]
 
-        # 別ライン絡み
-        if r1["ライン"] != r2["ライン"]:
-            score += 10
+        # 混戦では上乗せするが、単騎人数が多いと自動で弱い
+        if mode == "混戦モード":
+            score += bonus_cfg["chaos_bonus"]
 
-        if r2["ライン"] != r3["ライン"]:
-            score += 5
+    if r2["単騎"] == 1:
+        score += bonus_cfg["second_bonus"]
+
+    if r3["単騎"] == 1:
+        score += bonus_cfg["third_bonus"]
+
+    # ===== 単騎過多の抑制 =====
+    # 単騎が多いのに 1-2-3 全部単騎寄りなら少し下げる
+    if bonus_cfg["single_count"] >= 2:
+        single_in_ticket = int(r1["単騎"] == 1) + int(r2["単騎"] == 1) + int(r3["単騎"] == 1)
+        if single_in_ticket >= 2:
+            score -= 8
+        if single_in_ticket == 3:
+            score -= 14
+
+    # ===== ライン本線の生存補正 =====
+    if r1["ライン"] != 0 and r1["ライン"] == r2["ライン"]:
+        score *= race_balance_factor
+
+    return score
+
+
+def calc_score_2tan(r1, r2, mode, bonus_cfg, race_balance_factor):
+    score = 0.0
+
+    score += r1["競走得点"] * 1.5
+    score += r2["競走得点"] * 1.0
+
+    if r1["ライン"] == r2["ライン"] and r1["ライン"] != 0:
+        score += 14
+
+    if r1["脚質"] == "逃":
+        score += 6
+    elif r1["脚質"] == "両":
+        score += 4
+
+    if r2["ライン順"] == 2:
+        score += 8
+
+    if r1["単騎"] == 1:
+        score += bonus_cfg["head_bonus"]
+        if r1["競走得点"] >= 90:
+            score += bonus_cfg["strong_bonus"]
+        if mode == "混戦モード":
+            score += bonus_cfg["chaos_bonus"]
+
+    if r2["単騎"] == 1:
+        score += bonus_cfg["second_bonus"]
+
+    if bonus_cfg["single_count"] >= 2:
+        single_in_ticket = int(r1["単騎"] == 1) + int(r2["単騎"] == 1)
+        if single_in_ticket >= 2:
+            score -= 8
+
+    if r1["ライン"] != 0 and r1["ライン"] == r2["ライン"]:
+        score *= race_balance_factor
 
     return score
 
 
 # =========================================
-# ランク付け
+# ランク
 # =========================================
 def rank_ticket(score, odds):
-    if odds == 0:
+    if odds is None or odds <= 0:
+        if score >= 185:
+            return "🟢 本命"
+        if score >= 160:
+            return "🔥 AI推奨"
         return "🟡 穴"
 
     ev = score * odds
 
-    if ev > 8000:
-        return "🔥 AI推奨"
-    elif ev > 4000:
-        return "🟢 本命"
-    elif ev > 2000:
+    if ev >= 9000:
         return "💰 期待値高"
+    elif score >= 190:
+        return "🔥 AI推奨"
+    elif score >= 170:
+        return "🟢 本命"
     else:
         return "🟡 穴"
+
+
+# =========================================
+# AI評価
+# =========================================
+def ai_label(score):
+    if score >= 210:
+        return "S"
+    elif score >= 185:
+        return "A"
+    elif score >= 160:
+        return "B"
+    else:
+        return "C"
+
+
+# =========================================
+# レース判定
+# =========================================
+def evaluate_race(df: pd.DataFrame, pred_df: pd.DataFrame, mode: str):
+    if pred_df.empty:
+        return {
+            "レース判定": "見送り",
+            "的中率評価": "低",
+            "レース評価点": 0,
+            "判定理由": "買い目が生成できませんでした",
+        }
+
+    single_count = int((df["単騎"] == 1).sum())
+    top_score = float(pred_df["スコア"].max())
+    mean_top5 = float(pred_df.head(min(5, len(pred_df)))["スコア"].mean())
+
+    score = 50
+    reasons = []
+
+    if mode == "通常モード":
+        score += 10
+        reasons.append("通常モード")
+
+    if single_count == 0:
+        score += 8
+        reasons.append("単騎なし")
+    elif single_count == 1:
+        score += 4
+        reasons.append("単騎1車")
+    elif single_count >= 3:
+        score -= 10
+        reasons.append("単騎多め")
+
+    if top_score >= 205:
+        score += 12
+        reasons.append("本線強め")
+    elif top_score >= 185:
+        score += 6
+        reasons.append("軸はある")
+    else:
+        score -= 6
+        reasons.append("決め手弱め")
+
+    if mean_top5 >= 180:
+        score += 8
+        reasons.append("上位買い目安定")
+    else:
+        score -= 4
+        reasons.append("買い目分散")
+
+    if score >= 75:
+        decision = "買い"
+        hit_label = "高"
+    elif score >= 62:
+        decision = "様子見"
+        hit_label = "中"
+    else:
+        decision = "見送り"
+        hit_label = "低"
+
+    return {
+        "レース判定": decision,
+        "的中率評価": hit_label,
+        "レース評価点": int(score),
+        "判定理由": " / ".join(reasons),
+    }
+
+
+# =========================================
+# 単騎頭の偏りを抑える
+# =========================================
+def rebalance_single_head_tickets(df: pd.DataFrame, result_df: pd.DataFrame, ticket_type: str, top_n: int):
+    if result_df.empty:
+        return result_df
+
+    single_cars = set(df.loc[df["単騎"] == 1, "車番"].astype(int).tolist())
+    single_count = len(single_cars)
+
+    if single_count <= 1:
+        return result_df.head(top_n).copy()
+
+    out_rows = []
+    max_single_head = max(2, int(top_n * 0.4))  # 上位の4割まで
+    current_single_head = 0
+
+    for _, row in result_df.iterrows():
+        ticket = str(row["買い目"])
+        parts = ticket.split("-")
+        head = int(parts[0])
+
+        is_single_head = head in single_cars
+
+        if is_single_head:
+            if current_single_head >= max_single_head:
+                continue
+            current_single_head += 1
+
+        out_rows.append(row)
+
+        if len(out_rows) >= top_n:
+            break
+
+    # もし足りない場合は残りを埋める
+    if len(out_rows) < top_n:
+        used_tickets = {str(r["買い目"]) for r in out_rows}
+        for _, row in result_df.iterrows():
+            if str(row["買い目"]) in used_tickets:
+                continue
+            out_rows.append(row)
+            if len(out_rows) >= top_n:
+                break
+
+    return pd.DataFrame(out_rows).reset_index(drop=True)
 
 
 # =========================================
@@ -106,12 +376,11 @@ def generate_predictions(
         odds_dict = {}
 
     results = []
-
     riders = df.to_dict("records")
 
-    # =========================================
-    # 組み合わせ生成
-    # =========================================
+    bonus_cfg = get_single_bonus_weights(df, mode)
+    race_balance_factor = calc_race_balance_factor(df)
+
     if ticket_type == "3連単":
         combos = itertools.permutations(riders, 3)
     else:
@@ -121,68 +390,56 @@ def generate_predictions(
         if ticket_type == "3連単":
             r1, r2, r3 = combo
             ticket = f"{r1['車番']}-{r2['車番']}-{r3['車番']}"
-            score = calc_score(r1, r2, r3, mode)
+            score = calc_score_3tan(r1, r2, r3, mode, bonus_cfg, race_balance_factor)
         else:
             r1, r2 = combo
             ticket = f"{r1['車番']}-{r2['車番']}"
-            score = r1["競走得点"] * 1.5 + r2["競走得点"]
+            score = calc_score_2tan(r1, r2, mode, bonus_cfg, race_balance_factor)
 
-        odds = odds_dict.get(ticket, 0)
+        # 天候補正
+        if weather == "雨":
+            if r1["脚質"] in ["逃", "両"]:
+                score -= 4
+            if ticket_type == "3連単" and r2["脚質"] in ["追", "両"]:
+                score += 2
+        elif weather == "風強":
+            if r1["脚質"] == "逃":
+                score -= 6
+            if ticket_type == "3連単" and r2["脚質"] == "追":
+                score += 3
 
-        results.append({
-            "買い目": ticket,
-            "スコア": score,
-            "オッズ": odds,
-        })
+        odds = safe_float(odds_dict.get(ticket, 0), 0.0)
+
+        results.append(
+            {
+                "買い目": ticket,
+                "スコア": round(score, 2),
+                "オッズ": odds,
+            }
+        )
 
     result_df = pd.DataFrame(results)
+    if result_df.empty:
+        return result_df
 
-    # =========================================
-    # スコア順
-    # =========================================
-    result_df = result_df.sort_values("スコア", ascending=False)
-
-    # =========================================
-    # 期待値
-    # =========================================
-    result_df["期待値"] = result_df["スコア"] * result_df["オッズ"]
-
-    # =========================================
-    # ランク
-    # =========================================
+    result_df["期待値"] = (result_df["スコア"] * result_df["オッズ"]).round(1)
+    result_df["AI評価"] = result_df["スコア"].apply(ai_label)
     result_df["買い目ランク"] = result_df.apply(
         lambda x: rank_ticket(x["スコア"], x["オッズ"]),
         axis=1
     )
 
-    # =========================================
-    # AI評価（見やすさ）
-    # =========================================
-    def ai_label(score):
-        if score > 250:
-            return "S"
-        elif score > 200:
-            return "A"
-        elif score > 150:
-            return "B"
-        else:
-            return "C"
+    # まずスコアと期待値の両方を見る
+    result_df = result_df.sort_values(
+        ["スコア", "期待値", "オッズ"],
+        ascending=[False, False, True]
+    ).reset_index(drop=True)
 
-    result_df["AI評価"] = result_df["スコア"].apply(ai_label)
+    # 単騎頭の偏りを抑える
+    result_df = rebalance_single_head_tickets(df, result_df, ticket_type, top_n)
 
-    # =========================================
-    # 上位抽出（バランス）
-    # =========================================
-    main = result_df.head(int(top_n * 0.6))
-    mid = result_df.iloc[int(top_n * 0.6):int(top_n * 1.2)]
-    mid = mid.sample(min(len(mid), int(top_n * 0.4))) if len(mid) > 0 else mid
+    race_info = evaluate_race(df, result_df, mode)
+    for col, val in race_info.items():
+        result_df[col] = val
 
-    final_df = pd.concat([main, mid]).drop_duplicates()
-
-    # =========================================
-    # 最終整形
-    # =========================================
-    final_df = final_df.sort_values("期待値", ascending=False)
-    final_df = final_df.head(top_n)
-
-    return final_df.reset_index(drop=True)
+    return result_df.head(top_n).reset_index(drop=True)
