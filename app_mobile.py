@@ -14,8 +14,6 @@ import streamlit as st
 from bs4 import BeautifulSoup
 
 from predict import auto_detect_mode, generate_predictions
-import predict
-st.write("predict file:", predict.__file__)
 
 
 st.set_page_config(
@@ -1468,6 +1466,10 @@ def save_result_log(
                     "オッズ",
                     "購入金額",
                     "期待回収額(目安)",
+                    "レース判定",
+                    "的中率評価",
+                    "レース評価点",
+                    "判定理由",
                 ]
             )
 
@@ -1494,6 +1496,10 @@ def save_result_log(
                     row.get("オッズ", ""),
                     row.get("購入金額", ""),
                     row.get("期待回収額(目安)", ""),
+                    row.get("レース判定", ""),
+                    row.get("的中率評価", ""),
+                    row.get("レース評価点", ""),
+                    row.get("判定理由", ""),
                 ]
             )
 
@@ -1556,6 +1562,22 @@ def render_prediction_cards(pred_df: pd.DataFrame):
     if pred_df is None or pred_df.empty:
         st.caption("まだ買い目は出していません。")
         return
+
+    if "レース判定" in pred_df.columns:
+        race_decision = str(pred_df.iloc[0].get("レース判定", ""))
+        hit_label = str(pred_df.iloc[0].get("的中率評価", ""))
+        race_score = str(pred_df.iloc[0].get("レース評価点", ""))
+        reason = str(pred_df.iloc[0].get("判定理由", ""))
+
+        if race_decision == "買い":
+            st.success(f"レース判定: {race_decision} / 的中率評価: {hit_label} / 評価点: {race_score}")
+        elif race_decision == "見送り":
+            st.warning(f"レース判定: {race_decision} / 的中率評価: {hit_label} / 評価点: {race_score}")
+        else:
+            st.info(f"レース判定: {race_decision} / 的中率評価: {hit_label} / 評価点: {race_score}")
+
+        if reason:
+            st.caption(f"判定理由: {reason}")
 
     for _, row in pred_df.reset_index(drop=True).iterrows():
         with st.container(border=True):
@@ -1627,7 +1649,11 @@ with st.expander("⚙️ 基本設定", expanded=True):
     )
     st.session_state["ticket_type"] = ticket_type
 
-    display_count = st.selectbox("買い目点数", [3, 5, 10, 15, 20, 25, 30], index=2)
+    display_count = st.selectbox(
+        "買い目点数",
+        options=list(range(3, 31)),
+        index=7
+    )
     weather = st.selectbox("天候", ["晴", "雨", "風強"], index=0)
     unit_bet = st.number_input("1点あたり金額", min_value=100, max_value=10000, step=100, value=100)
 
