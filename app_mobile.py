@@ -14,6 +14,8 @@ import streamlit as st
 from bs4 import BeautifulSoup
 
 from predict import auto_detect_mode, generate_predictions
+import predict
+st.write("predict file:", predict.__file__)
 
 
 st.set_page_config(
