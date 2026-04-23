@@ -3,9 +3,6 @@ import itertools
 import pandas as pd
 
 
-# =========================================
-# 共通
-# =========================================
 def safe_float(v, default=0.0):
     try:
         if v is None or v == "":
@@ -17,9 +14,6 @@ def safe_float(v, default=0.0):
         return float(default)
 
 
-# =========================================
-# モード判定
-# =========================================
 def auto_detect_mode(df: pd.DataFrame) -> str:
     line_counts = df["ライン"].value_counts()
     single_count = int((df["単騎"] == 1).sum())
@@ -36,9 +30,6 @@ def auto_detect_mode(df: pd.DataFrame) -> str:
     return "混戦モード"
 
 
-# =========================================
-# 単騎人数に応じた補正
-# =========================================
 def get_single_bonus_weights(df: pd.DataFrame, mode: str):
     single_count = int((df["単騎"] == 1).sum())
 
@@ -75,9 +66,6 @@ def get_single_bonus_weights(df: pd.DataFrame, mode: str):
     }
 
 
-# =========================================
-# レース全体評価
-# =========================================
 def calc_race_balance_factor(df: pd.DataFrame) -> float:
     line_only = df[df["ライン"] > 0].copy()
     if line_only.empty:
@@ -96,9 +84,6 @@ def calc_race_balance_factor(df: pd.DataFrame) -> float:
     return 1.0
 
 
-# =========================================
-# 3連単スコア
-# =========================================
 def calc_score_3tan(r1, r2, r3, mode, bonus_cfg, race_balance_factor):
     score = 0.0
 
@@ -162,9 +147,6 @@ def calc_score_3tan(r1, r2, r3, mode, bonus_cfg, race_balance_factor):
     return score
 
 
-# =========================================
-# 2車単スコア
-# =========================================
 def calc_score_2tan(r1, r2, mode, bonus_cfg, race_balance_factor):
     score = 0.0
 
@@ -205,9 +187,6 @@ def calc_score_2tan(r1, r2, mode, bonus_cfg, race_balance_factor):
     return score
 
 
-# =========================================
-# ランク
-# =========================================
 def rank_ticket(score, odds):
     if odds is None or odds <= 0:
         if score >= 185:
@@ -228,9 +207,6 @@ def rank_ticket(score, odds):
         return "🟡 穴"
 
 
-# =========================================
-# AI評価
-# =========================================
 def ai_label(score):
     if score >= 210:
         return "S"
@@ -242,9 +218,6 @@ def ai_label(score):
         return "C"
 
 
-# =========================================
-# レース判定
-# =========================================
 def evaluate_race(df: pd.DataFrame, pred_df: pd.DataFrame, mode: str):
     if pred_df.empty:
         return {
@@ -310,9 +283,6 @@ def evaluate_race(df: pd.DataFrame, pred_df: pd.DataFrame, mode: str):
     }
 
 
-# =========================================
-# 単騎頭の偏り抑制
-# =========================================
 def rebalance_single_head_tickets(df: pd.DataFrame, result_df: pd.DataFrame, ticket_type: str, top_n: int):
     if result_df.empty:
         return result_df
@@ -329,8 +299,7 @@ def rebalance_single_head_tickets(df: pd.DataFrame, result_df: pd.DataFrame, tic
 
     for _, row in result_df.iterrows():
         ticket = str(row["買い目"])
-        parts = ticket.split("-")
-        head = int(parts[0])
+        head = int(ticket.split("-")[0])
 
         is_single_head = head in single_cars
 
@@ -356,9 +325,6 @@ def rebalance_single_head_tickets(df: pd.DataFrame, result_df: pd.DataFrame, tic
     return pd.DataFrame(out_rows).reset_index(drop=True)
 
 
-# =========================================
-# メイン予想
-# =========================================
 def generate_predictions(
     df: pd.DataFrame,
     mode="通常モード",
@@ -404,13 +370,11 @@ def generate_predictions(
 
         odds = safe_float(odds_dict.get(ticket, 0), 0.0)
 
-        results.append(
-            {
-                "買い目": ticket,
-                "スコア": round(score, 2),
-                "オッズ": odds,
-            }
-        )
+        results.append({
+            "買い目": ticket,
+            "スコア": round(score, 2),
+            "オッズ": odds,
+        })
 
     result_df = pd.DataFrame(results)
     if result_df.empty:
