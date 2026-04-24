@@ -3,7 +3,9 @@
 
 import re
 import itertools
+import csv
 from pathlib import Path
+from datetime import datetime
 
 import requests
 import pandas as pd
@@ -17,10 +19,7 @@ from learning import apply_learning_correction, learning_summary_text
 st.set_page_config(page_title="競輪AI Mobile", page_icon="🚴", layout="centered")
 
 st.title("🚴 競輪AI Mobile")
-st.caption("安定版 / 学習補正ON / 5・6・7・9車 / ガールズ対応")
-
-SCRIPT_DIR = Path(__file__).resolve().parent
-LOG_PATH = SCRIPT_DIR / "log.csv"
+st.caption("安定版 / 5・6・7・9車 / ガールズ対応")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0",
@@ -28,6 +27,9 @@ HEADERS = {
 }
 
 DEFAULT_COLUMNS = ["車番", "選手名", "競走得点", "脚質", "ライン", "ライン順", "単騎"]
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+LOG_PATH = SCRIPT_DIR / "log.csv"
 
 PREFECTURES = [
     "北海道", "青森", "岩手", "宮城", "秋田", "山形", "福島",
@@ -149,8 +151,10 @@ def set_df(df):
 def build_racecard_urls(url: str):
     u = normalize_text(url).rstrip("/")
     candidates = [u]
+
     if "/odds/" in u:
         candidates.append(u.replace("/odds/", "/racecard/"))
+
     if "/racecard/" not in u and "/odds/" not in u and "/keirin/" in u:
         candidates.append(u.replace("/keirin/", "/keirin/racecard/"))
 
@@ -165,8 +169,10 @@ def build_racecard_urls(url: str):
 def build_odds_urls(url: str):
     u = normalize_text(url).rstrip("/")
     candidates = [u]
+
     if "/racecard/" in u:
         candidates.append(u.replace("/racecard/", "/odds/"))
+
     if "/odds/" not in u and "/racecard/" not in u and "/keirin/" in u:
         candidates.append(u.replace("/keirin/", "/keirin/odds/"))
 
@@ -215,6 +221,7 @@ def groups_to_lineup_string(groups):
 
 def extract_lineup_window(text):
     s = normalize_text(text)
+
     for kw in ["並び予想", "予想並び", "並び"]:
         pos = s.find(kw)
         if pos != -1:
@@ -224,20 +231,25 @@ def extract_lineup_window(text):
                 "オッズ一覧", "レース情報", "払戻", "結果", "出走表",
                 "人気順", "3連単", "2車単", "2車複",
             ]
+
             end_pos = len(tail)
             for end_kw in end_keywords:
                 p = tail.find(end_kw)
                 if p != -1:
                     end_pos = min(end_pos, p)
+
             return normalize_text(tail[:end_pos])
+
     return ""
 
 
 def parse_lineup_from_text(text):
     window = extract_lineup_window(text)
+
     if window:
         tokens = re.findall(r"区切り|/|[1-9]", window)
         groups, current = [], []
+
         for t in tokens:
             if t in ["区切り", "/"]:
                 if current:
@@ -245,6 +257,7 @@ def parse_lineup_from_text(text):
                     current = []
             else:
                 current.append(int(t))
+
         if current:
             groups.append(current)
 
@@ -254,10 +267,12 @@ def parse_lineup_from_text(text):
                 return groups_to_lineup_string(groups)
 
     pattern = re.compile(r"([1-9](?:\s*-\s*[1-9])*(?:\s*/\s*[1-9](?:\s*-\s*[1-9])*){1,8})")
+
     for m in pattern.finditer(normalize_text(text)):
         cand = normalize_text(m.group(1))
         groups = parse_lineup_groups(cand)
         flat = list(itertools.chain.from_iterable(groups))
+
         if len(flat) in [5, 6, 7, 9] and len(flat) == len(set(flat)):
             if set(flat) == set(range(1, len(flat) + 1)):
                 return groups_to_lineup_string(groups)
@@ -267,14 +282,23 @@ def parse_lineup_from_text(text):
 
 def fetch_lineup(url):
     debug = []
+
     for target_url in build_racecard_urls(url):
         try:
             page = get_page(target_url)
             lineup = parse_lineup_from_text(page["text"])
-            debug.append({"url": target_url, "title": page["title"], "lineup": lineup, "text_head": page["text"][:500]})
+
+            debug.append({
+                "url": target_url,
+                "title": page["title"],
+                "lineup": lineup,
+                "text_head": page["text"][:500],
+            })
+
             if lineup:
                 st.session_state["debug"]["lineup"] = debug
                 return lineup
+
         except Exception as e:
             debug.append({"url": target_url, "error": str(e)})
 
@@ -317,6 +341,7 @@ def apply_lineup_to_df(df, lineup_text):
 
 def extract_players_section(text):
     s = normalize_text(text)
+
     start_pos = -1
     for kw in ["AI 競走得点", "競走得点", "脚質"]:
         p = s.find(kw)
@@ -328,7 +353,10 @@ def extract_players_section(text):
         return s
 
     end_pos = len(s)
-    for kw in ["並び予想", "予想並び", "並び", "オッズ一覧", "人気順", "2車単", "3連単", "2車複", "3連複"]:
+    for kw in [
+        "並び予想", "予想並び", "並び",
+        "オッズ一覧", "人気順", "2車単", "3連単", "2車複", "3連複",
+    ]:
         p = s.find(kw, start_pos + 1)
         if p != -1:
             end_pos = min(end_pos, p)
@@ -361,6 +389,7 @@ def split_blocks_by_car(text, num_riders):
             positions.append((car, found))
 
     positions = sorted(positions, key=lambda x: x[1])
+
     for i, (car, start) in enumerate(positions):
         end = positions[i + 1][1] if i + 1 < len(positions) else len(s)
         block = normalize_text(s[start:end])[:1800]
@@ -371,6 +400,7 @@ def split_blocks_by_car(text, num_riders):
 
 def extract_name(block):
     b = normalize_text(block)
+
     exact = re.search(
         rf"[1-9]?\s*([一-龥々]{{2,5}})\s+(?:{PREF_PATTERN})\s+(?:SS|S1|S2|A1|A2|L1|L2)\s+\d{{2}}歳\s+\d{{2,3}}期",
         b,
@@ -397,6 +427,7 @@ def extract_name(block):
 
 def extract_score(block):
     b = normalize_text(block)
+
     patterns = [
         re.compile(r"\d{2,3}期\s+(?:本命|対抗|単穴|連下)?\s*([4-9]\d(?:\.\d{1,3})?)"),
         re.compile(r"(?:本命|対抗|単穴|連下)\s*([4-9]\d(?:\.\d{1,3})?)"),
@@ -416,7 +447,11 @@ def extract_score(block):
         before = b[max(0, m.start() - 4):m.start()]
         after = b[m.end():m.end() + 4]
 
-        if "期" in before or "期" in after or "歳" in before or "歳" in after or "勝率" in before or "勝率" in after:
+        if "期" in before or "期" in after:
+            continue
+        if "歳" in before or "歳" in after:
+            continue
+        if "勝率" in before or "勝率" in after:
             continue
 
         if 40 <= v <= 130:
@@ -427,6 +462,7 @@ def extract_score(block):
 
 def extract_style(block):
     b = normalize_text(block)
+
     patterns = [
         re.compile(r"(?:本命|対抗|単穴|連下)?\s*[4-9]\d(?:\.\d{1,3})?\s+\d+\s+\d+\s+\d+\s+(逃|捲|追|両|自)"),
         re.compile(r"[4-9]\d(?:\.\d{1,3})?(?:\s+\d+){0,6}\s+(逃|捲|追|両|自)"),
@@ -473,10 +509,16 @@ def extract_single_player_by_car(text, car, num_riders):
 def extract_players_from_text(text, num_riders):
     rows = []
     preview = []
+
     for car in range(1, num_riders + 1):
         hit = extract_single_player_by_car(text, car, num_riders)
         if hit:
-            rows.append({"車番": hit["車番"], "選手名": hit["選手名"], "競走得点": hit["競走得点"], "脚質": hit["脚質"]})
+            rows.append({
+                "車番": hit["車番"],
+                "選手名": hit["選手名"],
+                "競走得点": hit["競走得点"],
+                "脚質": hit["脚質"],
+            })
             preview.append(hit)
 
     if not rows:
@@ -484,31 +526,51 @@ def extract_players_from_text(text, num_riders):
 
     df = pd.DataFrame(rows).groupby("車番", as_index=False).first()
     df = df.sort_values("車番").reset_index(drop=True)
+
     return df[["車番", "選手名", "競走得点", "脚質"]], preview
 
 
 def fetch_players(url, num_riders):
     debug = []
     best_df = pd.DataFrame()
+
     for target_url in build_racecard_urls(url):
         try:
             page = get_page(target_url)
             df, preview = extract_players_from_text(page["text"], num_riders)
-            missing = sorted(list(set(range(1, num_riders + 1)) - set(df["車番"].tolist()))) if not df.empty else list(range(1, num_riders + 1))
-            debug.append({"url": target_url, "title": page["title"], "hit_count": len(df), "missing": missing, "preview": preview, "text_head": page["text"][:500]})
+
+            missing = (
+                sorted(list(set(range(1, num_riders + 1)) - set(df["車番"].tolist())))
+                if not df.empty
+                else list(range(1, num_riders + 1))
+            )
+
+            debug.append({
+                "url": target_url,
+                "title": page["title"],
+                "hit_count": len(df),
+                "missing": missing,
+                "preview": preview,
+                "text_head": page["text"][:500],
+            })
+
             if len(df) > len(best_df):
                 best_df = df
+
         except Exception as e:
             debug.append({"url": target_url, "error": str(e)})
 
     st.session_state["debug"]["players"] = debug
+
     if best_df.empty:
         raise ValueError("選手情報を自動取得できませんでした。")
+
     return best_df
 
 
 def apply_players_to_df(df, players_df):
     out = df.copy()
+
     for _, row in players_df.iterrows():
         car = int(row["車番"])
         name = normalize_text(row.get("選手名", ""))
@@ -528,11 +590,13 @@ def apply_players_to_df(df, players_df):
 def extract_script_texts(html):
     soup = BeautifulSoup(html, "html.parser")
     items = []
+
     for tag in soup.find_all("script"):
         txt = tag.string if tag.string else tag.get_text(" ", strip=True)
         txt = normalize_text(txt or "")
         if txt:
             items.append(txt)
+
     return items
 
 
@@ -554,6 +618,7 @@ def extract_odds_loose(text, ticket_type):
     for pat in patterns:
         for m in pat.finditer(s):
             g = m.groups()
+
             if ticket_type == "2車単":
                 if len(g) == 3:
                     key = f"{g[0]}-{g[1]}"
@@ -563,9 +628,11 @@ def extract_odds_loose(text, ticket_type):
                     val = safe_float(g[1])
                 else:
                     continue
+
                 parts = key.split("-")
                 if len(parts) == 2 and len(set(parts)) == 2 and val > 0:
                     results[key] = val
+
             else:
                 if len(g) == 4:
                     key = f"{g[0]}-{g[1]}-{g[2]}"
@@ -575,6 +642,7 @@ def extract_odds_loose(text, ticket_type):
                     val = safe_float(g[1])
                 else:
                     continue
+
                 parts = key.split("-")
                 if len(parts) == 3 and len(set(parts)) == 3 and val > 0:
                     results[key] = val
@@ -595,7 +663,13 @@ def fetch_odds(url, ticket_type):
             for script_text in extract_script_texts(page["html"]):
                 found.update(extract_odds_loose(script_text, ticket_type))
 
-            debug.append({"url": target_url, "title": page["title"], "hit_count": len(found), "preview": list(sorted(found.items(), key=lambda x: x[1]))[:10]})
+            debug.append({
+                "url": target_url,
+                "title": page["title"],
+                "hit_count": len(found),
+                "preview": list(sorted(found.items(), key=lambda x: x[1]))[:10],
+            })
+
             if len(found) > len(best):
                 best = found
 
@@ -603,51 +677,104 @@ def fetch_odds(url, ticket_type):
             debug.append({"url": target_url, "error": str(e)})
 
     st.session_state["debug"]["odds"] = debug
+
     if not best:
         raise ValueError("オッズを抽出できませんでした。")
+
     return best
+
+
+
+
+# =========================
+# 結果保存 / 学習ログ
+# =========================
+def now_str():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def judge_hit(ticket_type: str, pred_df: pd.DataFrame, result_1: str, result_2: str, result_3: str):
     if pred_df is None or pred_df.empty:
-        return "未結果", ""
+        return {
+            "status_label": "未結果",
+            "hit_any": False,
+            "hit_ticket": "",
+            "result_text": "",
+        }
 
-    r1, r2, r3 = str(result_1).strip(), str(result_2).strip(), str(result_3).strip()
+    r1 = str(result_1).strip()
+    r2 = str(result_2).strip()
+    r3 = str(result_3).strip()
+
     if not r1 or not r2:
-        return "未結果", ""
+        return {
+            "status_label": "未結果",
+            "hit_any": False,
+            "hit_ticket": "",
+            "result_text": "",
+        }
 
     if ticket_type == "2車単":
         result_ticket = f"{r1}-{r2}"
     else:
         if not r3:
-            return "未結果", ""
+            return {
+                "status_label": "未結果",
+                "hit_any": False,
+                "hit_ticket": "",
+                "result_text": "",
+            }
         result_ticket = f"{r1}-{r2}-{r3}"
 
     tickets = pred_df["買い目"].astype(str).tolist() if "買い目" in pred_df.columns else []
-    return ("的中" if result_ticket in tickets else "不的中"), result_ticket
+    hit_any = result_ticket in tickets
+
+    return {
+        "status_label": "的中" if hit_any else "不的中",
+        "hit_any": hit_any,
+        "hit_ticket": result_ticket if hit_any else "",
+        "result_text": result_ticket,
+    }
 
 
-def save_result_log(race_name, mode, weather, lineup, ticket_type, pred_df, result_1, result_2, result_3, hit_status):
+def save_result_log(
+    race_name: str,
+    mode: str,
+    weather: str,
+    race_type: str,
+    lineup: str,
+    ticket_type: str,
+    pred_df: pd.DataFrame,
+    result_1: str,
+    result_2: str,
+    result_3: str,
+    hit_status: str,
+):
     is_new = not LOG_PATH.exists()
+
     if ticket_type == "2車単":
         result_text = "-".join([x for x in [result_1, result_2] if x])
     else:
         result_text = "-".join([x for x in [result_1, result_2, result_3] if x])
 
-    import csv
-    from datetime import datetime
-
     with open(LOG_PATH, "a", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
         if is_new:
-            writer.writerow(["保存日時", "レース名", "券種", "モード", "天候", "並び", "結果", "判定", "買い目", "買い目ランク", "AI評価", "期待値", "オッズ", "購入金額", "期待回収額(目安)", "学習補正", "学習理由"])
+            writer.writerow([
+                "保存日時", "レース名", "券種", "モード", "天候", "レース種別", "並び", "結果", "判定",
+                "買い目", "買い目ランク", "AI評価", "期待値", "オッズ",
+                "購入金額", "期待回収額(目安)", "レース判定", "的中率評価", "レース評価点", "判定理由",
+                "学習補正", "学習理由",
+            ])
+
         for _, row in pred_df.iterrows():
             writer.writerow([
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                now_str(),
                 race_name,
                 ticket_type,
                 mode,
                 weather,
+                race_type,
                 lineup,
                 result_text,
                 hit_status,
@@ -658,6 +785,10 @@ def save_result_log(race_name, mode, weather, lineup, ticket_type, pred_df, resu
                 row.get("オッズ", ""),
                 row.get("購入金額", ""),
                 row.get("期待回収額(目安)", ""),
+                row.get("レース判定", ""),
+                row.get("的中率評価", ""),
+                row.get("レース評価点", ""),
+                row.get("判定理由", ""),
                 row.get("学習補正", ""),
                 row.get("学習理由", ""),
             ])
@@ -697,13 +828,16 @@ with c1:
         try:
             lineup = fetch_lineup(url)
             df = get_df()
+
             groups = parse_lineup_groups(lineup)
             total = len(list(itertools.chain.from_iterable(groups)))
             if total in [5, 6, 7, 9] and total != len(df):
                 init_state(total)
                 df = get_df()
+
             df = apply_lineup_to_df(df, lineup)
             set_df(df)
+
             st.session_state["lineup_string"] = lineup
             st.session_state["message"] = f"並び取得成功: {lineup}"
             st.rerun()
@@ -718,6 +852,7 @@ with c2:
             players = fetch_players(url, len(df))
             df = apply_players_to_df(df, players)
             set_df(df)
+
             st.session_state["message"] = f"選手取得成功: {len(players)}人"
             st.rerun()
         except Exception as e:
@@ -770,16 +905,33 @@ style_options = ["", "逃", "捲", "追", "両", "自"]
 for i, row in df.iterrows():
     with st.container(border=True):
         st.markdown(f"### {int(row['車番'])}番車")
+
         name = st.text_input(f"選手名_{i}", value=str(row["選手名"]))
-        score = st.number_input(f"競走得点_{i}", min_value=0.0, max_value=200.0, value=float(row["競走得点"]), step=0.1)
+        score = st.number_input(
+            f"競走得点_{i}",
+            min_value=0.0,
+            max_value=200.0,
+            value=float(row["競走得点"]),
+            step=0.1,
+        )
+
         style_now = str(row["脚質"]) if str(row["脚質"]) in style_options else ""
         style = st.selectbox(f"脚質_{i}", style_options, index=style_options.index(style_now))
+
         c4, c5, c6 = st.columns(3)
         line_id = c4.number_input(f"ライン_{i}", min_value=0, max_value=9, value=int(row["ライン"]), step=1)
         line_order = c5.number_input(f"順_{i}", min_value=0, max_value=9, value=int(row["ライン順"]), step=1)
         single = c6.selectbox(f"単騎_{i}", [0, 1], index=1 if int(row["単騎"]) == 1 else 0)
 
-        updated_rows.append({"車番": int(row["車番"]), "選手名": name, "競走得点": float(score), "脚質": style, "ライン": int(line_id), "ライン順": int(line_order), "単騎": int(single)})
+        updated_rows.append({
+            "車番": int(row["車番"]),
+            "選手名": name,
+            "競走得点": float(score),
+            "脚質": style,
+            "ライン": int(line_id),
+            "ライン順": int(line_order),
+            "単騎": int(single),
+        })
 
 if st.button("出走表を更新", use_container_width=True):
     st.session_state["race_rows"] = updated_rows
@@ -794,6 +946,7 @@ st.subheader("🎯 AI予想")
 st.caption(learning_summary_text(LOG_PATH))
 
 detected_mode = auto_detect_mode(current_df)
+
 if race_type == "ガールズ":
     st.info("ガールズモード（表示のみ / 予想生成はpredict.py準拠）")
 else:
@@ -824,6 +977,7 @@ if st.button("買い目を出す", type="primary", use_container_width=True):
 
         pred = pred.copy()
         pred["購入金額"] = [int(unit_bet)] * len(pred)
+
         if "期待値" in pred.columns:
             ev = pd.to_numeric(pred["期待値"], errors="coerce").fillna(0)
             pred["期待回収額(目安)"] = (ev / 100.0 * pred["購入金額"]).round(0)
@@ -845,12 +999,14 @@ if pred_df is not None and isinstance(pred_df, pd.DataFrame) and not pred_df.emp
         hit_label = str(first.get("的中率評価", ""))
         race_score = str(first.get("レース評価点", ""))
         reason = str(first.get("判定理由", ""))
+
         if decision == "買い":
             st.success(f"レース判定: {decision} / 的中率評価: {hit_label} / 評価点: {race_score}")
         elif decision == "見送り":
             st.warning(f"レース判定: {decision} / 的中率評価: {hit_label} / 評価点: {race_score}")
         else:
             st.info(f"レース判定: {decision} / 的中率評価: {hit_label} / 評価点: {race_score}")
+
         if reason:
             st.caption(f"判定理由: {reason}")
 
@@ -868,29 +1024,39 @@ if pred_df is not None and isinstance(pred_df, pd.DataFrame) and not pred_df.emp
     st.metric("合計購入額", f"{total:,}円")
 
     st.markdown("### 📝 結果保存")
-    with st.form("direct_result_form_mobile"):
+    with st.form("mobile_result_form"):
         r1, r2, r3 = st.columns(3)
         result_1 = r1.text_input("1着", value="")
         result_2 = r2.text_input("2着", value="")
         result_3 = r3.text_input("3着", value="")
-        save_now = st.form_submit_button("結果を保存", use_container_width=True)
+        save_result = st.form_submit_button("結果を保存", use_container_width=True)
 
-    if save_now:
+    if ticket_type == "2車単":
+        st.caption("2車単判定は 1着-2着 で行います。")
+
+    if save_result:
         try:
-            hit_status, result_ticket = judge_hit(ticket_type, pred_df, result_1, result_2, result_3)
+            hit_info = judge_hit(
+                ticket_type=ticket_type,
+                pred_df=pred_df,
+                result_1=result_1,
+                result_2=result_2,
+                result_3=result_3,
+            )
             save_result_log(
                 race_name=st.session_state.get("race_name", ""),
                 mode=detected_mode,
                 weather=weather,
+                race_type=race_type,
                 lineup=st.session_state.get("lineup_string", ""),
                 ticket_type=ticket_type,
                 pred_df=pred_df,
                 result_1=result_1,
                 result_2=result_2,
                 result_3=result_3,
-                hit_status=hit_status,
+                hit_status=hit_info["status_label"],
             )
-            st.success(f"結果を保存しました / 判定: {hit_status} / 結果: {result_ticket}")
+            st.success(f"結果を保存しました: {LOG_PATH.name} / 判定: {hit_info['status_label']}")
             st.rerun()
         except Exception as e:
             st.error(f"保存失敗: {e}")
