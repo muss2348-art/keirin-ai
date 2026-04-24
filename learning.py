@@ -81,7 +81,6 @@ def build_learning_profile(log_df: pd.DataFrame) -> dict:
 
     profile["ready"] = True
 
-    # 買い目別補正
     g_ticket = work.groupby("買い目").agg(
         count=("買い目", "count"),
         hits=("hit", "sum"),
@@ -104,7 +103,6 @@ def build_learning_profile(log_df: pd.DataFrame) -> dict:
         elif rate == 0 and count >= 4:
             profile["ticket_bonus"][ticket] = -5.0
 
-    # 頭別補正
     work["頭"] = work["買い目"].str.split("-").str[0]
 
     g_head = work.groupby("頭").agg(
@@ -127,7 +125,6 @@ def build_learning_profile(log_df: pd.DataFrame) -> dict:
         elif rate <= 0.05:
             profile["head_bonus"][head] = -4.0
 
-    # モード別補正
     if "モード" in work.columns:
         g_mode = work.groupby("モード").agg(
             count=("モード", "count"),
@@ -148,7 +145,6 @@ def build_learning_profile(log_df: pd.DataFrame) -> dict:
             elif rate <= 0.05:
                 profile["mode_bonus"][key] = -3.0
 
-    # 天候別補正
     if "天候" in work.columns:
         g_weather = work.groupby("天候").agg(
             count=("天候", "count"),
@@ -169,7 +165,6 @@ def build_learning_profile(log_df: pd.DataFrame) -> dict:
             elif rate <= 0.05:
                 profile["weather_bonus"][key] = -2.0
 
-    # 券種別補正
     if "券種" in work.columns:
         g_type = work.groupby("券種").agg(
             count=("券種", "count"),
@@ -262,7 +257,11 @@ def apply_learning_correction(
         out["期待値"] = pd.to_numeric(out["期待値"], errors="coerce").fillna(0)
         out["期待値"] = (out["期待値"] + out["学習補正"] * 1.5).round(1)
 
-    out = out.sort_values(["AI評価", "期待値"], ascending=False).reset_index(drop=True)
+    sort_cols = ["AI評価"]
+    if "期待値" in out.columns:
+        sort_cols.append("期待値")
+
+    out = out.sort_values(sort_cols, ascending=False).reset_index(drop=True)
 
     return out
 
