@@ -827,7 +827,7 @@ st.subheader("🎯 AI予想")
 detected_mode = auto_detect_mode(current_df)
 
 if race_type == "ガールズ":
-    st.info("ガールズモード（ライン評価なし）")
+    st.info("ガールズモード（表示のみ / 予想生成はpredict.py準拠）")
 else:
     st.info(f"モード自動判定: {detected_mode}")
 
@@ -840,7 +840,6 @@ if st.button("買い目を出す", type="primary", use_container_width=True):
             top_n=display_count,
             odds_dict=st.session_state.get("odds_dict", {}),
             ticket_type=ticket_type,
-            race_type=race_type,
         )
 
         if pred is None or pred.empty:
