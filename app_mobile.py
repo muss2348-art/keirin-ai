@@ -1,3 +1,6 @@
+if "race_rows" not in st.session_state:
+    init_state(7)
+
 def extract_single_player_by_car(text, car, num_riders):
     s = normalize_text(text)
 
