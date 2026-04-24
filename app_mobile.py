@@ -361,12 +361,14 @@ def extract_players_section(text):
 def split_blocks_by_car(text, num_riders):
     s = normalize_text(text)
     blocks = {}
-
     positions = []
+
     for car in range(1, num_riders + 1):
         patterns = [
             rf"(?<!\d){car}\s+{car}\s+",
-            rf"(?<!\d){car}\s+",
+            rf"(?<!\d){car}\s+{car}(?=[一-龥ぁ-んァ-ヶ々])",
+            rf"(?<!\d){car}\s+(?=[一-龥ぁ-んァ-ヶ々])",
+            rf"(?<!\d){car}(?=[一-龥ぁ-んァ-ヶ々])",
         ]
 
         found = None
@@ -383,7 +385,7 @@ def split_blocks_by_car(text, num_riders):
 
     for i, (car, start) in enumerate(positions):
         end = positions[i + 1][1] if i + 1 < len(positions) else len(s)
-        block = normalize_text(s[start:end])[:1500]
+        block = normalize_text(s[start:end])[:1800]
         blocks[car] = block
 
     return blocks
@@ -392,7 +394,6 @@ def split_blocks_by_car(text, num_riders):
 def extract_name(block):
     b = normalize_text(block)
 
-    # 車番・級班・年齢・期を含む正規パターンを最優先
     exact = re.search(
         rf"[1-9]?\s*([一-龥々]{{2,5}})\s+(?:{PREF_PATTERN})\s+(?:SS|S1|S2|A1|A2|L1|L2)\s+\d{{2}}歳\s+\d{{2,3}}期",
         b,
@@ -402,14 +403,12 @@ def extract_name(block):
         if is_valid_name(name):
             return name
 
-    # 都道府県の直前の漢字名を優先
     pref_before = re.search(rf"([一-龥々]{{2,5}})\s+(?:{PREF_PATTERN})", b)
     if pref_before:
         name = normalize_text(pref_before.group(1))
         if is_valid_name(name):
             return name
 
-    # 最後の保険。ひらがなを含む説明文を拾わないよう漢字中心だけ
     candidates = re.findall(r"[一-龥々]{2,5}", b)
     for cand in candidates:
         cand = normalize_text(cand)
@@ -493,7 +492,7 @@ def extract_single_player_by_car(text, car, num_riders):
             "選手名": name,
             "競走得点": score,
             "脚質": style,
-            "source": "block_split_safe_v2",
+            "source": "block_split_safe_v3",
             "block_head": block[:180],
         }
 
