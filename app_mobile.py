@@ -12,75 +12,49 @@ from bs4 import BeautifulSoup
 from predict import auto_detect_mode, generate_predictions
 
 
-st.set_page_config(
-    page_title="競輪AI Mobile",
-    page_icon="🚴",
-    layout="centered",
-)
+st.set_page_config(page_title="競輪AI Mobile", page_icon="🚴", layout="centered")
 
 st.title("🚴 競輪AI Mobile")
 st.caption("安定版 / 5・6・7・9車 / ガールズ対応")
 
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/146.0.0.0 Safari/537.36"
-    ),
+    "User-Agent": "Mozilla/5.0",
     "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
 }
 
-DEFAULT_COLUMNS = [
-    "車番",
-    "選手名",
-    "競走得点",
-    "脚質",
-    "ライン",
-    "ライン順",
-    "単騎",
-]
+DEFAULT_COLUMNS = ["車番", "選手名", "競走得点", "脚質", "ライン", "ライン順", "単騎"]
 
 PREFECTURES = [
-    "北海道",
-    "青森", "岩手", "宮城", "秋田", "山形", "福島",
+    "北海道", "青森", "岩手", "宮城", "秋田", "山形", "福島",
     "茨城", "栃木", "群馬", "埼玉", "千葉", "東京", "神奈川",
-    "新潟", "富山", "石川", "福井",
-    "山梨", "長野",
-    "岐阜", "静岡", "愛知", "三重",
-    "滋賀", "京都", "大阪", "兵庫", "奈良", "和歌山",
-    "鳥取", "島根", "岡山", "広島", "山口",
-    "徳島", "香川", "愛媛", "高知",
-    "福岡", "佐賀", "長崎", "熊本", "大分", "宮崎", "鹿児島", "沖縄",
+    "新潟", "富山", "石川", "福井", "山梨", "長野",
+    "岐阜", "静岡", "愛知", "三重", "滋賀", "京都", "大阪", "兵庫",
+    "奈良", "和歌山", "鳥取", "島根", "岡山", "広島", "山口",
+    "徳島", "香川", "愛媛", "高知", "福岡", "佐賀", "長崎",
+    "熊本", "大分", "宮崎", "鹿児島", "沖縄",
 ]
 
-NG_NAMES = set(
-    PREFECTURES
-    + [
-        "競走", "得点", "脚質", "ライン", "ライン順", "単騎",
-        "本命", "対抗", "単穴", "連下", "勝率", "倍率", "ギヤ",
-        "コメント", "自力", "単騎", "取れた", "位置", "取れた位置",
-        "並び", "予想", "出走", "選手", "車番", "人気", "オッズ",
-    ]
-)
+PREF_PATTERN = "|".join(sorted(PREFECTURES, key=len, reverse=True))
+
+NG_NAMES = set(PREFECTURES + [
+    "競走", "得点", "脚質", "ライン", "ライン順", "単騎",
+    "本命", "対抗", "単穴", "連下", "勝率", "倍率", "ギヤ",
+    "コメント", "自力", "並び", "予想", "出走", "選手", "車番",
+    "人気", "オッズ", "取れた", "位置", "取れた位置",
+    "取れた位置から", "位置から", "取得", "情報", "更新",
+])
 
 
-# =========================================================
-# 共通
-# =========================================================
 def normalize_text(s: str) -> str:
     if s is None:
         return ""
-
-    table = str.maketrans(
-        {
-            "０": "0", "１": "1", "２": "2", "３": "3", "４": "4",
-            "５": "5", "６": "6", "７": "7", "８": "8", "９": "9",
-            "－": "-", "ー": "-", "―": "-", "‐": "-", "ｰ": "-",
-            "／": "/", "　": " ", "，": ",", "．": ".",
-            "（": "(", "）": ")", "｜": "|", "：": ":",
-            "\xa0": " ",
-        }
-    )
+    table = str.maketrans({
+        "０": "0", "１": "1", "２": "2", "３": "3", "４": "4",
+        "５": "5", "６": "6", "７": "7", "８": "8", "９": "9",
+        "－": "-", "ー": "-", "―": "-", "‐": "-", "ｰ": "-",
+        "／": "/", "　": " ", "，": ",", "．": ".",
+        "（": "(", "）": ")", "｜": "|", "：": ":", "\xa0": " ",
+    })
     s = str(s).translate(table)
     s = re.sub(r"\s+", " ", s)
     return s.strip()
@@ -97,13 +71,6 @@ def safe_float(v, default=0.0):
         return float(default)
 
 
-def normalize_ticket(ticket: str) -> str:
-    s = normalize_text(ticket)
-    s = s.replace(" ", "")
-    s = re.sub(r"[^0-9\-]", "", s)
-    return s
-
-
 def is_valid_name(name: str) -> bool:
     name = normalize_text(name)
     if not name:
@@ -112,16 +79,22 @@ def is_valid_name(name: str) -> bool:
         return False
     if re.fullmatch(r"\d+", name):
         return False
-    if len(name) < 2 or len(name) > 12:
+    if len(name) < 2 or len(name) > 8:
         return False
-    if not re.search(r"[一-龥ぁ-んァ-ヶ々]", name):
+    if re.search(r"(取れた|位置|から|競走|得点|脚質|ライン|予想|取得)", name):
+        return False
+    if not re.search(r"[一-龥々]", name):
         return False
     return True
 
 
-# =========================================================
-# 状態管理
-# =========================================================
+def normalize_ticket(ticket: str) -> str:
+    s = normalize_text(ticket)
+    s = s.replace(" ", "")
+    s = re.sub(r"[^0-9\-]", "", s)
+    return s
+
+
 def init_state(num_riders=7):
     st.session_state["num_riders"] = num_riders
     st.session_state["race_rows"] = [
@@ -168,9 +141,6 @@ def set_df(df):
     st.session_state["num_riders"] = len(df)
 
 
-# =========================================================
-# URL / HTML
-# =========================================================
 def build_racecard_urls(url: str):
     u = normalize_text(url).rstrip("/")
     candidates = [u]
@@ -181,8 +151,7 @@ def build_racecard_urls(url: str):
     if "/racecard/" not in u and "/odds/" not in u and "/keirin/" in u:
         candidates.append(u.replace("/keirin/", "/keirin/racecard/"))
 
-    out = []
-    seen = set()
+    out, seen = [], set()
     for x in candidates:
         if x and x not in seen:
             out.append(x)
@@ -200,8 +169,7 @@ def build_odds_urls(url: str):
     if "/odds/" not in u and "/racecard/" not in u and "/keirin/" in u:
         candidates.append(u.replace("/keirin/", "/keirin/odds/"))
 
-    out = []
-    seen = set()
+    out, seen = [], set()
     for x in candidates:
         if x and x not in seen:
             out.append(x)
@@ -213,23 +181,12 @@ def get_page(url: str):
     r = requests.get(url, headers=HEADERS, timeout=20)
     r.raise_for_status()
     r.encoding = r.apparent_encoding or r.encoding
-
     soup = BeautifulSoup(r.text, "html.parser")
     text = normalize_text(soup.get_text(" ", strip=True))
     title = normalize_text(soup.title.get_text(" ", strip=True)) if soup.title else ""
-
-    return {
-        "url": url,
-        "html": r.text,
-        "text": text,
-        "title": title,
-        "status": r.status_code,
-    }
+    return {"url": url, "html": r.text, "text": text, "title": title, "status": r.status_code}
 
 
-# =========================================================
-# 並び
-# =========================================================
 def parse_lineup_groups(lineup_text):
     s = normalize_text(lineup_text)
     if not s:
@@ -284,8 +241,7 @@ def parse_lineup_from_text(text):
 
     if window:
         tokens = re.findall(r"区切り|/|[1-9]", window)
-        groups = []
-        current = []
+        groups, current = [], []
 
         for t in tokens:
             if t in ["区切り", "/"]:
@@ -303,9 +259,7 @@ def parse_lineup_from_text(text):
             if set(flat) == set(range(1, len(flat) + 1)):
                 return groups_to_lineup_string(groups)
 
-    pattern = re.compile(
-        r"([1-9](?:\s*-\s*[1-9])*(?:\s*/\s*[1-9](?:\s*-\s*[1-9])*){1,8})"
-    )
+    pattern = re.compile(r"([1-9](?:\s*-\s*[1-9])*(?:\s*/\s*[1-9](?:\s*-\s*[1-9])*){1,8})")
 
     for m in pattern.finditer(normalize_text(text)):
         cand = normalize_text(m.group(1))
@@ -327,14 +281,12 @@ def fetch_lineup(url):
             page = get_page(target_url)
             lineup = parse_lineup_from_text(page["text"])
 
-            debug.append(
-                {
-                    "url": target_url,
-                    "title": page["title"],
-                    "lineup": lineup,
-                    "text_head": page["text"][:500],
-                }
-            )
+            debug.append({
+                "url": target_url,
+                "title": page["title"],
+                "lineup": lineup,
+                "text_head": page["text"][:500],
+            })
 
             if lineup:
                 st.session_state["debug"]["lineup"] = debug
@@ -380,9 +332,6 @@ def apply_lineup_to_df(df, lineup_text):
     return out
 
 
-# =========================================================
-# 選手取得
-# =========================================================
 def extract_players_section(text):
     s = normalize_text(text)
 
@@ -443,16 +392,25 @@ def split_blocks_by_car(text, num_riders):
 def extract_name(block):
     b = normalize_text(block)
 
-    # 車番や級班より後ろ、都道府県の前にある名前を最優先
-    pref_pattern = "|".join(sorted(PREFECTURES, key=len, reverse=True))
-    m = re.search(rf"([一-龥ぁ-んァ-ヶ々]{{2,12}})\s+(?:{pref_pattern})", b)
-    if m:
-        name = normalize_text(m.group(1))
+    # 車番・級班・年齢・期を含む正規パターンを最優先
+    exact = re.search(
+        rf"[1-9]?\s*([一-龥々]{{2,5}})\s+(?:{PREF_PATTERN})\s+(?:SS|S1|S2|A1|A2|L1|L2)\s+\d{{2}}歳\s+\d{{2,3}}期",
+        b,
+    )
+    if exact:
+        name = normalize_text(exact.group(1))
         if is_valid_name(name):
             return name
 
-    # 余計な文言を飛ばして日本語名候補を拾う
-    candidates = re.findall(r"[一-龥ぁ-んァ-ヶ々]{2,12}", b)
+    # 都道府県の直前の漢字名を優先
+    pref_before = re.search(rf"([一-龥々]{{2,5}})\s+(?:{PREF_PATTERN})", b)
+    if pref_before:
+        name = normalize_text(pref_before.group(1))
+        if is_valid_name(name):
+            return name
+
+    # 最後の保険。ひらがなを含む説明文を拾わないよう漢字中心だけ
+    candidates = re.findall(r"[一-龥々]{2,5}", b)
     for cand in candidates:
         cand = normalize_text(cand)
         if is_valid_name(cand):
@@ -464,7 +422,6 @@ def extract_name(block):
 def extract_score(block):
     b = normalize_text(block)
 
-    # 期の直後の競走得点を最優先
     patterns = [
         re.compile(r"\d{2,3}期\s+(?:本命|対抗|単穴|連下)?\s*([4-9]\d(?:\.\d{1,3})?)"),
         re.compile(r"(?:本命|対抗|単穴|連下)\s*([4-9]\d(?:\.\d{1,3})?)"),
@@ -484,7 +441,6 @@ def extract_score(block):
         before = b[max(0, m.start() - 4):m.start()]
         after = b[m.end():m.end() + 4]
 
-        # 年齢・期・勝率系を除外
         if "期" in before or "期" in after:
             continue
         if "歳" in before or "歳" in after:
@@ -495,10 +451,7 @@ def extract_score(block):
         if 40 <= v <= 130:
             candidates.append(v)
 
-    if candidates:
-        return candidates[0]
-
-    return 0.0
+    return candidates[0] if candidates else 0.0
 
 
 def extract_style(block):
@@ -540,7 +493,7 @@ def extract_single_player_by_car(text, car, num_riders):
             "選手名": name,
             "競走得点": score,
             "脚質": style,
-            "source": "block_split_safe",
+            "source": "block_split_safe_v2",
             "block_head": block[:180],
         }
 
@@ -554,14 +507,12 @@ def extract_players_from_text(text, num_riders):
     for car in range(1, num_riders + 1):
         hit = extract_single_player_by_car(text, car, num_riders)
         if hit:
-            rows.append(
-                {
-                    "車番": hit["車番"],
-                    "選手名": hit["選手名"],
-                    "競走得点": hit["競走得点"],
-                    "脚質": hit["脚質"],
-                }
-            )
+            rows.append({
+                "車番": hit["車番"],
+                "選手名": hit["選手名"],
+                "競走得点": hit["競走得点"],
+                "脚質": hit["脚質"],
+            })
             preview.append(hit)
 
     if not rows:
@@ -588,16 +539,14 @@ def fetch_players(url, num_riders):
                 else list(range(1, num_riders + 1))
             )
 
-            debug.append(
-                {
-                    "url": target_url,
-                    "title": page["title"],
-                    "hit_count": len(df),
-                    "missing": missing,
-                    "preview": preview,
-                    "text_head": page["text"][:500],
-                }
-            )
+            debug.append({
+                "url": target_url,
+                "title": page["title"],
+                "hit_count": len(df),
+                "missing": missing,
+                "preview": preview,
+                "text_head": page["text"][:500],
+            })
 
             if len(df) > len(best_df):
                 best_df = df
@@ -632,9 +581,6 @@ def apply_players_to_df(df, players_df):
     return out
 
 
-# =========================================================
-# オッズ
-# =========================================================
 def extract_script_texts(html):
     soup = BeautifulSoup(html, "html.parser")
     items = []
@@ -705,21 +651,18 @@ def fetch_odds(url, ticket_type):
     for target_url in build_odds_urls(url):
         try:
             page = get_page(target_url)
-
             found = {}
             found.update(extract_odds_loose(page["text"], ticket_type))
 
             for script_text in extract_script_texts(page["html"]):
                 found.update(extract_odds_loose(script_text, ticket_type))
 
-            debug.append(
-                {
-                    "url": target_url,
-                    "title": page["title"],
-                    "hit_count": len(found),
-                    "preview": list(sorted(found.items(), key=lambda x: x[1]))[:10],
-                }
-            )
+            debug.append({
+                "url": target_url,
+                "title": page["title"],
+                "hit_count": len(found),
+                "preview": list(sorted(found.items(), key=lambda x: x[1]))[:10],
+            })
 
             if len(found) > len(best):
                 best = found
@@ -735,9 +678,6 @@ def fetch_odds(url, ticket_type):
     return best
 
 
-# =========================================================
-# UI
-# =========================================================
 with st.expander("⚙️ 設定", expanded=True):
     rider_options = [5, 6, 7, 9]
     current_num = st.session_state.get("num_riders", 7)
@@ -864,17 +804,15 @@ for i, row in df.iterrows():
         line_order = c5.number_input(f"順_{i}", min_value=0, max_value=9, value=int(row["ライン順"]), step=1)
         single = c6.selectbox(f"単騎_{i}", [0, 1], index=1 if int(row["単騎"]) == 1 else 0)
 
-        updated_rows.append(
-            {
-                "車番": int(row["車番"]),
-                "選手名": name,
-                "競走得点": float(score),
-                "脚質": style,
-                "ライン": int(line_id),
-                "ライン順": int(line_order),
-                "単騎": int(single),
-            }
-        )
+        updated_rows.append({
+            "車番": int(row["車番"]),
+            "選手名": name,
+            "競走得点": float(score),
+            "脚質": style,
+            "ライン": int(line_id),
+            "ライン順": int(line_order),
+            "単騎": int(single),
+        })
 
 if st.button("出走表を更新", use_container_width=True):
     st.session_state["race_rows"] = updated_rows
