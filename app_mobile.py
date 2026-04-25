@@ -17,6 +17,7 @@ from bs4 import BeautifulSoup
 from predict import auto_detect_mode, generate_predictions
 from learning import apply_learning_correction, learning_summary_text
 from race_filter import assess_race_buyability, apply_race_buyability_to_predictions, race_buyability_summary_text
+from staking import apply_staking_ai, staking_summary_text
 
 
 st.set_page_config(page_title="競輪AI Mobile", page_icon="🚴", layout="centered")
@@ -1062,6 +1063,8 @@ def save_result_log(
                 row.get("判定理由", ""),
                 row.get("学習補正", ""),
                 row.get("学習理由", ""),
+                row.get("賭け金AI係数", ""),
+                row.get("賭け金AI理由", ""),
             ])
 
 
@@ -1391,6 +1394,7 @@ st.markdown("---")
 st.subheader("🎯 AI予想")
 st.caption(learning_summary_text(LOG_PATH))
 st.caption("見送りAIは買い/軽く買い/注意/見送りを判定します。")
+st.caption("賭け金AIはAI評価・期待値・見送りAI判定から購入金額を自動配分します。")
 
 detected_mode = auto_detect_mode(current_df)
 
@@ -1438,11 +1442,11 @@ if st.button("買い目を出す", type="primary", use_container_width=True):
         st.session_state["race_assessment"] = race_assessment
 
         pred = pred.copy()
-        pred["購入金額"] = [int(unit_bet)] * len(pred)
-
-        if "期待値" in pred.columns:
-            ev = pd.to_numeric(pred["期待値"], errors="coerce").fillna(0)
-            pred["期待回収額(目安)"] = (ev / 100.0 * pred["購入金額"]).round(0)
+        pred = apply_staking_ai(
+            pred,
+            unit_bet=unit_bet,
+            race_assessment=race_assessment,
+        )
 
         st.session_state["pred_df"] = pred
         st.session_state["message"] = "買い目生成成功"
@@ -1492,8 +1496,11 @@ if pred_df is not None and isinstance(pred_df, pd.DataFrame) and not pred_df.emp
             st.write(f"学習補正: {row.get('学習補正', '-')}")
             st.write(f"学習理由: {row.get('学習理由', '-')}")
             st.write(f"見送りAIコメント: {row.get('見送りAIコメント', '-')}")
+            st.write(f"賭け金AI係数: {row.get('賭け金AI係数', '-')}")
+            st.write(f"賭け金AI理由: {row.get('賭け金AI理由', '-')}")
             st.write(f"購入金額: {int(safe_float(row.get('購入金額', 0))):,}円")
 
+    st.caption(staking_summary_text(pred_df))
     total = int(pd.to_numeric(pred_df["購入金額"], errors="coerce").fillna(0).sum())
     st.metric("合計購入額", f"{total:,}円")
 
