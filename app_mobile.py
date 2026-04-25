@@ -21,7 +21,7 @@ from learning import apply_learning_correction, learning_summary_text
 st.set_page_config(page_title="競輪AI Mobile", page_icon="🚴", layout="centered")
 
 st.title("🚴 競輪AI Mobile")
-st.caption("安定版 / 選手取得強化 / 保存一覧復活 / 単騎バランス補正 / 学習補正ON")
+st.caption("安定版 / 選手取得さらに強化 / 保存一覧復活 / 単騎バランス補正 / 学習補正ON")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0",
@@ -626,29 +626,168 @@ def extract_single_player_by_car(text, car, num_riders):
     return None
 
 
-def extract_players_from_text(text, num_riders):
+
+def extract_players_global(text, num_riders):
+    """
+    WINTICKETの出走表テキスト全体から、車番・名前・府県・級班・年齢・期・競走得点を一括で拾う。
+    ブロック切り出しがズレても、こちらでかなり救済できる。
+    """
+    s = normalize_text(text)
+
+    class_pattern = r"(?:SS|S1|S2|A1|A2|A3|L1|L2)"
+    mark_pattern = r"(?:本命|対抗|単穴|連下)?"
+
+    # 例:
+    # 1 1 小原周祐 高知 A1 35歳 99期 本命 96.55 ...
+    # 2 松本京太 静岡 A1 27歳 123期 連下 94.07 ...
+    entry_pattern = re.compile(
+        rf"(?<!\d)"
+        rf"([1-9])\s+"
+        rf"(?:\1\s+)?"
+        rf"([一-龥ぁ-んァ-ヶ々]{{2,12}})\s+"
+        rf"({PREF_PATTERN})\s+"
+        rf"{class_pattern}\s+"
+        rf"\d{{2}}歳\s+"
+        rf"\d{{2,3}}期\s+"
+        rf"{mark_pattern}\s*"
+        rf"([4-9]\d(?:\.\d{{1,3}})?)"
+        rf"(?P<tail>.{{0,260}}?)"
+        rf"(?=(?<!\d)[1-9]\s+(?:[1-9]\s+)?[一-龥ぁ-んァ-ヶ々]{{2,12}}\s+(?:{PREF_PATTERN})\s+{class_pattern}\s+\d{{2}}歳\s+\d{{2,3}}期|並び予想|予想並び|オッズ一覧|人気順|$)"
+    )
+
     rows = []
     preview = []
+    seen = set()
 
-    for car in range(1, num_riders + 1):
-        hit = extract_single_player_by_car(text, car, num_riders)
-        if hit:
+    for m in entry_pattern.finditer(s):
+        car = safe_int(m.group(1), 0)
+        name = normalize_text(m.group(2))
+        score = safe_float(m.group(4), 0.0)
+        tail = normalize_text(m.group("tail") or "")
+
+        style = ""
+        # 競走得点の後にある「脚」列を優先
+        style_match = re.search(r"(逃|捲|追|両|自)", tail)
+        if style_match:
+            style = normalize_text(style_match.group(1))
+
+        if (
+            1 <= car <= num_riders
+            and car not in seen
+            and is_valid_name(name)
+            and 40 <= score <= 130
+        ):
+            seen.add(car)
             rows.append({
-                "車番": hit["車番"],
-                "選手名": hit["選手名"],
-                "競走得点": hit["競走得点"],
-                "脚質": hit["脚質"],
+                "車番": car,
+                "選手名": name,
+                "競走得点": score,
+                "脚質": style if style in ["逃", "捲", "追", "両", "自"] else "",
             })
-            preview.append(hit)
+            preview.append({
+                "車番": car,
+                "選手名": name,
+                "競走得点": score,
+                "脚質": style,
+                "source": "global_entry",
+                "block_head": s[m.start():m.start() + 220],
+            })
 
     if not rows:
         return pd.DataFrame(), preview
 
     df = pd.DataFrame(rows).groupby("車番", as_index=False).first()
     df = df.sort_values("車番").reset_index(drop=True)
-
     return df[["車番", "選手名", "競走得点", "脚質"]], preview
 
+
+def merge_players_by_priority(*items):
+    """
+    前のDataFrameほど優先。
+    globalで取れた正規データを優先し、足りない車番だけ fallback で埋める。
+    """
+    rows = []
+    preview = []
+    seen = set()
+
+    for df, dbg in items:
+        if dbg:
+            preview.extend(dbg)
+        if df is None or df.empty:
+            continue
+
+        for _, r in df.sort_values("車番").iterrows():
+            car = safe_int(r.get("車番", 0), 0)
+            if car in seen:
+                continue
+
+            name = normalize_text(r.get("選手名", ""))
+            score = safe_float(r.get("競走得点", 0.0))
+            style = normalize_text(r.get("脚質", ""))
+
+            if car > 0 and is_valid_name(name) and 40 <= score <= 130:
+                rows.append({
+                    "車番": car,
+                    "選手名": name,
+                    "競走得点": score,
+                    "脚質": style if style in ["逃", "捲", "追", "両", "自"] else "",
+                })
+                seen.add(car)
+
+    if not rows:
+        return pd.DataFrame(), preview
+
+    out = pd.DataFrame(rows).groupby("車番", as_index=False).first()
+    out = out.sort_values("車番").reset_index(drop=True)
+    return out[["車番", "選手名", "競走得点", "脚質"]], preview
+
+
+def extract_players_from_text(text, num_riders):
+    section = extract_players_section(text)
+
+    # 1) 正規出走表パターンを最優先
+    df_global_section, prev_global_section = extract_players_global(section, num_riders)
+    df_global_full, prev_global_full = extract_players_global(text, num_riders)
+
+    # 2) 足りない車番だけ、従来の車番別抽出で救済
+    rows_fallback = []
+    preview_fallback = []
+
+    already = set()
+    for df_tmp in [df_global_section, df_global_full]:
+        if df_tmp is not None and not df_tmp.empty:
+            already |= set(df_tmp["車番"].astype(int).tolist())
+
+    for car in range(1, num_riders + 1):
+        if car in already:
+            continue
+
+        hit = extract_single_player_by_car(text, car, num_riders)
+        if hit:
+            rows_fallback.append({
+                "車番": hit["車番"],
+                "選手名": hit["選手名"],
+                "競走得点": hit["競走得点"],
+                "脚質": hit["脚質"],
+            })
+            preview_fallback.append(hit)
+
+    df_fallback = pd.DataFrame(rows_fallback) if rows_fallback else pd.DataFrame()
+    if not df_fallback.empty:
+        df_fallback = df_fallback.groupby("車番", as_index=False).first()
+        df_fallback = df_fallback.sort_values("車番").reset_index(drop=True)
+
+    # section global → full global → fallback の順で採用
+    df, preview = merge_players_by_priority(
+        (df_global_section, prev_global_section),
+        (df_global_full, prev_global_full),
+        (df_fallback, preview_fallback),
+    )
+
+    if df is None or df.empty:
+        return pd.DataFrame(), preview
+
+    return df[["車番", "選手名", "競走得点", "脚質"]], preview
 
 def fetch_players(url, num_riders):
     debug = []
