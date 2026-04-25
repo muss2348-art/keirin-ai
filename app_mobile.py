@@ -81,6 +81,17 @@ def safe_float(v, default=0.0):
         return float(default)
 
 
+def safe_int(v, default=0):
+    try:
+        if v is None or v == "":
+            return int(default)
+        if isinstance(v, str):
+            v = v.replace(",", "").strip()
+        return int(float(v))
+    except Exception:
+        return int(default)
+
+
 def is_valid_name(name: str) -> bool:
     name = normalize_text(name)
     if not name:
