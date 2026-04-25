@@ -16,6 +16,7 @@ from bs4 import BeautifulSoup
 
 from predict import auto_detect_mode, generate_predictions
 from learning import apply_learning_correction, learning_summary_text
+from race_filter import assess_race_buyability, apply_race_buyability_to_predictions, race_buyability_summary_text
 
 
 st.set_page_config(page_title="競輪AI Mobile", page_icon="🚴", layout="centered")
@@ -1389,6 +1390,7 @@ st.dataframe(current_df, use_container_width=True, hide_index=True)
 st.markdown("---")
 st.subheader("🎯 AI予想")
 st.caption(learning_summary_text(LOG_PATH))
+st.caption("見送りAIは買い/軽く買い/注意/見送りを判定します。")
 
 detected_mode = auto_detect_mode(current_df)
 
@@ -1423,6 +1425,18 @@ if st.button("買い目を出す", type="primary", use_container_width=True):
 
         pred = balance_prediction_heads(pred, current_df, display_count)
 
+        race_assessment = assess_race_buyability(
+            current_df,
+            pred_df=pred,
+            log_path=LOG_PATH,
+            mode=detected_mode,
+            weather=weather,
+            ticket_type=ticket_type,
+            race_type=race_type,
+        )
+        pred = apply_race_buyability_to_predictions(pred, race_assessment)
+        st.session_state["race_assessment"] = race_assessment
+
         pred = pred.copy()
         pred["購入金額"] = [int(unit_bet)] * len(pred)
 
@@ -1439,6 +1453,17 @@ if st.button("買い目を出す", type="primary", use_container_width=True):
         st.rerun()
 
 pred_df = st.session_state.get("pred_df")
+
+if st.session_state.get("race_assessment"):
+    ra = st.session_state.get("race_assessment")
+    if ra.get("decision") in ["買い", "軽く買い"]:
+        st.success(race_buyability_summary_text(ra))
+    elif ra.get("decision") == "注意":
+        st.warning(race_buyability_summary_text(ra))
+    else:
+        st.error(race_buyability_summary_text(ra))
+    if ra.get("advice"):
+        st.caption(ra.get("advice"))
 
 if pred_df is not None and isinstance(pred_df, pd.DataFrame) and not pred_df.empty:
     if "レース判定" in pred_df.columns:
@@ -1466,6 +1491,7 @@ if pred_df is not None and isinstance(pred_df, pd.DataFrame) and not pred_df.emp
             st.write(f"オッズ: {row.get('オッズ', '-')}")
             st.write(f"学習補正: {row.get('学習補正', '-')}")
             st.write(f"学習理由: {row.get('学習理由', '-')}")
+            st.write(f"見送りAIコメント: {row.get('見送りAIコメント', '-')}")
             st.write(f"購入金額: {int(safe_float(row.get('購入金額', 0))):,}円")
 
     total = int(pd.to_numeric(pred_df["購入金額"], errors="coerce").fillna(0).sum())
