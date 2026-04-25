@@ -4,6 +4,8 @@
 import re
 import itertools
 import csv
+import json
+import math
 from pathlib import Path
 from datetime import datetime
 
@@ -19,7 +21,7 @@ from learning import apply_learning_correction, learning_summary_text
 st.set_page_config(page_title="競輪AI Mobile", page_icon="🚴", layout="centered")
 
 st.title("🚴 競輪AI Mobile")
-st.caption("安定版 / 5・6・7・9車 / ガールズ対応")
+st.caption("安定版 / 選手取得強化 / 保存一覧復活 / 単騎バランス補正 / 学習補正ON")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0",
@@ -30,6 +32,7 @@ DEFAULT_COLUMNS = ["車番", "選手名", "競走得点", "脚質", "ライン",
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 LOG_PATH = SCRIPT_DIR / "log.csv"
+SAVED_RACES_PATH = SCRIPT_DIR / "saved_races_mobile.json"
 
 PREFECTURES = [
     "北海道", "青森", "岩手", "宮城", "秋田", "山形", "福島",
@@ -477,13 +480,130 @@ def extract_style(block):
     return normalize_text(m.group(1)) if m else ""
 
 
+
+def extract_single_player_exact(text, car, num_riders):
+    """車番ごとの正規出走表パターンを最優先で拾う。"""
+    s = normalize_text(text)
+    patterns = [
+        re.compile(
+            rf"(?<!\d){car}\s+{car}\s+"
+            rf"([一-龥ぁ-んァ-ヶ々]{{2,12}})\s+"
+            rf"(?:{PREF_PATTERN})\s+"
+            rf"(?:SS|S1|S2|A1|A2|L1|L2)\s+"
+            rf"\d{{2}}歳\s+\d{{2,3}}期\s+"
+            rf"(?:本命|対抗|単穴|連下)?\s*"
+            rf"([4-9]\d(?:\.\d{{1,3}})?)"
+            rf".{{0,180}}?"
+            rf"(逃|捲|追|両|自)"
+        ),
+        re.compile(
+            rf"(?<!\d){car}\s+"
+            rf"([一-龥ぁ-んァ-ヶ々]{{2,12}})\s+"
+            rf"(?:{PREF_PATTERN})\s+"
+            rf"(?:SS|S1|S2|A1|A2|L1|L2)\s+"
+            rf"\d{{2}}歳\s+\d{{2,3}}期\s+"
+            rf"(?:本命|対抗|単穴|連下)?\s*"
+            rf"([4-9]\d(?:\.\d{{1,3}})?)"
+            rf".{{0,180}}?"
+            rf"(逃|捲|追|両|自)"
+        ),
+        re.compile(
+            rf"(?<!\d){car}\s+{car}\s*"
+            rf"([一-龥ぁ-んァ-ヶ々]{{2,12}})\s*"
+            rf"(?:{PREF_PATTERN})\s*"
+            rf"(?:SS|S1|S2|A1|A2|L1|L2)\s*"
+            rf"\d{{2}}歳\s*\d{{2,3}}期\s*"
+            rf"(?:本命|対抗|単穴|連下)?\s*"
+            rf"([4-9]\d(?:\.\d{{1,3}})?)"
+            rf".{{0,180}}?"
+            rf"(逃|捲|追|両|自)"
+        ),
+    ]
+
+    for idx, pat in enumerate(patterns, start=1):
+        m = pat.search(s)
+        if not m:
+            continue
+        name = normalize_text(m.group(1))
+        score = safe_float(m.group(2), 0.0)
+        style = normalize_text(m.group(3))
+        if is_valid_name(name) and 40 <= score <= 130 and style in ["逃", "捲", "追", "両", "自"]:
+            return {
+                "車番": car,
+                "選手名": name,
+                "競走得点": score,
+                "脚質": style,
+                "source": f"exact_entry_{idx}",
+                "block_head": s[max(0, m.start()):m.start() + 220],
+            }
+    return None
+
+
+def collect_player_start_positions(text, num_riders):
+    """車番開始位置を複数候補から集め、自然な昇順セットを作る。"""
+    s = normalize_text(text)
+    candidates = {car: [] for car in range(1, num_riders + 1)}
+
+    for car in range(1, num_riders + 1):
+        pats = [
+            rf"(?<!\d){car}\s+{car}\s+(?=[一-龥ぁ-んァ-ヶ々])",
+            rf"(?<!\d){car}\s+(?=[一-龥ぁ-んァ-ヶ々])",
+            rf"(?<!\d){car}(?=[一-龥ぁ-んァ-ヶ々])",
+            rf"(?<!\d){car}\s+{car}\s+",
+        ]
+        for pat in pats:
+            for m in re.finditer(pat, s):
+                pos = m.start()
+                window = s[pos:pos + 320]
+                if re.search(rf"(?:{PREF_PATTERN})", window) and re.search(r"(歳|期)", window):
+                    candidates[car].append(pos)
+
+    positions = []
+    last = -1
+    for car in range(1, num_riders + 1):
+        valid = sorted([p for p in set(candidates[car]) if p > last])
+        if valid:
+            pick = valid[0]
+            positions.append((car, pick))
+            last = pick
+
+    return positions
+
+
+def split_blocks_by_car_enhanced(text, num_riders):
+    s = normalize_text(text)
+    blocks = {}
+    positions = collect_player_start_positions(s, num_riders)
+
+    if len(positions) < num_riders:
+        old_blocks = split_blocks_by_car(s, num_riders)
+        already = {x[0] for x in positions}
+        for car, block in old_blocks.items():
+            if car in already or not block:
+                continue
+            pos = s.find(block[:20])
+            if pos >= 0:
+                positions.append((car, pos))
+        positions = sorted(set(positions), key=lambda x: x[1])
+
+    for i, (car, start) in enumerate(positions):
+        end = positions[i + 1][1] if i + 1 < len(positions) else len(s)
+        block = normalize_text(s[start:end])[:2200]
+        blocks[car] = block
+
+    return blocks
+
 def extract_single_player_by_car(text, car, num_riders):
+    exact = extract_single_player_exact(text, car, num_riders)
+    if exact:
+        return exact
+
     section = extract_players_section(text)
-    blocks = split_blocks_by_car(section, num_riders)
+    blocks = split_blocks_by_car_enhanced(section, num_riders)
 
     block = blocks.get(car, "")
     if not block:
-        blocks = split_blocks_by_car(text, num_riders)
+        blocks = split_blocks_by_car_enhanced(text, num_riders)
         block = blocks.get(car, "")
 
     if not block:
@@ -499,8 +619,8 @@ def extract_single_player_by_car(text, car, num_riders):
             "選手名": name,
             "競走得点": score,
             "脚質": style,
-            "source": "block_split_safe_v3",
-            "block_head": block[:180],
+            "source": "block_split_enhanced_v4",
+            "block_head": block[:220],
         }
 
     return None
@@ -794,6 +914,181 @@ def save_result_log(
             ])
 
 
+
+# =========================
+# 予想バランス補正 / 保存レース一覧
+# =========================
+def get_single_heads(df: pd.DataFrame) -> set:
+    if df is None or df.empty or "単騎" not in df.columns:
+        return set()
+    work = df.copy()
+    work["車番"] = pd.to_numeric(work["車番"], errors="coerce").fillna(0).astype(int)
+    work["単騎"] = pd.to_numeric(work["単騎"], errors="coerce").fillna(0).astype(int)
+    return set(work.loc[work["単騎"] == 1, "車番"].astype(str).tolist())
+
+
+def head_of_ticket(ticket: str) -> str:
+    t = normalize_ticket(ticket)
+    return t.split("-")[0] if t else ""
+
+
+def balance_prediction_heads(pred_df: pd.DataFrame, current_df: pd.DataFrame, display_count: int) -> pd.DataFrame:
+    if pred_df is None or pred_df.empty or "買い目" not in pred_df.columns:
+        return pred_df
+
+    out = pred_df.copy()
+    out["_sort_ai"] = pd.to_numeric(out.get("AI評価", 0), errors="coerce").fillna(0)
+    out["_sort_ev"] = pd.to_numeric(out.get("期待値", 0), errors="coerce").fillna(0)
+    out["_head"] = out["買い目"].astype(str).map(head_of_ticket)
+    single_heads = get_single_heads(current_df)
+    out["_single_head"] = out["_head"].isin(single_heads)
+    out = out.sort_values(["_sort_ai", "_sort_ev"], ascending=False).reset_index(drop=True)
+
+    n = max(1, int(display_count))
+    max_per_head = max(1, math.ceil(n * 0.40))
+    max_single_total = max(1, math.ceil(n * 0.35)) if single_heads else n
+
+    picked = []
+    used_idx = set()
+    head_counts = {}
+    single_total = 0
+
+    for idx, row in out.iterrows():
+        head = str(row.get("_head", ""))
+        is_single = bool(row.get("_single_head", False))
+        if head_counts.get(head, 0) >= max_per_head:
+            continue
+        if is_single and single_total >= max_single_total:
+            continue
+        picked.append(idx)
+        used_idx.add(idx)
+        head_counts[head] = head_counts.get(head, 0) + 1
+        if is_single:
+            single_total += 1
+        if len(picked) >= n:
+            break
+
+    if len(picked) < n:
+        for idx, _ in out.iterrows():
+            if idx in used_idx:
+                continue
+            picked.append(idx)
+            if len(picked) >= n:
+                break
+
+    balanced = out.loc[picked].copy().reset_index(drop=True)
+    balanced["頭バランス補正"] = "ON"
+    balanced = balanced.drop(columns=[c for c in ["_sort_ai", "_sort_ev", "_head", "_single_head"] if c in balanced.columns])
+    return balanced
+
+
+def ensure_saved_races_file():
+    if not SAVED_RACES_PATH.exists():
+        with open(SAVED_RACES_PATH, "w", encoding="utf-8") as f:
+            json.dump([], f, ensure_ascii=False, indent=2)
+
+
+def load_saved_races() -> list:
+    ensure_saved_races_file()
+    try:
+        with open(SAVED_RACES_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def write_saved_races(data: list):
+    with open(SAVED_RACES_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def save_current_prediction_record(race_name, url, mode, weather, race_type, lineup, ticket_type, current_df, pred_df, odds_dict, unit_bet, display_count):
+    data = load_saved_races()
+    saved_id = datetime.now().strftime("%Y%m%d%H%M%S%f")
+    record = {
+        "id": saved_id,
+        "created_at": now_str(),
+        "updated_at": now_str(),
+        "race_name": race_name,
+        "url": url,
+        "mode": mode,
+        "weather": weather,
+        "race_type": race_type,
+        "lineup_string": lineup,
+        "ticket_type": ticket_type,
+        "num_riders": len(current_df),
+        "unit_bet": int(unit_bet),
+        "display_count": int(display_count),
+        "race_rows": current_df[DEFAULT_COLUMNS].to_dict(orient="records"),
+        "pred_rows": pred_df.to_dict(orient="records"),
+        "odds_dict": odds_dict,
+        "result_saved": False,
+        "hit_status": "未結果",
+        "result": {},
+    }
+    data.insert(0, record)
+    write_saved_races(data)
+    return saved_id
+
+
+def update_saved_race(saved_id: str, updates: dict) -> bool:
+    data = load_saved_races()
+    ok = False
+    for i, item in enumerate(data):
+        if item.get("id") == saved_id:
+            item.update(updates)
+            item["updated_at"] = now_str()
+            data[i] = item
+            ok = True
+            break
+    if ok:
+        write_saved_races(data)
+    return ok
+
+
+def delete_saved_race(saved_id: str) -> bool:
+    data = load_saved_races()
+    before = len(data)
+    data = [x for x in data if x.get("id") != saved_id]
+    if len(data) != before:
+        write_saved_races(data)
+        return True
+    return False
+
+
+def get_saved_race(saved_id: str):
+    for item in load_saved_races():
+        if item.get("id") == saved_id:
+            return item
+    return None
+
+
+def saved_race_label(item: dict) -> str:
+    race_name = item.get("race_name", "") or "(名称未設定)"
+    created_at = item.get("created_at", "")
+    ticket_type = item.get("ticket_type", "3連単")
+    status = item.get("hit_status", "未結果") if item.get("result_saved") else "未結果"
+    result_text = (item.get("result", {}) or {}).get("result_text", "")
+    if result_text:
+        return f"{created_at} | {race_name} | {ticket_type} | {status} | 結果 {result_text}"
+    return f"{created_at} | {race_name} | {ticket_type} | {status}"
+
+
+def restore_saved_race_to_session(item: dict):
+    rows = item.get("race_rows", [])
+    if rows:
+        st.session_state["race_rows"] = rows
+        st.session_state["num_riders"] = item.get("num_riders", len(rows))
+    else:
+        init_state(item.get("num_riders", 7))
+    st.session_state["race_name"] = item.get("race_name", "")
+    st.session_state["last_url"] = item.get("url", "")
+    st.session_state["lineup_string"] = item.get("lineup_string", "")
+    st.session_state["odds_dict"] = item.get("odds_dict", {})
+    st.session_state["pred_df"] = pd.DataFrame(item.get("pred_rows", [])) if item.get("pred_rows") else None
+    st.session_state["message"] = f"保存レースを読込: {item.get('race_name', '')}"
+
 with st.expander("⚙️ 設定", expanded=True):
     rider_options = [5, 6, 7, 9]
     current_num = st.session_state.get("num_riders", 7)
@@ -954,11 +1249,12 @@ else:
 
 if st.button("買い目を出す", type="primary", use_container_width=True):
     try:
+        expanded_top_n = min(80, max(int(display_count) * 3, int(display_count) + 12))
         pred = generate_predictions(
             current_df,
             mode=detected_mode,
             weather=weather,
-            top_n=display_count,
+            top_n=expanded_top_n,
             odds_dict=st.session_state.get("odds_dict", {}),
             ticket_type=ticket_type,
         )
@@ -974,6 +1270,8 @@ if st.button("買い目を出す", type="primary", use_container_width=True):
             weather=weather,
             ticket_type=ticket_type,
         )
+
+        pred = balance_prediction_heads(pred, current_df, display_count)
 
         pred = pred.copy()
         pred["購入金額"] = [int(unit_bet)] * len(pred)
@@ -1023,6 +1321,26 @@ if pred_df is not None and isinstance(pred_df, pd.DataFrame) and not pred_df.emp
     total = int(pd.to_numeric(pred_df["購入金額"], errors="coerce").fillna(0).sum())
     st.metric("合計購入額", f"{total:,}円")
 
+    if st.button("この予想を保存", use_container_width=True):
+        try:
+            save_current_prediction_record(
+                race_name=st.session_state.get("race_name", ""),
+                url=st.session_state.get("last_url", ""),
+                mode=detected_mode,
+                weather=weather,
+                race_type=race_type,
+                lineup=st.session_state.get("lineup_string", ""),
+                ticket_type=ticket_type,
+                current_df=current_df,
+                pred_df=pred_df,
+                odds_dict=st.session_state.get("odds_dict", {}),
+                unit_bet=unit_bet,
+                display_count=display_count,
+            )
+            st.success("予想レースを保存しました。")
+        except Exception as e:
+            st.error(f"保存失敗: {e}")
+
     st.markdown("### 📝 結果保存")
     with st.form("mobile_result_form"):
         r1, r2, r3 = st.columns(3)
@@ -1060,6 +1378,92 @@ if pred_df is not None and isinstance(pred_df, pd.DataFrame) and not pred_df.emp
             st.rerun()
         except Exception as e:
             st.error(f"保存失敗: {e}")
+
+
+st.markdown("---")
+st.subheader("💾 保存した予想レース一覧")
+
+saved_items = load_saved_races()
+if not saved_items:
+    st.caption("まだ保存レースはありません。")
+else:
+    labels = [saved_race_label(x) for x in saved_items]
+    label_to_id = {saved_race_label(x): x.get("id") for x in saved_items}
+    selected_label = st.selectbox("保存レースを選択", labels)
+    selected_id = label_to_id.get(selected_label, "")
+    selected_item = get_saved_race(selected_id)
+
+    if selected_item:
+        st.write(f"**レース名:** {selected_item.get('race_name', '')}")
+        st.write(f"**券種:** {selected_item.get('ticket_type', '')} / **判定:** {selected_item.get('hit_status', '未結果')}")
+        result_text = (selected_item.get("result", {}) or {}).get("result_text", "")
+        if result_text:
+            st.write(f"**結果:** {result_text}")
+
+        b1, b2 = st.columns(2)
+        with b1:
+            if st.button("この保存レースを読込", use_container_width=True):
+                restore_saved_race_to_session(selected_item)
+                st.rerun()
+        with b2:
+            if st.button("この保存レースを削除", use_container_width=True):
+                if delete_saved_race(selected_id):
+                    st.success("削除しました。")
+                    st.rerun()
+                else:
+                    st.error("削除に失敗しました。")
+
+        saved_pred_df = pd.DataFrame(selected_item.get("pred_rows", []))
+        if not saved_pred_df.empty:
+            st.markdown("#### 保存済み買い目")
+            st.dataframe(saved_pred_df, use_container_width=True, hide_index=True)
+
+            st.markdown("#### 保存レースに結果を保存")
+            default_result = selected_item.get("result", {}) or {}
+            with st.form("saved_result_form_mobile"):
+                sr1, sr2, sr3 = st.columns(3)
+                result_1 = sr1.text_input("1着", value=str(default_result.get("1着", "")), key="saved_r1")
+                result_2 = sr2.text_input("2着", value=str(default_result.get("2着", "")), key="saved_r2")
+                result_3 = sr3.text_input("3着", value=str(default_result.get("3着", "")), key="saved_r3")
+                save_saved_result = st.form_submit_button("この保存レースに結果を保存", use_container_width=True)
+
+            if save_saved_result:
+                try:
+                    selected_ticket_type = selected_item.get("ticket_type", "3連単")
+                    hit_info = judge_hit(selected_ticket_type, saved_pred_df, result_1, result_2, result_3)
+                    save_result_log(
+                        race_name=selected_item.get("race_name", ""),
+                        mode=selected_item.get("mode", ""),
+                        weather=selected_item.get("weather", ""),
+                        race_type=selected_item.get("race_type", "通常"),
+                        lineup=selected_item.get("lineup_string", ""),
+                        ticket_type=selected_ticket_type,
+                        pred_df=saved_pred_df,
+                        result_1=result_1,
+                        result_2=result_2,
+                        result_3=result_3,
+                        hit_status=hit_info["status_label"],
+                    )
+                    update_saved_race(
+                        selected_id,
+                        {
+                            "result_saved": True,
+                            "hit_status": hit_info["status_label"],
+                            "result": {
+                                "1着": result_1,
+                                "2着": result_2,
+                                "3着": result_3,
+                                "result_text": hit_info["result_text"],
+                                "hit_ticket": hit_info["hit_ticket"],
+                                "saved_at": now_str(),
+                            },
+                        },
+                    )
+                    st.success(f"結果を保存しました / 判定: {hit_info['status_label']}")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"保存失敗: {e}")
+
 
 with st.expander("デバッグ", expanded=False):
     st.write(st.session_state.get("debug", {}))
