@@ -1394,16 +1394,30 @@ def fetch_players_from_winticket(url: str, num_riders: int):
 
     if best_df.empty:
         raise ValueError("選手情報を自動取得できませんでした。")
-    if len(best_df) < num_riders:
-        missing = sorted(list(set(range(1, num_riders + 1)) - set(best_df["車番"].astype(int).tolist())))
-        raise ValueError(f"選手情報が不足しています。取得{len(best_df)}人 / 不足車番: {missing}")
+
+    # v7: 7番だけ取れない時にアプリを止めない。
+    # 取得できた車番だけ反映し、不足車番は空欄にして手入力できるようにする。
+    missing = sorted(list(set(range(1, num_riders + 1)) - set(best_df["車番"].astype(int).tolist())))
+    debug_info["missing_final"] = missing
+    if missing:
+        debug_info["warning"] = f"部分取得: {len(best_df)}人取得 / 不足車番: {missing}"
 
     return best_df, debug_info
 
 
 def apply_players_to_df(df: pd.DataFrame, players_df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
+
+    # v7: 前回の誤取得が残らないように、選手欄だけ先にクリアする。
+    # ライン・ライン順・単騎は残す。
+    out["選手名"] = ""
+    out["競走得点"] = 0.0
+    out["脚質"] = ""
+
     players_df = normalize_player_df(players_df, len(out)).copy()
+
+    if players_df.empty:
+        return out
 
     players_df["車番"] = pd.to_numeric(players_df["車番"], errors="coerce").fillna(0).astype(int)
     players_df["競走得点"] = pd.to_numeric(players_df["競走得点"], errors="coerce").fillna(0.0)
@@ -1759,7 +1773,11 @@ with c4:
 
             st.session_state["player_debug_info"] = debug_info
             st.session_state["widget_ver"] = st.session_state.get("widget_ver", 0) + 1
-            st.session_state["message"] = f"選手情報取得成功: {len(players_df)}人"
+            missing = debug_info.get("missing_final", []) if isinstance(debug_info, dict) else []
+            if missing:
+                st.session_state["message"] = f"選手情報は部分取得: {len(players_df)}人 / 不足車番: {missing}（不足分は手入力してください）"
+            else:
+                st.session_state["message"] = f"選手情報取得成功: {len(players_df)}人"
             st.rerun()
         except Exception as e:
             st.session_state["player_debug_info"] = {"error": str(e)}
