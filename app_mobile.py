@@ -23,7 +23,7 @@ from staking import apply_staking_ai, staking_summary_text
 st.set_page_config(page_title="競輪AI Mobile", page_icon="🚴", layout="centered")
 
 st.title("🚴 競輪AI Mobile")
-st.caption("安定版 / 選手取得さらに強化 / 保存一覧復活 / 単騎バランス補正 / 学習補正ON")
+st.caption("安定版 / ライン信頼度・崩れ対応 / 学習補正 / 見送りAI / 賭け金AI")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0",
@@ -1258,7 +1258,7 @@ with st.expander("⚙️ 設定", expanded=True):
         init_state(num_riders)
         st.rerun()
 
-    race_type = st.selectbox("レース種別", ["通常", "ガールズ"])
+    race_type = st.selectbox("レース種別", ["通常", "ガールズ", "G3"])
     ticket_type = st.selectbox("券種", ["3連単", "2車単"])
     weather = st.selectbox("天候", ["晴", "雨", "風強"])
     display_count = st.selectbox("買い目点数", list(range(3, 31)), index=7)
