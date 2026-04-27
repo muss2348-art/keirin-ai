@@ -357,8 +357,8 @@ def score_ticket(
     break_bonus = 0.0
     if second is not None and not is_same_line(d, head, second):
         if line_level == "低":
-            break_bonus += 12.0
-            reasons.append("ライン崩れ想定")
+            break_bonus += 18.0
+            reasons.append("ライン崩れ強め想定")
         elif line_level == "中":
             break_bonus += 5.0
             reasons.append("ライン崩れ少し")
