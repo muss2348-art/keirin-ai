@@ -1534,7 +1534,7 @@ def merge_player_dfs(base_df: pd.DataFrame, add_df: pd.DataFrame, num_riders=Non
     return normalize_player_df(merged, num_riders)
 
 
-def players_df, debug_info = fetch_players_g3(url, num_riders)
+def fetch_players_from_winticket(url: str, num_riders: int):
     """
     G3安全版 v_final。
     車番をHTMLから無理に拾わず、出走表に出てくる順番で 1〜num_riders を振る。
@@ -1676,6 +1676,8 @@ def players_df, debug_info = fetch_players_g3(url, num_riders)
 
     # 足りない場合も止めずに返す。取れた分だけ反映して、不足分は手入力できるようにする。
     return best_df[["車番", "選手名", "競走得点", "脚質"]].copy(), debug_info
+
+
 def apply_players_to_df(df: pd.DataFrame, players_df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     players_df = players_df.copy()
