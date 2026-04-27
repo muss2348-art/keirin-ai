@@ -1534,7 +1534,7 @@ def merge_player_dfs(base_df: pd.DataFrame, add_df: pd.DataFrame, num_riders=Non
     return normalize_player_df(merged, num_riders)
 
 
-def fetch_players_from_winticket(url: str, num_riders: int):
+def players_df, debug_info = fetch_players_g3(url, num_riders)
     """
     G3安全版 v_final。
     車番をHTMLから無理に拾わず、出走表に出てくる順番で 1〜num_riders を振る。
