@@ -1239,17 +1239,24 @@ def extract_players_by_car_blocks(text: str, num_riders: int):
 
 def normalize_player_df(players_df: pd.DataFrame, num_riders: int) -> pd.DataFrame:
     """
-    選手取得の最終安全整形。
-    - 車番1〜num_riders以外を除外
-    - 同じ車番は最初の有効行だけ採用
-    - 同じ選手名が複数車番に入る事故を防止
-    - 競走得点/脚質の異常値を除外
+    選手取得の最終安全整形 v5。
+
+    重要：
+    以前の版は「同じ選手名」を見つけたら後ろを消していたため、
+    WINTICKET側のテキスト抽出ブレで 7番だけ消える事故がありました。
+
+    この版では、
+    - 車番を最優先で1〜num_ridersまで残す
+    - 同じ車番の候補が複数ある場合だけ、情報量が良い方を採用
+    - 選手名の重複だけでは削除しない
+    - 最後にデバッグしやすい形で車番順に返す
     """
+    cols = ["車番", "選手名", "競走得点", "脚質"]
     if players_df is None or players_df.empty:
-        return pd.DataFrame(columns=["車番", "選手名", "競走得点", "脚質"])
+        return pd.DataFrame(columns=cols)
 
     df = players_df.copy()
-    for col in ["車番", "選手名", "競走得点", "脚質"]:
+    for col in cols:
         if col not in df.columns:
             df[col] = ""
 
@@ -1263,32 +1270,57 @@ def normalize_player_df(players_df: pd.DataFrame, num_riders: int) -> pd.DataFra
     df = df[(df["競走得点"] >= 40.0) & (df["競走得点"] <= 130.0)]
     df = df[df["脚質"].isin(["逃", "捲", "追", "両", "自"])]
 
-    fixed = []
-    used_cars = set()
-    used_names = set()
+    if df.empty:
+        return pd.DataFrame(columns=cols)
 
-    for _, row in df.sort_values(["車番"]).iterrows():
+    def candidate_quality(row) -> float:
+        """同じ車番の候補が複数あるとき、より信頼できる行を選ぶ。"""
+        q = 0.0
+        name = str(row.get("選手名", ""))
+        score = safe_float(row.get("競走得点", 0), 0)
+        style = str(row.get("脚質", ""))
+
+        if is_valid_player_name(name):
+            q += 10.0
+        if 60.0 <= score <= 125.0:
+            q += 10.0
+        if style in ["逃", "捲", "追", "両", "自"]:
+            q += 5.0
+        q += min(max(score - 40.0, 0.0), 80.0) / 20.0
+        return q
+
+    fixed = {}
+    for _, row in df.iterrows():
         car = int(row["車番"])
-        name = str(row["選手名"])
-        if car in used_cars:
-            continue
-        if name in used_names:
-            continue
-        fixed.append({
+        current = {
             "車番": car,
-            "選手名": name,
+            "選手名": str(row["選手名"]),
             "競走得点": float(row["競走得点"]),
             "脚質": str(row["脚質"]),
-        })
-        used_cars.add(car)
-        used_names.add(name)
+            "_quality": candidate_quality(row),
+        }
 
-    out = pd.DataFrame(fixed)
+        if car not in fixed:
+            fixed[car] = current
+            continue
+
+        old = fixed[car]
+        if current["_quality"] > old.get("_quality", 0):
+            fixed[car] = current
+
+    rows = []
+    for car in range(1, int(num_riders) + 1):
+        if car not in fixed:
+            continue
+        item = fixed[car].copy()
+        item.pop("_quality", None)
+        rows.append(item)
+
+    out = pd.DataFrame(rows)
     if out.empty:
-        return pd.DataFrame(columns=["車番", "選手名", "競走得点", "脚質"])
+        return pd.DataFrame(columns=cols)
 
-    return out[["車番", "選手名", "競走得点", "脚質"]].sort_values("車番").reset_index(drop=True)
-
+    return out[cols].sort_values("車番").reset_index(drop=True)
 
 def merge_player_dfs(base_df: pd.DataFrame, add_df: pd.DataFrame, num_riders: int | None = None) -> pd.DataFrame:
     if base_df is None or base_df.empty:
