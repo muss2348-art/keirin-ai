@@ -1,4 +1,4 @@
-# app.py
+# app_mobile_g3.py
 # -*- coding: utf-8 -*-
 
 import re
@@ -21,9 +21,9 @@ from staking import apply_staking_ai, staking_summary_text
 
 
 st.set_page_config(
-    page_title="競輪AI G3版",
+    page_title="競輪AI モバイル版",
     page_icon="🚴",
-    layout="wide",
+    layout="centered",
 )
 
 HEADERS = {
@@ -535,7 +535,7 @@ def saved_race_label(item: dict) -> str:
     created_at = item.get("created_at", "")
     mode = item.get("mode", "")
     ticket_type = item.get("ticket_type", "3連単")
-    race_type = item.get("race_type", "通常")
+    race_type = item.get("race_type", "G3")
     result_saved = saved_race_status_label(item)
     result_text = format_saved_result(item)
 
@@ -619,7 +619,7 @@ def restore_saved_race_to_session(item: dict):
     st.session_state["pred_df"] = pd.DataFrame(item.get("pred_rows", [])) if item.get("pred_rows") else None
     st.session_state["odds_dict"] = item.get("odds_dict", {})
     st.session_state["ticket_type"] = item.get("ticket_type", "3連単")
-    st.session_state["race_type"] = item.get("race_type", "通常")
+    st.session_state["race_type"] = item.get("race_type", "G3")
     st.session_state["message"] = f"保存レースを読込: {item.get('race_name', '')}"
 
 
@@ -1240,15 +1240,20 @@ def extract_players_by_car_blocks(text: str, num_riders: int):
 
 def normalize_player_df(players_df: pd.DataFrame, num_riders: int) -> pd.DataFrame:
     """
-    選手取得の最終安全整形 v7。
-    車番ごとに候補を集め、JSON/HTMLカード/regexの信頼度を使って最良候補を採用する。
-    同じ選手名が複数車番に入る場合は低品質候補だけ落とす。
+    通常版・選手取得の最終安全整形 v8。
+
+    重要：名前が取れている選手を、得点0・脚質空欄という理由で消さない。
+    - 必須：車番、選手名
+    - 任意：競走得点、脚質
+    - 同じ車番は品質の高い候補を採用
+    - 同じ選手名が複数車番に出た場合は、品質の高い方を残す
     """
     cols = ["車番", "選手名", "競走得点", "脚質"]
     if players_df is None or players_df.empty:
         return pd.DataFrame(columns=cols)
 
     df = players_df.copy()
+
     for col in cols:
         if col not in df.columns:
             df[col] = ""
@@ -1261,22 +1266,27 @@ def normalize_player_df(players_df: pd.DataFrame, num_riders: int) -> pd.DataFra
     df["脚質"] = df["脚質"].astype(str).map(normalize_text)
     df["source"] = df["source"].astype(str)
 
+    # 車番と名前だけは必須
     df = df[(df["車番"] >= 1) & (df["車番"] <= int(num_riders))]
     df = df[df["選手名"].map(is_valid_player_name)]
-    df = df[(df["競走得点"] >= 40.0) & (df["競走得点"] <= 130.0)]
-    df = df[df["脚質"].isin(["逃", "捲", "追", "両", "自"])]
+
+    # 得点・脚質は任意。怪しい値だけ空に戻す。
+    df.loc[~df["競走得点"].between(40.0, 130.0), "競走得点"] = 0.0
+    df.loc[~df["脚質"].isin(["逃", "捲", "追", "両", "自"]), "脚質"] = ""
 
     if df.empty:
         return pd.DataFrame(columns=cols)
 
     source_weight = {
-        "json_exact": 100,
-        "json_recursive": 95,
-        "html_card": 90,
-        "entry_pattern": 80,
-        "loose_entry": 70,
-        "single_block": 55,
-        "car_block_safe": 50,
+        "json_exact": 120,
+        "json_recursive": 115,
+        "html_card": 100,
+        "entry_pattern": 90,
+        "loose_entry": 75,
+        "single_block": 65,
+        "car_block_safe": 60,
+        "sequence_card": 45,
+        "sequence_text": 35,
     }
 
     def candidate_quality(row) -> float:
@@ -1285,19 +1295,22 @@ def normalize_player_df(players_df: pd.DataFrame, num_riders: int) -> pd.DataFra
         score = safe_float(row.get("競走得点", 0), 0)
         style = str(row.get("脚質", ""))
         src = str(row.get("source", ""))
-        q += source_weight.get(src, 10)
+
+        q += source_weight.get(src, 20)
         if is_valid_player_name(name):
-            q += 10.0
+            q += 10
         if 60.0 <= score <= 125.0:
-            q += 10.0
+            q += 12
+        elif 40.0 <= score <= 130.0:
+            q += 5
         if style in ["逃", "捲", "追", "両", "自"]:
-            q += 5.0
-        q += min(max(score - 40.0, 0.0), 80.0) / 20.0
+            q += 8
         return q
 
     df["_quality"] = df.apply(candidate_quality, axis=1)
     df = df.sort_values(["車番", "_quality", "競走得点"], ascending=[True, False, False]).reset_index(drop=True)
 
+    # 車番ごとに最良候補を採用
     picked = {}
     for car in range(1, int(num_riders) + 1):
         cand = df[df["車番"] == car]
@@ -1305,6 +1318,7 @@ def normalize_player_df(players_df: pd.DataFrame, num_riders: int) -> pd.DataFra
             continue
         picked[car] = cand.iloc[0]
 
+    # 同名重複は品質の高い方を残し、可能なら代替候補へ差し替え
     name_to_cars = {}
     for car, row in picked.items():
         name_to_cars.setdefault(str(row["選手名"]), []).append(car)
@@ -1312,10 +1326,12 @@ def normalize_player_df(players_df: pd.DataFrame, num_riders: int) -> pd.DataFra
     for name, cars in list(name_to_cars.items()):
         if len(cars) <= 1:
             continue
+
         keep_car = max(cars, key=lambda c: safe_float(picked[c].get("_quality", 0), 0))
         for car in cars:
             if car == keep_car:
                 continue
+
             used_names = {str(v["選手名"]) for k, v in picked.items() if k != car}
             cand = df[df["車番"] == car]
             replacement = None
@@ -1323,6 +1339,7 @@ def normalize_player_df(players_df: pd.DataFrame, num_riders: int) -> pd.DataFra
                 if str(row["選手名"]) not in used_names:
                     replacement = row
                     break
+
             if replacement is not None:
                 picked[car] = replacement
             else:
@@ -1334,18 +1351,18 @@ def normalize_player_df(players_df: pd.DataFrame, num_riders: int) -> pd.DataFra
         rows.append({
             "車番": int(car),
             "選手名": str(row["選手名"]),
-            "競走得点": float(row["競走得点"]),
-            "脚質": str(row["脚質"]),
+            "競走得点": float(safe_float(row.get("競走得点", 0), 0)),
+            "脚質": str(row.get("脚質", "")),
         })
 
     out = pd.DataFrame(rows)
     if out.empty:
         return pd.DataFrame(columns=cols)
+
     out = out.drop_duplicates(subset=["車番"], keep="first")
     out = out.drop_duplicates(subset=["選手名"], keep="first")
     out = out.sort_values("車番").reset_index(drop=True)
     return out[cols].copy()
-
 
 def _walk_json(obj):
     if isinstance(obj, dict):
@@ -1536,137 +1553,181 @@ def merge_player_dfs(base_df: pd.DataFrame, add_df: pd.DataFrame, num_riders=Non
 
 def fetch_players_from_winticket(url: str, num_riders: int):
     """
-    G3安全版 v_final。
-    車番をHTMLから無理に拾わず、出走表に出てくる順番で 1〜num_riders を振る。
-    得点・脚質が取れなくても、名前が取れた選手は採用する。
-    これで「取得7人なのに不足車番 [1,5]」や「部分取得で車番が飛ぶ」を防ぐ。
+    WINTICKET選手取得 v8 通常版安全取得。
+
+    方針：
+    1. まず既存の高精度ルート（JSON/HTMLカード/regex）を使う
+    2. 足りない車番だけ、ページ上の選手カードらしき並びから補完する
+    3. それでも足りない場合もアプリを止めず、取れた分だけ返す
     """
     candidate_urls = build_player_candidate_urls(url)
     debug_items = []
     best_df = pd.DataFrame(columns=["車番", "選手名", "競走得点", "脚質"])
 
-    def pick_players_by_sequence(html: str, title: str = "") -> pd.DataFrame:
+    def extract_sequence_candidates(html: str, page_text: str, n: int):
+        """車番がうまく拾えない時の保険。出走表らしい順番で名前だけでも拾う。"""
         soup = BeautifulSoup(html, "html.parser")
-
         selectors = [
-            '[class*="RaceCardPlayer"]',
-            '[class*="PlayerCard"]',
+            '[class*="RaceCard"]',
+            '[class*="race-card"]',
+            '[class*="Player"]',
+            '[class*="player"]',
             '[class*="Racer"]',
             '[class*="racer"]',
-            '[class*="player"]',
-            '[class*="Entry"]',
-            '[class*="entry"]',
             'tr',
             'li',
         ]
 
-        rows = []
+        candidates = []
         used_names = set()
         used_texts = set()
 
-        ng_words = set(PREFECTURES + [
-            "競輪", "出走表", "レース", "オッズ", "予想", "並び", "ライン", "結果",
-            "人気", "払戻", "選手", "情報", "基本", "成績", "直近", "コメント",
-            "本命", "対抗", "単穴", "連下", "勝率", "得点", "脚質",
-        ])
+        def pick_name(text: str) -> str:
+            text = normalize_text(text)
+            m = re.search(rf'([一-龥ぁ-んァ-ヶ々]{{2,8}})\s+(?:{PREF_PATTERN})', text)
+            if m:
+                cand = normalize_text(m.group(1))
+                if is_valid_player_name(cand):
+                    return cand
+            for cand in re.findall(r'[一-龥ぁ-んァ-ヶ々]{2,8}', text):
+                cand = normalize_text(cand)
+                if is_valid_player_name(cand):
+                    return cand
+            return ""
+
+        def pick_score(text: str) -> float:
+            vals = []
+            for m in re.finditer(r'([6-9]\d(?:\.\d{1,3})?|1[0-2]\d(?:\.\d{1,3})?)', text):
+                v = safe_float(m.group(1), 0.0)
+                if 60.0 <= v <= 130.0:
+                    vals.append(v)
+            return vals[0] if vals else 0.0
+
+        def pick_style(text: str) -> str:
+            m = re.search(r'(逃|捲|追|両|自)', text)
+            return normalize_text(m.group(1)) if m else ""
 
         for sel in selectors:
             for tag in soup.select(sel):
                 text = normalize_text(tag.get_text(" ", strip=True))
-
                 if not text or text in used_texts:
                     continue
                 used_texts.add(text)
 
-                # 大きすぎる本文・小さすぎる断片は除外
-                if len(text) < 8 or len(text) > 1000:
+                if len(text) < 8 or len(text) > 1200:
                     continue
 
-                # 選手カードらしさの最低条件
-                if not re.search(r"[一-龥ぁ-んァ-ヶ々]{2,8}", text):
-                    continue
-                if not (re.search(r"(逃|捲|追|両|自)", text) or re.search(r"(?:北海道|青森|岩手|宮城|秋田|山形|福島|茨城|栃木|群馬|埼玉|千葉|東京|神奈川|新潟|富山|石川|福井|山梨|長野|岐阜|静岡|愛知|三重|滋賀|京都|大阪|兵庫|奈良|和歌山|鳥取|島根|岡山|広島|山口|徳島|香川|愛媛|高知|福岡|佐賀|長崎|熊本|大分|宮崎|鹿児島|沖縄)", text)):
-                    continue
-
-                candidates = re.findall(r"[一-龥ぁ-んァ-ヶ々]{2,8}", text)
-                name = ""
-                for cand in candidates:
-                    cand = normalize_text(cand)
-                    if cand in ng_words:
-                        continue
-                    if is_valid_player_name(cand):
-                        name = cand
-                        break
-
+                name = pick_name(text)
                 if not name or name in used_names:
                     continue
 
-                style_match = re.search(r"(逃|捲|追|両|自)", text)
-                style = normalize_text(style_match.group(1)) if style_match else ""
+                # 選手カードらしさが薄すぎるものは除外
+                has_pref = bool(re.search(PREF_PATTERN, text))
+                has_style = bool(re.search(r'(逃|捲|追|両|自)', text))
+                has_score = bool(re.search(r'([6-9]\d(?:\.\d{1,3})?|1[0-2]\d(?:\.\d{1,3})?)', text))
+                if not (has_pref or has_style or has_score):
+                    continue
 
-                # 得点は誤取得しやすいので、かなり慎重に拾う。怪しければ0のまま。
-                score = 0.0
-                score_candidates = []
-                for m in re.finditer(r"([6-9]\d(?:\.\d{1,3})?|1[0-2]\d(?:\.\d{1,3})?)", text):
-                    v = safe_float(m.group(1), 0.0)
-                    if 60.0 <= v <= 130.0:
-                        before = text[max(0, m.start() - 4):m.start()]
-                        after = text[m.end():m.end() + 4]
-                        if "歳" in after or "歳" in before or "期" in after or "期" in before:
-                            continue
-                        score_candidates.append(v)
-
-                if score_candidates:
-                    # 競走得点は多くの場合、カード内の得点らしい数値の先頭側にある
-                    score = score_candidates[0]
-
-                rows.append({
-                    "車番": len(rows) + 1,
+                candidates.append({
+                    "車番": len(candidates) + 1,
                     "選手名": name,
-                    "競走得点": score,
-                    "脚質": style,
+                    "競走得点": pick_score(text),
+                    "脚質": pick_style(text),
+                    "source": "sequence_card",
                 })
                 used_names.add(name)
 
-                if len(rows) >= int(num_riders):
+                if len(candidates) >= n:
                     break
-
-            if len(rows) >= int(num_riders):
+            if len(candidates) >= n:
                 break
 
-        if not rows:
-            return pd.DataFrame(columns=["車番", "選手名", "競走得点", "脚質"])
+        if candidates:
+            return pd.DataFrame(candidates), candidates[:12]
 
-        return pd.DataFrame(rows)[["車番", "選手名", "競走得点", "脚質"]].copy()
+        return pd.DataFrame(columns=["車番", "選手名", "競走得点", "脚質", "source"]), []
 
     for target_url in candidate_urls:
         try:
             fetched = get_html_text_title(target_url)
+            full_text = fetched["text"]
             html = fetched.get("html", "")
-            title = fetched.get("title", "")
+            section_text = extract_players_section(full_text)
 
-            seq_df = pick_players_by_sequence(html, title)
+            df_json, dbg_json = extract_players_from_json_html(html, num_riders)
+            df_cards, dbg_cards = extract_players_from_html_cards(html, num_riders)
+            df_section, dbg_section = extract_players_with_regex(section_text, num_riders)
+            df_full, dbg_full = extract_players_with_regex(full_text, num_riders)
+            df_block, dbg_block = extract_players_by_car_blocks(full_text, num_riders)
+            df_loose, dbg_loose = extract_players_loose_entries(full_text, num_riders)
+            df_sequence, seq_preview = extract_sequence_candidates(html, full_text, num_riders)
+
+            # まず高精度候補を統合
+            valid_frames = [
+                x for x in [df_json, df_cards, df_section, df_full, df_block, df_loose]
+                if x is not None and not x.empty
+            ]
+            combined = pd.concat(valid_frames, ignore_index=True) if valid_frames else pd.DataFrame()
+            final_df = normalize_player_df(combined, num_riders)
+
+            # 足りない場合は、順番候補で不足車番だけ補完
+            if len(final_df) < num_riders and df_sequence is not None and not df_sequence.empty:
+                seq_df = normalize_player_df(df_sequence, num_riders)
+                if not seq_df.empty:
+                    existing_cars = set(final_df["車番"].astype(int).tolist()) if not final_df.empty else set()
+                    existing_names = set(final_df["選手名"].astype(str).tolist()) if not final_df.empty else set()
+                    fill_rows = []
+                    for _, row in seq_df.iterrows():
+                        car = safe_int(row.get("車番", 0), 0)
+                        name = normalize_text(row.get("選手名", ""))
+                        if car in existing_cars or name in existing_names:
+                            continue
+                        fill_rows.append(row.to_dict())
+
+                    if fill_rows:
+                        final_df = normalize_player_df(
+                            pd.concat([final_df, pd.DataFrame(fill_rows)], ignore_index=True),
+                            num_riders,
+                        )
+
+            missing = sorted(list(set(range(1, num_riders + 1)) - set(final_df["車番"].astype(int).tolist()))) if not final_df.empty else list(range(1, num_riders + 1))
 
             debug_items.append({
                 "url": target_url,
-                "status_code": fetched.get("status_code", ""),
-                "title": title,
-                "sequence_hits": len(seq_df),
-                "final_players": seq_df.to_dict(orient="records") if not seq_df.empty else [],
+                "status_code": fetched["status_code"],
+                "title": fetched["title"],
+                "json_hits": len(df_json),
+                "card_hits": len(df_cards),
+                "section_hits": len(df_section),
+                "full_hits": len(df_full),
+                "block_hits": len(df_block),
+                "loose_hits": len(df_loose),
+                "sequence_hits": len(df_sequence),
+                "final_hits": len(final_df),
+                "missing_after": missing,
+                "final_players": final_df.to_dict(orient="records") if not final_df.empty else [],
+                "preview_json": dbg_json.get("preview", [])[:6],
+                "preview_cards": dbg_cards.get("preview", [])[:6],
+                "preview_regex": (dbg_section.get("preview", [])[:4] + dbg_full.get("preview", [])[:4] + dbg_block.get("preview", [])[:4] + dbg_loose.get("preview", [])[:4]),
+                "preview_sequence": seq_preview[:8],
+                "section_head": section_text[:300],
             })
 
-            if len(seq_df) > len(best_df):
-                best_df = seq_df.copy()
-
-            if len(best_df) >= int(num_riders):
+            if len(final_df) > len(best_df):
+                best_df = final_df.copy()
+            if len(best_df) >= num_riders:
                 break
 
         except Exception as e:
             debug_items.append({"url": target_url, "error": str(e)})
 
+    best_df = normalize_player_df(best_df, num_riders)
+    missing = sorted(list(set(range(1, num_riders + 1)) - set(best_df["車番"].astype(int).tolist()))) if not best_df.empty else list(range(1, num_riders + 1))
+
     debug_info = {
-        "source_type": "g3_sequence_safe_v_final",
+        "source_type": "winticket_player_auto_v8_safe_normal",
         "hit_count": len(best_df),
+        "missing": missing,
         "candidate_results": debug_items,
         "final_players": best_df.to_dict(orient="records") if not best_df.empty else [],
     }
@@ -1674,27 +1735,43 @@ def fetch_players_from_winticket(url: str, num_riders: int):
     if best_df.empty:
         raise ValueError("選手情報を自動取得できませんでした。デバッグ情報を確認してください。")
 
-    # 足りない場合も止めずに返す。取れた分だけ反映して、不足分は手入力できるようにする。
-    return best_df[["車番", "選手名", "競走得点", "脚質"]].copy(), debug_info
+    # 通常版は止めない。取れた分だけ反映して、不足は手入力できるようにする。
+    if len(best_df) < num_riders:
+        debug_info["warning"] = f"部分取得: {len(best_df)}人 / 不足車番: {missing}"
 
+    return best_df, debug_info
 
 def apply_players_to_df(df: pd.DataFrame, players_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    取得した選手情報を画面の表へ反映する。
+    得点0・脚質空欄でも、名前が取れていれば消さずに反映する。
+    """
     out = df.copy()
+
+    if players_df is None or players_df.empty:
+        return out
+
     players_df = players_df.copy()
+
+    for col in ["車番", "選手名", "競走得点", "脚質"]:
+        if col not in players_df.columns:
+            players_df[col] = ""
 
     players_df["車番"] = pd.to_numeric(players_df["車番"], errors="coerce").fillna(0).astype(int)
     players_df["競走得点"] = pd.to_numeric(players_df["競走得点"], errors="coerce").fillna(0.0)
 
     for _, row in players_df.iterrows():
         car = int(row["車番"])
+        if car <= 0 or car not in out["車番"].astype(int).tolist():
+            continue
 
         name = normalize_text(row.get("選手名", ""))
         if is_valid_player_name(name):
             out.loc[out["車番"] == car, "選手名"] = name
 
-        score = safe_float(row.get("競走得点", 0.0))
-        # 誤取得対策：40台前半の整数っぽい値は年齢などを拾っていることが多いので反映しない
-        if 40.0 <= score <= 130.0 and not (score < 45.0 and float(score).is_integer()):
+        score = safe_float(row.get("競走得点", 0.0), 0.0)
+        # 0は「未取得」としてそのまま。怪しい40台整数は反映しない。
+        if 45.0 <= score <= 130.0:
             out.loc[out["車番"] == car, "競走得点"] = score
 
         style = normalize_text(row.get("脚質", ""))
@@ -1703,10 +1780,6 @@ def apply_players_to_df(df: pd.DataFrame, players_df: pd.DataFrame) -> pd.DataFr
 
     return out
 
-
-# =========================================================
-# オッズ取得
-# =========================================================
 def extract_script_texts(html: str):
     soup = BeautifulSoup(html, "html.parser")
     items = []
@@ -1939,8 +2012,8 @@ def save_current_prediction(
 # =========================================================
 # UI
 # =========================================================
-st.title("🚴 競輪AI G3版")
-st.caption("完全統合版 / ライン信頼度・崩れ対応 / 学習補正 / 見送りAI / 賭け金AI")
+st.title("🚴 競輪AI モバイル版")
+st.caption("モバイル版 / 通常版の安全取得ロジック反映 / 学習補正・ROI・見送りAI・賭け金AI")
 
 if "race_rows" not in st.session_state:
     init_state(7)
@@ -1966,7 +2039,7 @@ with st.sidebar:
     st.session_state["ticket_type"] = ticket_type
 
     race_type_options = ["通常", "ガールズ", "G3"]
-    race_type_default = st.session_state.get("race_type", "通常")
+    race_type_default = st.session_state.get("race_type", "G3")
     race_type = st.selectbox(
         "レース種別",
         options=race_type_options,
