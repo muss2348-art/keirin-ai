@@ -337,7 +337,7 @@ def load_log_df() -> pd.DataFrame:
             df[col] = 0
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
-    for col in ["レース名", "券種", "モード", "天候", "判定", "結果", "買い目", "レース種別"]:
+    for col in ["保存日時", "レース名", "券種", "モード", "天候", "判定", "結果", "買い目", "レース種別"]:
         if col not in df.columns:
             df[col] = ""
         df[col] = df[col].fillna("").astype(str)
@@ -1942,7 +1942,33 @@ def save_result_log(
         else:
             result_text = "-".join([x for x in [result_1, result_2, result_3] if x])
 
+        # ROI学習用の安全補正。
+        # モバイル版では保存時に購入金額が空/0になりやすいため、
+        # ログへ書く直前に最低100円を必ず入れる。
+        if pred_df is None or pred_df.empty:
+            return
+
+        pred_df = pred_df.copy()
+
+        amount_series = pd.to_numeric(pred_df.get("購入金額", 0), errors="coerce").fillna(0)
+        if "購入金額" not in pred_df.columns or amount_series.sum() <= 0:
+            pred_df = apply_rank_based_amounts(pred_df, unit_bet=100)
+
+        if "購入金額" not in pred_df.columns:
+            pred_df["購入金額"] = 100
+
+        pred_df["購入金額"] = pd.to_numeric(pred_df["購入金額"], errors="coerce").fillna(0)
+        pred_df.loc[pred_df["購入金額"] <= 0, "購入金額"] = 100
+        pred_df["購入金額"] = pred_df["購入金額"].astype(int)
+
+        if "期待回収額(目安)" not in pred_df.columns:
+            pred_df["期待回収額(目安)"] = 0
+        pred_df["期待回収額(目安)"] = pd.to_numeric(pred_df["期待回収額(目安)"], errors="coerce").fillna(0)
+
         for _, row in pred_df.iterrows():
+            purchase_amount = max(100, int(safe_float(row.get("購入金額", 100), 100)))
+            expected_return = safe_float(row.get("期待回収額(目安)", 0), 0)
+
             writer.writerow(
                 [
                     now_str(),
@@ -1959,12 +1985,13 @@ def save_result_log(
                     row.get("AI評価", ""),
                     row.get("期待値", ""),
                     row.get("オッズ", ""),
-                    row.get("購入金額", ""),
-                    row.get("期待回収額(目安)", ""),
+                    purchase_amount,
+                    expected_return,
                     row.get("レース判定", ""),
                     row.get("的中率評価", ""),
                     row.get("レース評価点", ""),
                     row.get("判定理由", ""),
+                    row.get("見送りAIコメント", ""),
                 ]
             )
 
