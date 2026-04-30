@@ -26,6 +26,8 @@ st.set_page_config(
     layout="centered",
 )
 
+st.caption("✅ mobile ROI修正版 v11 起動中")
+
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
