@@ -1968,8 +1968,6 @@ def save_result_log(
 
     with open(LOG_PATH, "a", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
-
-    st.write("保存直前の購入金額チェック", pred_df[["買い目", "購入金額"]])
     
         if is_new:
             writer.writerow(
