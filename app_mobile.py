@@ -26,7 +26,7 @@ st.set_page_config(
     layout="centered",
 )
 
-st.caption("✅ mobile ROI修正版 v13 起動中（購入金額ログ強制修復版）")
+st.caption("✅ mobile ROI修正版 v14 起動中（購入金額ログ強制修復版）")
 
 HEADERS = {
     "User-Agent": (
@@ -379,7 +379,9 @@ def repair_log_purchase_amounts() -> None:
     target = ticket_exists & (amount <= 0)
 
     if target.any():
-        df.loc[target, "購入金額"] = 100
+        amount = amount.copy()
+        amount.loc[target] = 100
+        df["購入金額"] = amount.astype(int)
 
         if "期待回収額(目安)" not in df.columns:
             df["期待回収額(目安)"] = 0
