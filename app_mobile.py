@@ -26,7 +26,7 @@ st.set_page_config(
     layout="centered",
 )
 
-st.caption("✅ mobile ROI修正版 v11 起動中")
+st.caption("✅ mobile ROI購入金額 強制修正版 v12 起動中")
 
 HEADERS = {
     "User-Agent": (
@@ -269,44 +269,6 @@ def apply_rank_based_amounts(pred_df: pd.DataFrame, unit_bet: int) -> pd.DataFra
     return out
 
 
-def ensure_purchase_amounts(pred_df: pd.DataFrame, unit_bet: int = 100) -> pd.DataFrame:
-    """
-    モバイル版ROI学習用の購入金額ガード。
-    購入金額が無い・空・0円の場合でも、ログ保存時に必ず投資額が残るようにする。
-    """
-    if pred_df is None or pred_df.empty:
-        return pred_df
-
-    out = pred_df.copy()
-    unit = max(100, int(safe_float(unit_bet, 100)))
-
-    # まず既存のランク別配分を適用して、購入金額列を作る。
-    if "購入金額" not in out.columns:
-        out = apply_rank_based_amounts(out, unit)
-
-    if "購入金額" not in out.columns:
-        out["購入金額"] = unit
-
-    out["購入金額"] = pd.to_numeric(out["購入金額"], errors="coerce").fillna(0)
-
-    # 全部0なら、配分を作り直す。
-    if float(out["購入金額"].sum()) <= 0:
-        out = apply_rank_based_amounts(out, unit)
-        if "購入金額" not in out.columns:
-            out["購入金額"] = unit
-        out["購入金額"] = pd.to_numeric(out["購入金額"], errors="coerce").fillna(0)
-
-    # それでも0以下の行は最低100円にする。
-    out.loc[out["購入金額"] <= 0, "購入金額"] = unit
-    out["購入金額"] = out["購入金額"].round(0).astype(int)
-
-    if "期待回収額(目安)" not in out.columns:
-        out["期待回収額(目安)"] = 0
-    out["期待回収額(目安)"] = pd.to_numeric(out["期待回収額(目安)"], errors="coerce").fillna(0)
-
-    return out
-
-
 # =========================================================
 # 的中判定
 # =========================================================
@@ -357,7 +319,51 @@ def judge_hit(ticket_type: str, pred_df: pd.DataFrame, result_1: str, result_2: 
 # =========================================================
 # 回収率集計
 # =========================================================
+
+def repair_log_file_amounts(log_path=LOG_PATH):
+    """
+    モバイル版ROI用のログ修復。
+    過去に購入金額0円で保存された行も、買い目がある行は最低100円に補正する。
+    Streamlit Cloud上で古い0円ログが残っていてもROI学習が止まらないようにする。
+    """
+    try:
+        path = Path(log_path)
+        if not path.exists() or path.stat().st_size == 0:
+            return
+
+        try:
+            df = pd.read_csv(path, encoding="utf-8-sig")
+        except Exception:
+            df = pd.read_csv(path, encoding="utf-8")
+
+        if df is None or df.empty:
+            return
+
+        required_cols = [
+            "保存日時", "レース名", "券種", "モード", "天候", "レース種別", "並び", "結果", "判定",
+            "買い目", "買い目ランク", "AI評価", "期待値", "オッズ",
+            "購入金額", "期待回収額(目安)", "レース判定", "的中率評価", "レース評価点", "判定理由", "見送りAIコメント",
+        ]
+        for col in required_cols:
+            if col not in df.columns:
+                df[col] = "" if col not in ["期待値", "オッズ", "購入金額", "期待回収額(目安)"] else 0
+
+        # 買い目がある行だけを有効ログとして扱う
+        has_ticket = df["買い目"].astype(str).str.strip() != ""
+        amounts = pd.to_numeric(df["購入金額"], errors="coerce").fillna(0)
+        df.loc[has_ticket & (amounts <= 0), "購入金額"] = 100
+
+        # 数値列の型を整える
+        for col in ["期待値", "オッズ", "購入金額", "期待回収額(目安)"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+        df.to_csv(path, index=False, encoding="utf-8-sig")
+    except Exception:
+        # ログ修復でアプリを止めない
+        return
+
 def load_log_df() -> pd.DataFrame:
+    repair_log_file_amounts(LOG_PATH)
     if not LOG_PATH.exists():
         return pd.DataFrame()
 
@@ -1968,7 +1974,6 @@ def save_result_log(
 
     with open(LOG_PATH, "a", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
-    
         if is_new:
             writer.writerow(
                 [
@@ -1989,7 +1994,22 @@ def save_result_log(
         if pred_df is None or pred_df.empty:
             return
 
-        pred_df = ensure_purchase_amounts(pred_df, unit_bet=100)
+        pred_df = pred_df.copy()
+
+        amount_series = pd.to_numeric(pred_df.get("購入金額", 0), errors="coerce").fillna(0)
+        if "購入金額" not in pred_df.columns or amount_series.sum() <= 0:
+            pred_df = apply_rank_based_amounts(pred_df, unit_bet=100)
+
+        if "購入金額" not in pred_df.columns:
+            pred_df["購入金額"] = 100
+
+        pred_df["購入金額"] = pd.to_numeric(pred_df["購入金額"], errors="coerce").fillna(0)
+        pred_df.loc[pred_df["購入金額"] <= 0, "購入金額"] = 100
+        pred_df["購入金額"] = pred_df["購入金額"].astype(int)
+
+        if "期待回収額(目安)" not in pred_df.columns:
+            pred_df["期待回収額(目安)"] = 0
+        pred_df["期待回収額(目安)"] = pd.to_numeric(pred_df["期待回収額(目安)"], errors="coerce").fillna(0)
 
         for _, row in pred_df.iterrows():
             purchase_amount = max(100, int(safe_float(row.get("購入金額", 100), 100)))
@@ -2037,7 +2057,18 @@ def save_current_prediction(
     display_count: int,
 ):
     saved_id = datetime.now().strftime("%Y%m%d%H%M%S%f")
-    pred_df = ensure_purchase_amounts(pred_df, unit_bet=unit_bet)
+
+    # 保存済みレースから結果保存する場合でも購入金額が消えないようにする
+    if pred_df is None:
+        pred_df = pd.DataFrame()
+    else:
+        pred_df = pred_df.copy()
+    if not pred_df.empty:
+        amount_series = pd.to_numeric(pred_df.get("購入金額", 0), errors="coerce").fillna(0)
+        if "購入金額" not in pred_df.columns or amount_series.sum() <= 0:
+            pred_df = apply_rank_based_amounts(pred_df, unit_bet=max(100, int(unit_bet)))
+        pred_df["購入金額"] = pd.to_numeric(pred_df.get("購入金額", 0), errors="coerce").fillna(0)
+        pred_df.loc[pred_df["購入金額"] <= 0, "購入金額"] = max(100, int(unit_bet))
 
     record = {
         "id": saved_id,
@@ -2306,6 +2337,7 @@ st.dataframe(current_df, use_container_width=True, hide_index=True)
 
 st.markdown("---")
 st.subheader("AI予想")
+repair_log_file_amounts(LOG_PATH)
 st.caption(learning_summary_text(LOG_PATH))
 st.caption(roi_learning_summary_text(LOG_PATH))
 st.caption("見送りAIは買い/軽く買い/注意/見送りを判定します。")
@@ -2340,6 +2372,7 @@ with p1:
                 weather=weather,
                 ticket_type=ticket_type,
             )
+            repair_log_file_amounts(LOG_PATH)
             pred_df = apply_roi_learning(
                 pred_df,
                 LOG_PATH,
@@ -2364,7 +2397,6 @@ with p1:
                 unit_bet=unit_bet,
                 race_assessment=race_assessment,
             )
-            pred_df = ensure_purchase_amounts(pred_df, unit_bet=unit_bet)
             st.session_state["pred_df"] = pred_df
             st.session_state["message"] = "買い目生成成功"
             st.rerun()
@@ -2378,8 +2410,6 @@ with p2:
             st.error("先に買い目を出してください。")
         else:
             try:
-                pred_df = ensure_purchase_amounts(pred_df, unit_bet=unit_bet)
-                st.session_state["pred_df"] = pred_df
                 save_current_prediction(
                     race_name=st.session_state.get("race_name", ""),
                     url=st.session_state.get("last_url", ""),
@@ -2452,6 +2482,9 @@ st.subheader("回収率集計")
 
 log_df = load_log_df()
 summary = summarize_log_df(log_df)
+
+if not log_df.empty:
+    st.caption(f"ログ確認: {len(log_df)}行 / 購入金額合計 {int(pd.to_numeric(log_df.get('購入金額', 0), errors='coerce').fillna(0).sum()):,}円")
 
 m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
 m1.metric("保存件数", f"{summary['race_count']}件")
@@ -2569,10 +2602,6 @@ else:
                     result_3=result_3,
                 )
 
-                saved_pred_df = ensure_purchase_amounts(
-                    saved_pred_df,
-                    unit_bet=int(selected_item.get("unit_bet", 100) or 100),
-                )
                 save_result_log(
                     race_name=selected_item.get("race_name", ""),
                     mode=selected_item.get("mode", ""),
@@ -2586,6 +2615,7 @@ else:
                     result_3=result_3,
                     hit_status=hit_info["status_label"],
                 )
+                repair_log_file_amounts(LOG_PATH)
 
                 update_saved_race(
                     selected_saved_id,
@@ -2631,8 +2661,6 @@ if pred_df is not None and isinstance(pred_df, pd.DataFrame) and not pred_df.emp
                 result_3=result_3,
             )
 
-            pred_df = ensure_purchase_amounts(pred_df, unit_bet=unit_bet)
-            st.session_state["pred_df"] = pred_df
             save_result_log(
                 race_name=st.session_state.get("race_name", ""),
                 mode=detected_mode,
@@ -2646,6 +2674,7 @@ if pred_df is not None and isinstance(pred_df, pd.DataFrame) and not pred_df.emp
                 result_3=result_3,
                 hit_status=hit_info["status_label"],
             )
+            repair_log_file_amounts(LOG_PATH)
             st.success(f"結果を保存しました: {LOG_PATH.name} / 判定: {hit_info['status_label']}")
         except Exception as e:
             st.error(f"保存失敗: {e}")
