@@ -267,6 +267,44 @@ def apply_rank_based_amounts(pred_df: pd.DataFrame, unit_bet: int) -> pd.DataFra
     return out
 
 
+def ensure_purchase_amounts(pred_df: pd.DataFrame, unit_bet: int = 100) -> pd.DataFrame:
+    """
+    モバイル版ROI学習用の購入金額ガード。
+    購入金額が無い・空・0円の場合でも、ログ保存時に必ず投資額が残るようにする。
+    """
+    if pred_df is None or pred_df.empty:
+        return pred_df
+
+    out = pred_df.copy()
+    unit = max(100, int(safe_float(unit_bet, 100)))
+
+    # まず既存のランク別配分を適用して、購入金額列を作る。
+    if "購入金額" not in out.columns:
+        out = apply_rank_based_amounts(out, unit)
+
+    if "購入金額" not in out.columns:
+        out["購入金額"] = unit
+
+    out["購入金額"] = pd.to_numeric(out["購入金額"], errors="coerce").fillna(0)
+
+    # 全部0なら、配分を作り直す。
+    if float(out["購入金額"].sum()) <= 0:
+        out = apply_rank_based_amounts(out, unit)
+        if "購入金額" not in out.columns:
+            out["購入金額"] = unit
+        out["購入金額"] = pd.to_numeric(out["購入金額"], errors="coerce").fillna(0)
+
+    # それでも0以下の行は最低100円にする。
+    out.loc[out["購入金額"] <= 0, "購入金額"] = unit
+    out["購入金額"] = out["購入金額"].round(0).astype(int)
+
+    if "期待回収額(目安)" not in out.columns:
+        out["期待回収額(目安)"] = 0
+    out["期待回収額(目安)"] = pd.to_numeric(out["期待回収額(目安)"], errors="coerce").fillna(0)
+
+    return out
+
+
 # =========================================================
 # 的中判定
 # =========================================================
@@ -1948,22 +1986,7 @@ def save_result_log(
         if pred_df is None or pred_df.empty:
             return
 
-        pred_df = pred_df.copy()
-
-        amount_series = pd.to_numeric(pred_df.get("購入金額", 0), errors="coerce").fillna(0)
-        if "購入金額" not in pred_df.columns or amount_series.sum() <= 0:
-            pred_df = apply_rank_based_amounts(pred_df, unit_bet=100)
-
-        if "購入金額" not in pred_df.columns:
-            pred_df["購入金額"] = 100
-
-        pred_df["購入金額"] = pd.to_numeric(pred_df["購入金額"], errors="coerce").fillna(0)
-        pred_df.loc[pred_df["購入金額"] <= 0, "購入金額"] = 100
-        pred_df["購入金額"] = pred_df["購入金額"].astype(int)
-
-        if "期待回収額(目安)" not in pred_df.columns:
-            pred_df["期待回収額(目安)"] = 0
-        pred_df["期待回収額(目安)"] = pd.to_numeric(pred_df["期待回収額(目安)"], errors="coerce").fillna(0)
+        pred_df = ensure_purchase_amounts(pred_df, unit_bet=100)
 
         for _, row in pred_df.iterrows():
             purchase_amount = max(100, int(safe_float(row.get("購入金額", 100), 100)))
@@ -2011,6 +2034,7 @@ def save_current_prediction(
     display_count: int,
 ):
     saved_id = datetime.now().strftime("%Y%m%d%H%M%S%f")
+    pred_df = ensure_purchase_amounts(pred_df, unit_bet=unit_bet)
 
     record = {
         "id": saved_id,
@@ -2337,6 +2361,7 @@ with p1:
                 unit_bet=unit_bet,
                 race_assessment=race_assessment,
             )
+            pred_df = ensure_purchase_amounts(pred_df, unit_bet=unit_bet)
             st.session_state["pred_df"] = pred_df
             st.session_state["message"] = "買い目生成成功"
             st.rerun()
@@ -2350,6 +2375,8 @@ with p2:
             st.error("先に買い目を出してください。")
         else:
             try:
+                pred_df = ensure_purchase_amounts(pred_df, unit_bet=unit_bet)
+                st.session_state["pred_df"] = pred_df
                 save_current_prediction(
                     race_name=st.session_state.get("race_name", ""),
                     url=st.session_state.get("last_url", ""),
@@ -2539,6 +2566,10 @@ else:
                     result_3=result_3,
                 )
 
+                saved_pred_df = ensure_purchase_amounts(
+                    saved_pred_df,
+                    unit_bet=int(selected_item.get("unit_bet", 100) or 100),
+                )
                 save_result_log(
                     race_name=selected_item.get("race_name", ""),
                     mode=selected_item.get("mode", ""),
@@ -2597,6 +2628,8 @@ if pred_df is not None and isinstance(pred_df, pd.DataFrame) and not pred_df.emp
                 result_3=result_3,
             )
 
+            pred_df = ensure_purchase_amounts(pred_df, unit_bet=unit_bet)
+            st.session_state["pred_df"] = pred_df
             save_result_log(
                 race_name=st.session_state.get("race_name", ""),
                 mode=detected_mode,
