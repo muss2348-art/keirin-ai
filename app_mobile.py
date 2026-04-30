@@ -26,7 +26,7 @@ st.set_page_config(
     layout="centered",
 )
 
-st.caption("✅ mobile ROI修正版 v14 起動中（購入金額ログ強制修復版）")
+st.caption("✅ mobile ROIランク分岐版 v15 起動中（購入金額ログ強制修復＋ROI連動ランク版）")
 
 HEADERS = {
     "User-Agent": (
@@ -144,6 +144,201 @@ def safe_int(v, default=0):
     except Exception:
         return int(default)
 
+# =========================================================
+# ROI連動 ランク再判定
+# =========================================================
+def _series_numeric_safe(df: pd.DataFrame, col: str, default=0.0) -> pd.Series:
+    """列を安全に数値化する。列が無ければ default のSeriesを返す。"""
+    if df is None or df.empty or col not in df.columns:
+        return pd.Series([default] * (0 if df is None else len(df)))
+    return pd.to_numeric(df[col], errors="coerce").fillna(default)
+
+
+def detect_roi_column(df: pd.DataFrame):
+    """
+    ROI学習・期待値系の列を自動検出する。
+    roi_learning.py / predict.py の列名が多少変わっても落ちないよう広めに見る。
+    """
+    if df is None or df.empty:
+        return None
+
+    preferred = [
+        "ROI補正後期待値",
+        "ROI期待値",
+        "期待ROI",
+        "期待回収率",
+        "回収率",
+        "ROI",
+        "roi",
+        "期待値",
+        "EV",
+        "ev",
+        "score",
+        "スコア",
+        "AI評価",
+    ]
+
+    for col in preferred:
+        if col in df.columns:
+            return col
+
+    for col in df.columns:
+        name = str(col).lower()
+        if "roi" in name or "回収" in str(col) or "期待" in str(col):
+            return col
+
+    return None
+
+
+def detect_confidence_column(df: pd.DataFrame):
+    """
+    的中率・確率・信頼度系の列を自動検出する。
+    """
+    if df is None or df.empty:
+        return None
+
+    preferred = [
+        "的中率",
+        "予想的中率",
+        "信頼度",
+        "confidence",
+        "prob",
+        "確率",
+        "勝率",
+        "AI信頼度",
+    ]
+
+    for col in preferred:
+        if col in df.columns:
+            return col
+
+    for col in df.columns:
+        name = str(col).lower()
+        if "confidence" in name or "prob" in name or "的中" in str(col) or "信頼" in str(col) or "確率" in str(col):
+            return col
+
+    return None
+
+
+def normalize_roi_value(value) -> float:
+    """
+    ROI/期待値を 100基準の数値に寄せる。
+    1.25 のような倍率表記は 125 として扱う。
+    """
+    roi = safe_float(value, 0.0)
+
+    if 0 < roi <= 3:
+        roi *= 100.0
+
+    return roi
+
+
+def normalize_confidence_value(value) -> float:
+    """
+    的中率/信頼度を 0〜100 の数値に寄せる。
+    0.35 のような小数表記は 35 として扱う。
+    """
+    conf = safe_float(value, 0.0)
+
+    if 0 < conf <= 1:
+        conf *= 100.0
+
+    return conf
+
+
+def judge_ticket_rank_by_roi(row, roi_col=None, confidence_col=None, fallback_rank="🟡 穴"):
+    """
+    ROI学習結果と的中率から買い目ランクを分岐する。
+    """
+    roi = normalize_roi_value(row.get(roi_col, 0.0)) if roi_col else 0.0
+    confidence = normalize_confidence_value(row.get(confidence_col, 0.0)) if confidence_col else 0.0
+
+    # ROIも信頼度も無い場合は、既存ランクを尊重する
+    if roi <= 0 and confidence <= 0:
+        current_rank = str(row.get("買い目ランク", "")).strip()
+        return current_rank if current_rank else fallback_rank
+
+    # 本命: 的中率重視
+    if confidence >= 42 and roi >= 95:
+        return "🟢 本命"
+
+    # AI推奨: ROIと信頼度の両方が強い
+    if roi >= 135 and confidence >= 30:
+        return "🔥 AI推奨"
+
+    # 期待値高: ROI優位
+    if roi >= 120:
+        return "💰 期待値高"
+
+    # 穴: ROIはあるが信頼度は控えめ
+    if roi >= 105:
+        return "🟡 穴"
+
+    # 信頼度だけ高い場合は本命寄りに残す
+    if confidence >= 38:
+        return "🟢 本命"
+
+    return "⚪ 抑え"
+
+
+def calc_thick_score_by_rank(row, roi_col=None, confidence_col=None) -> float:
+    """
+    ランク・ROI・信頼度から厚張り指数を作る。
+    """
+    rank_label = str(row.get("買い目ランク", "⚪ 抑え"))
+    roi = normalize_roi_value(row.get(roi_col, 0.0)) if roi_col else 0.0
+    confidence = normalize_confidence_value(row.get(confidence_col, 0.0)) if confidence_col else 0.0
+
+    if rank_label == "🔥 AI推奨":
+        base = 3.0
+    elif rank_label == "🟢 本命":
+        base = 2.2
+    elif rank_label == "💰 期待値高":
+        base = 2.0
+    elif rank_label == "🟡 穴":
+        base = 1.4
+    else:
+        base = 1.0
+
+    roi_bonus = min(max((roi - 100.0) / 50.0, 0.0), 1.5)
+    conf_bonus = min(max(confidence / 100.0, 0.0), 1.0)
+
+    return round(base + roi_bonus + conf_bonus, 2)
+
+
+def apply_roi_ticket_ranking(pred_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    予想DataFrameにROI連動の買い目ランクと厚張り指数を付け直す。
+    """
+    if pred_df is None or pred_df.empty:
+        return pred_df
+
+    out = pred_df.copy()
+
+    roi_col = detect_roi_column(out)
+    confidence_col = detect_confidence_column(out)
+
+    out["買い目ランク"] = out.apply(
+        lambda row: judge_ticket_rank_by_roi(
+            row,
+            roi_col=roi_col,
+            confidence_col=confidence_col,
+        ),
+        axis=1,
+    )
+
+    out["厚張り指数"] = out.apply(
+        lambda row: calc_thick_score_by_rank(
+            row,
+            roi_col=roi_col,
+            confidence_col=confidence_col,
+        ),
+        axis=1,
+    )
+
+    return out
+
+
 
 def widget_key(name: str, idx: int) -> str:
     ver = st.session_state.get("widget_ver", 0)
@@ -210,58 +405,61 @@ def apply_rank_based_amounts(pred_df: pd.DataFrame, unit_bet: int) -> pd.DataFra
     if pred_df is None or pred_df.empty:
         return pred_df
 
-    out = pred_df.copy()
+    # ここで必ずROI連動ランクを再判定する
+    out = apply_roi_ticket_ranking(pred_df)
     total_budget = int(unit_bet) * len(out)
 
     if "買い目ランク" not in out.columns:
-        out["買い目ランク"] = "🟡 穴"
+        out["買い目ランク"] = "⚪ 抑え"
 
-    base_amounts = []
-    thick_scores = []
+    if "厚張り指数" not in out.columns:
+        out["厚張り指数"] = 1.0
 
+    rank_weight = {
+        "🔥 AI推奨": 3.0,
+        "🟢 本命": 2.2,
+        "💰 期待値高": 2.0,
+        "🟡 穴": 1.4,
+        "⚪ 抑え": 1.0,
+    }
+
+    weights = []
     for _, row in out.iterrows():
-        rank_label = str(row.get("買い目ランク", "🟡 穴"))
-        amount = rank_base_amount(rank_label, unit_bet)
-        base_amounts.append(amount)
+        rank_label = str(row.get("買い目ランク", "⚪ 抑え"))
+        thick_score = safe_float(row.get("厚張り指数", 1.0), 1.0)
+        weight = rank_weight.get(rank_label, 1.0) * max(thick_score, 0.1)
+        weights.append(weight)
 
-        if rank_label == "🔥 AI推奨":
-            thick_scores.append(3.0)
-        elif rank_label == "🟢 本命":
-            thick_scores.append(2.0)
-        elif rank_label == "💰 期待値高":
-            thick_scores.append(1.2)
-        else:
-            thick_scores.append(1.0)
+    total_weight = sum(weights)
+    unit = max(100, int(unit_bet))
 
-    base_sum = sum(base_amounts)
+    if total_weight <= 0:
+        out["購入金額"] = unit
+        return out
 
-    if base_sum <= total_budget:
-        final_amounts = base_amounts[:]
-    else:
-        ratio = total_budget / base_sum if base_sum > 0 else 1.0
-        scaled = [max(unit_bet, int(round((x * ratio) / 100.0) * 100)) for x in base_amounts]
-        diff = total_budget - sum(scaled)
+    amounts = []
+    for weight in weights:
+        raw_amount = total_budget * (weight / total_weight)
+        rounded_amount = int(raw_amount // 100) * 100
+        rounded_amount = max(rounded_amount, unit)
+        amounts.append(rounded_amount)
 
-        if diff < 0:
-            order = sorted(range(len(scaled)), key=lambda i: scaled[i], reverse=True)
-            for i in order:
-                while diff < 0 and scaled[i] - 100 >= unit_bet:
-                    scaled[i] -= 100
-                    diff += 100
-                if diff == 0:
-                    break
-        elif diff > 0:
-            order = sorted(range(len(scaled)), key=lambda i: thick_scores[i], reverse=True)
-            idx = 0
-            while diff > 0 and order:
-                scaled[order[idx % len(order)]] += 100
-                diff -= 100
-                idx += 1
+    # 予算超過時は金額が大きいところから100円ずつ削る
+    while sum(amounts) > total_budget and max(amounts) > unit:
+        max_index = amounts.index(max(amounts))
+        amounts[max_index] -= 100
 
-        final_amounts = scaled
+    # 予算に余りがある場合は厚張り指数が高い順に100円ずつ足す
+    diff = total_budget - sum(amounts)
+    if diff >= 100 and len(amounts) > 0:
+        order = sorted(range(len(amounts)), key=lambda i: weights[i], reverse=True)
+        idx = 0
+        while diff >= 100 and order:
+            amounts[order[idx % len(order)]] += 100
+            diff -= 100
+            idx += 1
 
-    out["厚張り指数"] = [round(x, 2) for x in thick_scores]
-    out["購入金額"] = final_amounts
+    out["購入金額"] = [int(x) for x in amounts]
 
     ev_num = pd.to_numeric(out.get("期待値", 0), errors="coerce").fillna(0)
     out["期待回収額(目安)"] = (ev_num / 100.0 * out["購入金額"]).round(0)
@@ -2378,6 +2576,7 @@ with p1:
                 weather=weather,
                 ticket_type=ticket_type,
             )
+            pred_df = apply_roi_ticket_ranking(pred_df)
             race_assessment = assess_race_buyability(
                 current_df,
                 pred_df=ensure_prediction_amounts(pred_df, unit_bet=unit_bet),
@@ -2396,6 +2595,8 @@ with p1:
                 unit_bet=unit_bet,
                 race_assessment=race_assessment,
             )
+            pred_df = apply_roi_ticket_ranking(pred_df)
+            pred_df = apply_rank_based_amounts(pred_df, unit_bet)
             pred_df = ensure_prediction_amounts(pred_df, unit_bet=unit_bet)
             st.session_state["pred_df"] = pred_df
             st.session_state["message"] = "買い目生成成功"
