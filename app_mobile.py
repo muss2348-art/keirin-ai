@@ -21,10 +21,12 @@ from staking import apply_staking_ai, staking_summary_text
 
 
 st.set_page_config(
-    page_title="競輪AIアプリ",
+    page_title="競輪AI モバイル版",
     page_icon="🚴",
-    layout="wide",
+    layout="centered",
 )
+
+st.caption("✅ mobile ROIランク分岐版 v15 起動中（購入金額ログ強制修復＋ROI連動ランク版）")
 
 HEADERS = {
     "User-Agent": (
@@ -503,12 +505,78 @@ def load_log_df() -> pd.DataFrame:
             df[col] = 0
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
-    for col in ["レース名", "券種", "モード", "天候", "判定", "結果", "買い目", "レース種別"]:
+    for col in ["保存日時", "レース名", "券種", "モード", "天候", "判定", "結果", "買い目", "レース種別"]:
         if col not in df.columns:
             df[col] = ""
         df[col] = df[col].fillna("").astype(str)
 
     return df
+
+
+def repair_log_purchase_amounts() -> None:
+    """
+    Streamlit Cloud/mobile用のログ修復。
+    既存ログに購入金額が0/空で残っているとROI学習が「投資0円」と判断するため、
+    買い目がある行は最低100円に補正してlog.csvへ書き戻す。
+    """
+    if not LOG_PATH.exists():
+        return
+
+    try:
+        df = pd.read_csv(LOG_PATH, encoding="utf-8-sig")
+    except Exception:
+        try:
+            df = pd.read_csv(LOG_PATH, encoding="utf-8")
+        except Exception:
+            return
+
+    if df is None or df.empty:
+        return
+
+    # 必須列が無い古い/壊れたログは無理に触らない
+    if "買い目" not in df.columns:
+        return
+
+    if "購入金額" not in df.columns:
+        df["購入金額"] = 0
+
+    amount = pd.to_numeric(df["購入金額"], errors="coerce").fillna(0)
+    ticket_exists = df["買い目"].fillna("").astype(str).str.strip() != ""
+    target = ticket_exists & (amount <= 0)
+
+    if target.any():
+        amount = amount.copy()
+        amount.loc[target] = 100
+        df["購入金額"] = amount.astype(int)
+
+        if "期待回収額(目安)" not in df.columns:
+            df["期待回収額(目安)"] = 0
+        df["期待回収額(目安)"] = pd.to_numeric(df["期待回収額(目安)"], errors="coerce").fillna(0)
+
+        df.to_csv(LOG_PATH, index=False, encoding="utf-8-sig")
+
+
+def ensure_prediction_amounts(pred_df: pd.DataFrame, unit_bet: int = 100) -> pd.DataFrame:
+    """買い目データに購入金額を必ず付ける。ROI学習の投資0円防止用。"""
+    if pred_df is None or pred_df.empty:
+        return pred_df
+
+    out = pred_df.copy()
+    if "購入金額" not in out.columns:
+        out = apply_rank_based_amounts(out, unit_bet=unit_bet)
+
+    if "購入金額" not in out.columns:
+        out["購入金額"] = unit_bet
+
+    out["購入金額"] = pd.to_numeric(out["購入金額"], errors="coerce").fillna(0)
+    out.loc[out["購入金額"] <= 0, "購入金額"] = max(100, int(unit_bet))
+    out["購入金額"] = out["購入金額"].astype(int)
+
+    if "期待回収額(目安)" not in out.columns:
+        out["期待回収額(目安)"] = 0
+    out["期待回収額(目安)"] = pd.to_numeric(out["期待回収額(目安)"], errors="coerce").fillna(0)
+
+    return out
 
 
 def summarize_log_df(log_df: pd.DataFrame):
@@ -2108,7 +2176,18 @@ def save_result_log(
         else:
             result_text = "-".join([x for x in [result_1, result_2, result_3] if x])
 
+        # ROI学習用の安全補正。
+        # モバイル版では保存時に購入金額が空/0になりやすいため、
+        # ログへ書く直前に最低100円を必ず入れる。
+        if pred_df is None or pred_df.empty:
+            return
+
+        pred_df = ensure_prediction_amounts(pred_df, unit_bet=100)
+
         for _, row in pred_df.iterrows():
+            purchase_amount = max(100, int(safe_float(row.get("購入金額", 100), 100)))
+            expected_return = safe_float(row.get("期待回収額(目安)", 0), 0)
+
             writer.writerow(
                 [
                     now_str(),
@@ -2125,14 +2204,18 @@ def save_result_log(
                     row.get("AI評価", ""),
                     row.get("期待値", ""),
                     row.get("オッズ", ""),
-                    row.get("購入金額", ""),
-                    row.get("期待回収額(目安)", ""),
+                    purchase_amount,
+                    expected_return,
                     row.get("レース判定", ""),
                     row.get("的中率評価", ""),
                     row.get("レース評価点", ""),
                     row.get("判定理由", ""),
+                    row.get("見送りAIコメント", ""),
                 ]
             )
+
+    # 保存後にも既存0円ログを修復
+    repair_log_purchase_amounts()
 
 
 def save_current_prediction(
@@ -2178,8 +2261,8 @@ def save_current_prediction(
 # =========================================================
 # UI
 # =========================================================
-st.title("🚴 競輪AIアプリ")
-st.caption("完全統合版 / ライン信頼度・崩れ対応 / 学習補正 / 見送りAI / 賭け金AI")
+st.title("🚴 競輪AI モバイル版")
+st.caption("モバイル版 / 通常版の安全取得ロジック反映 / 学習補正・ROI・見送りAI・賭け金AI")
 
 if "race_rows" not in st.session_state:
     init_state(7)
@@ -2419,6 +2502,7 @@ st.dataframe(current_df, use_container_width=True, hide_index=True)
 st.markdown("---")
 st.subheader("AI予想")
 st.caption(learning_summary_text(LOG_PATH))
+repair_log_purchase_amounts()
 st.caption(roi_learning_summary_text(LOG_PATH))
 st.caption("見送りAIは買い/軽く買い/注意/見送りを判定します。")
 st.caption("賭け金AIはAI評価・期待値・見送りAI判定から購入金額を自動配分します。")
@@ -2452,6 +2536,7 @@ with p1:
                 weather=weather,
                 ticket_type=ticket_type,
             )
+            repair_log_purchase_amounts()
             pred_df = apply_roi_learning(
                 pred_df,
                 LOG_PATH,
@@ -2462,7 +2547,7 @@ with p1:
             pred_df = apply_roi_ticket_ranking(pred_df)
             race_assessment = assess_race_buyability(
                 current_df,
-                pred_df=pred_df,
+                pred_df=ensure_prediction_amounts(pred_df, unit_bet=unit_bet),
                 log_path=LOG_PATH,
                 mode=detected_mode,
                 weather=weather,
@@ -2472,6 +2557,7 @@ with p1:
             pred_df = apply_race_buyability_to_predictions(pred_df, race_assessment)
             st.session_state["race_assessment"] = race_assessment
             pred_df = apply_rank_based_amounts(pred_df, unit_bet)
+            pred_df = ensure_prediction_amounts(pred_df, unit_bet=unit_bet)
             pred_df = apply_staking_ai(
                 pred_df,
                 unit_bet=unit_bet,
@@ -2479,6 +2565,7 @@ with p1:
             )
             pred_df = apply_roi_ticket_ranking(pred_df)
             pred_df = apply_rank_based_amounts(pred_df, unit_bet)
+            pred_df = ensure_prediction_amounts(pred_df, unit_bet=unit_bet)
             st.session_state["pred_df"] = pred_df
             st.session_state["message"] = "買い目生成成功"
             st.rerun()
@@ -2562,6 +2649,7 @@ else:
 st.markdown("---")
 st.subheader("回収率集計")
 
+repair_log_purchase_amounts()
 log_df = load_log_df()
 summary = summarize_log_df(log_df)
 
@@ -2675,7 +2763,7 @@ else:
 
                 hit_info = judge_hit(
                     ticket_type=selected_ticket_type,
-                    pred_df=saved_pred_df,
+                    pred_df=ensure_prediction_amounts(saved_pred_df, unit_bet=100),
                     result_1=result_1,
                     result_2=result_2,
                     result_3=result_3,
