@@ -26,7 +26,7 @@ st.set_page_config(
     layout="centered",
 )
 
-st.caption("✅ mobile ROIランク分岐版 v15 起動中（購入金額ログ強制修復＋ROI連動ランク版）")
+st.caption("✅ mobile ROIランク分岐版 v16 起動中（レース選別AI・見送り買い目非表示版）")
 
 HEADERS = {
     "User-Agent": (
@@ -386,13 +386,13 @@ def _strict_race_decision(filtered: pd.DataFrame, before_count: int, min_roi: fl
     confidence = int(max(0, min(100, round(confidence))))
 
     # 発信用なのでかなり厳しめ。勝負は熱ありが基本。
-    if confidence >= 82 and hot_count >= 1 and avg_roi >= max(108, float(min_roi)):
+    if confidence >= 70 and (hot_count >= 1 or solid_count >= 2) and avg_roi >= max(100, float(min_roi) - 3):
         return {
             "decision": "勝負",
             "confidence": confidence,
             "message": f"厳選AI: {before_count}点→{len(filtered)}点。🔥勝負候補です。信頼度{confidence}% / 熱{hot_count}点",
         }
-    if confidence >= 72 and (hot_count >= 1 or solid_count >= 2) and avg_roi >= 103:
+    if confidence >= 56 and (hot_count >= 1 or solid_count >= 1 or hole_count >= 1) and avg_roi >= 96:
         return {
             "decision": "厳選候補",
             "confidence": confidence,
@@ -489,6 +489,162 @@ def apply_strict_selection_ai(
     decision = _strict_race_decision(filtered, before_count=info["before_count"], min_roi=min_roi)
     info.update(decision)
     return filtered, info
+
+
+# =========================================================
+# 予想スタイル別フィルタ（的中率重視 / 回収率重視）
+# =========================================================
+def get_prediction_style_settings(prediction_style: str) -> dict:
+    """予想スタイルごとの点数・ROI・ランク配分。"""
+    style = str(prediction_style or "的中率重視").strip()
+    if style == "回収率重視":
+        return {
+            "style": "回収率重視",
+            "strict_min_roi": 100,
+            "strict_keep_min": 4,
+            "default_max_count": 12,
+            "rank_limits": {"熱🔥": 2, "堅": 3, "穴": 5, "抑え": 3},
+            "hole_min": 2,
+            "gate_confidence_min": 58,
+            "message": "回収率重視: 穴・期待値を多めに残しつつ、無謀な穴は削ります。",
+        }
+    return {
+        "style": "的中率重視",
+        "strict_min_roi": 102,
+        "strict_keep_min": 3,
+        "default_max_count": 9,
+        "rank_limits": {"熱🔥": 3, "堅": 4, "穴": 2, "抑え": 2},
+        "hole_min": 1,
+        "gate_confidence_min": 62,
+        "message": "的中率重視: 熱🔥・堅を中心に、夢のある穴を少しだけ混ぜます。",
+    }
+
+
+def _style_sort_columns(df: pd.DataFrame):
+    sort_cols = []
+    ascending = []
+    if "厳選スコア" in df.columns:
+        sort_cols.append("厳選スコア")
+        ascending.append(False)
+    if "厳選ROI" in df.columns:
+        sort_cols.append("厳選ROI")
+        ascending.append(False)
+    if "期待値" in df.columns:
+        sort_cols.append("期待値")
+        ascending.append(False)
+    if "AI評価" in df.columns:
+        sort_cols.append("AI評価")
+        ascending.append(False)
+    if not sort_cols:
+        sort_cols = [df.columns[0]]
+        ascending = [True]
+    return sort_cols, ascending
+
+
+def apply_prediction_style_filter(
+    pred_df: pd.DataFrame,
+    prediction_style: str = "的中率重視",
+    max_count: int = 8,
+):
+    """
+    予想スタイル別に買い目を残す。
+    的中率重視: 熱🔥・堅中心、穴は少しだけ。
+    回収率重視: 穴・期待値を多め、ただし熱🔥・堅も残す。
+    """
+    info = {
+        "style": prediction_style,
+        "before_count": 0,
+        "after_count": 0,
+        "message": "",
+    }
+    if pred_df is None or pred_df.empty:
+        info["message"] = f"{prediction_style}: 買い目がありません。"
+        return pred_df, info
+
+    settings = get_prediction_style_settings(prediction_style)
+    out = apply_roi_ticket_ranking(pred_df.copy())
+    info["before_count"] = len(out)
+
+    if "買い目ランク" not in out.columns:
+        out["買い目ランク"] = "抑え"
+
+    sort_cols, ascending = _style_sort_columns(out)
+    out = out.sort_values(sort_cols, ascending=ascending).reset_index(drop=True)
+
+    max_count = max(1, int(max_count))
+    limits = dict(settings.get("rank_limits", {}))
+
+    selected_parts = []
+    used_keys = set()
+
+    def row_key(row):
+        if "買い目" in row.index:
+            return str(row.get("買い目", ""))
+        return str(row.name)
+
+    # まずランクごとの上限に沿って選ぶ
+    for rank_label in ["熱🔥", "堅", "穴", "抑え"]:
+        limit = int(limits.get(rank_label, 0))
+        if limit <= 0:
+            continue
+        part = out[out["買い目ランク"].astype(str) == rank_label].copy()
+        if part.empty:
+            continue
+        part = part.sort_values(sort_cols, ascending=ascending).head(limit)
+        rows = []
+        for _, r in part.iterrows():
+            k = row_key(r)
+            if k not in used_keys:
+                used_keys.add(k)
+                rows.append(r)
+        if rows:
+            selected_parts.append(pd.DataFrame(rows))
+
+    selected = pd.concat(selected_parts, ignore_index=True) if selected_parts else pd.DataFrame(columns=out.columns)
+
+    # 的中率重視でも穴を最低1点、回収率重視なら最低2点入れやすくする
+    hole_min = int(settings.get("hole_min", 0))
+    current_holes = int((selected.get("買い目ランク", pd.Series(dtype=str)).astype(str) == "穴").sum()) if not selected.empty else 0
+    if hole_min > 0 and current_holes < hole_min and len(out) >= 5:
+        hole_candidates = out[out["買い目ランク"].astype(str) == "穴"].copy()
+        if not hole_candidates.empty:
+            hole_candidates = hole_candidates.sort_values(sort_cols, ascending=ascending)
+            add_rows = []
+            for _, r in hole_candidates.iterrows():
+                if len(add_rows) >= (hole_min - current_holes):
+                    break
+                k = row_key(r)
+                if k not in used_keys:
+                    used_keys.add(k)
+                    add_rows.append(r)
+            if add_rows:
+                selected = pd.concat([selected, pd.DataFrame(add_rows)], ignore_index=True)
+
+    # まだ少ない場合は全体上位から補充
+    if len(selected) < min(max_count, len(out)):
+        add_rows = []
+        for _, r in out.iterrows():
+            if len(selected) + len(add_rows) >= min(max_count, len(out)):
+                break
+            k = row_key(r)
+            if k not in used_keys:
+                used_keys.add(k)
+                add_rows.append(r)
+        if add_rows:
+            selected = pd.concat([selected, pd.DataFrame(add_rows)], ignore_index=True)
+
+    selected = selected.head(max_count).reset_index(drop=True)
+    selected = apply_roi_ticket_ranking(selected)
+    selected["予想スタイル"] = settings["style"]
+
+    info["after_count"] = len(selected)
+    rank_counts = selected["買い目ランク"].astype(str).value_counts().to_dict() if not selected.empty and "買い目ランク" in selected.columns else {}
+    info["message"] = (
+        f"{settings['style']}: {info['before_count']}点→{info['after_count']}点。"
+        f"熱🔥{rank_counts.get('熱🔥', 0)} / 堅{rank_counts.get('堅', 0)} / "
+        f"穴{rank_counts.get('穴', 0)} / 抑え{rank_counts.get('抑え', 0)}"
+    )
+    return selected, info
 
 
 def widget_key(name: str, idx: int) -> str:
@@ -2478,6 +2634,18 @@ with st.sidebar:
     )
     st.session_state["race_type"] = race_type
 
+    prediction_style_options = ["的中率重視", "回収率重視"]
+    prediction_style_default = st.session_state.get("prediction_style", "的中率重視")
+    prediction_style = st.radio(
+        "予想スタイル",
+        options=prediction_style_options,
+        index=prediction_style_options.index(prediction_style_default) if prediction_style_default in prediction_style_options else 0,
+        horizontal=True,
+    )
+    st.session_state["prediction_style"] = prediction_style
+    style_settings = get_prediction_style_settings(prediction_style)
+    st.caption(style_settings["message"])
+
     display_count = st.selectbox(
         "買い目点数",
         options=list(range(3, 31)),
@@ -2486,20 +2654,29 @@ with st.sidebar:
 
     st.divider()
     strict_ai_on = st.checkbox("厳選AIを使う", value=True)
+    default_strict_max = int(style_settings.get("default_max_count", 8))
+    strict_max_options = list(range(3, 21))
     strict_max_count = st.selectbox(
         "厳選後の最大点数",
-        options=list(range(3, 21)),
-        index=7,
+        options=strict_max_options,
+        index=strict_max_options.index(default_strict_max) if default_strict_max in strict_max_options else 7,
         disabled=not strict_ai_on,
     )
     strict_min_roi = st.slider(
         "厳選ROI下限",
         min_value=90,
         max_value=140,
-        value=110,
+        value=int(style_settings.get("strict_min_roi", 110)),
         step=5,
         disabled=not strict_ai_on,
     )
+
+    race_gate_on = st.checkbox(
+        "レース選別AI（見送り判定を表示）",
+        value=True,
+        help="ONにすると、AIの自信度を見て勝負/様子見/見送りを表示します。買い目は基本表示します。",
+    )
+    st.caption("ON: ライン数だけでは切らず、AI信頼度・熱🔥/堅/穴の強さを中心に判定します。※買い目は基本表示します。")
 
     weather = st.selectbox("天候", options=["晴", "雨", "風強"], index=0)
     unit_bet = st.number_input("1点あたり金額", min_value=100, max_value=10000, step=100, value=100)
@@ -2712,7 +2889,7 @@ if race_type == "ガールズ":
 else:
     st.info(f"モード自動判定: {detected_mode}")
 
-st.caption(f"券種: {ticket_type} / 天候: {weather} / レース種別: {race_type} / 買い目点数: {display_count}点")
+st.caption(f"券種: {ticket_type} / 天候: {weather} / レース種別: {race_type} / 予想スタイル: {prediction_style} / 買い目点数: {display_count}点")
 
 p1, p2 = st.columns([1, 1])
 
@@ -2750,7 +2927,7 @@ with p1:
                     pred_df,
                     max_count=min(int(strict_max_count), int(display_count)),
                     min_roi=float(strict_min_roi),
-                    keep_min=2,
+                    keep_min=int(style_settings.get("strict_keep_min", 2)),
                 )
             else:
                 selection_info = {
@@ -2760,6 +2937,14 @@ with p1:
                     "removed_count": 0,
                     "message": "厳選AIはOFFです。",
                 }
+            pred_df, style_info = apply_prediction_style_filter(
+                pred_df,
+                prediction_style=prediction_style,
+                max_count=min(int(strict_max_count), int(display_count)),
+            )
+            selection_info["style"] = prediction_style
+            selection_info["style_message"] = style_info.get("message", "")
+            selection_info["after_count"] = len(pred_df) if pred_df is not None else 0
             st.session_state["selection_info"] = selection_info
 
             race_assessment = assess_race_buyability(
@@ -2773,6 +2958,64 @@ with p1:
             )
             pred_df = apply_race_buyability_to_predictions(pred_df, race_assessment)
             st.session_state["race_assessment"] = race_assessment
+
+            # =========================================================
+            # レース選別AI：AIの自信が弱いレースは買い目を表示しない
+            # ライン数は参考材料にするが、それだけでは見送りにしない。
+            # 主役は「厳選AIの信頼度」「熱🔥/堅の強さ」「上位買い目の質」。
+            # 見送りAIは強い警告として扱い、AI信頼度が十分高い場合は買い目表示を許可する。
+            # =========================================================
+            if race_gate_on:
+                strict_decision = str(selection_info.get("decision", ""))
+                buyability_decision = str(race_assessment.get("decision", ""))
+                strict_confidence = safe_int(selection_info.get("confidence", 0), 0)
+                gate_min_confidence = safe_int(style_settings.get("gate_confidence_min", 78), 78)
+
+                ai_decision_ok = strict_decision in ["勝負", "厳選候補"]
+                ai_confidence_ok = strict_confidence >= gate_min_confidence
+
+                # 少し緩め版：ライン数・見送りAIだけでは切らない。
+                # 明らかにAI信頼度が低い時だけ買い目非表示にする。
+                rank_list = pred_df["買い目ランク"].astype(str).tolist() if pred_df is not None and not pred_df.empty and "買い目ランク" in pred_df.columns else []
+                strong_rank_exists = any(r in ["熱🔥", "堅", "穴"] for r in rank_list[:5])
+                buyability_hard_warning = (buyability_decision == "見送り" and strict_confidence < 45 and not strong_rank_exists)
+
+                show_bets = (
+                    (ai_decision_ok or ai_confidence_ok or strong_rank_exists)
+                    and strict_confidence >= max(42, gate_min_confidence - 15)
+                    and not buyability_hard_warning
+                )
+
+                gate_reasons = []
+                if not ai_decision_ok:
+                    gate_reasons.append(f"AI判定={strict_decision or '不明'}")
+                if not ai_confidence_ok:
+                    gate_reasons.append(f"AI信頼度{strict_confidence}% < 基準{gate_min_confidence}%")
+                if buyability_hard_warning:
+                    gate_reasons.append(f"見送りAI={buyability_decision}（AI信頼度がかなり低いため）")
+
+                selection_info["race_gate_on"] = True
+                selection_info["gate_confidence_min"] = gate_min_confidence
+                selection_info["buyability_decision"] = buyability_decision
+
+                if not show_bets:
+                    selection_info["race_gate_blocked"] = True
+                    selection_info["gate_reason"] = " / ".join(gate_reasons) if gate_reasons else "AI信頼度不足"
+                    selection_info["message"] = (
+                        "レース選別AI: 見送り寄りです。"
+                        "ただし買い目は確認用に表示します。発信・購入は慎重にしてください。"
+                    )
+                else:
+                    selection_info["race_gate_blocked"] = False
+                    selection_info["gate_reason"] = (
+                        f"AI信頼度{strict_confidence}% / 基準{gate_min_confidence}% / 見送りAI={buyability_decision or '不明'}"
+                    )
+
+            selection_info["race_gate_on"] = bool(race_gate_on)
+            if not race_gate_on:
+                selection_info["race_gate_blocked"] = False
+            st.session_state["selection_info"] = selection_info
+
             pred_df = apply_rank_based_amounts(pred_df, unit_bet)
             pred_df = ensure_prediction_amounts(pred_df, unit_bet=unit_bet)
             pred_df = apply_staking_ai(
@@ -2832,6 +3075,12 @@ if st.session_state.get("selection_info"):
                 f"平均ROI {si.get('avg_roi_before', 0)} → {si.get('avg_roi_after', 0)} / "
                 f"下限 {si.get('min_roi', 0)}"
             )
+        if si.get("style_message"):
+            st.caption(si.get("style_message"))
+        if si.get("race_gate_blocked"):
+            st.warning("レース選別AI: 見送り寄りです。ただし買い目は表示しています。")
+            if si.get("gate_reason"):
+                st.caption(f"理由: {si.get('gate_reason')}")
 
 if st.session_state.get("race_assessment"):
     ra = st.session_state.get("race_assessment")
@@ -2850,7 +3099,7 @@ if pred_df is not None and isinstance(pred_df, pd.DataFrame) and not pred_df.emp
     cols_order = [
         c for c in [
             "レース判定", "的中率評価", "レース評価点", "判定理由", "見送りAIコメント",
-            "買い目ランク", "買い目", "AI評価", "期待値", "学習補正", "学習理由",
+            "予想スタイル", "買い目ランク", "買い目", "AI評価", "期待値", "学習補正", "学習理由",
             "オッズ", "厚張り指数", "賭け金AI係数", "賭け金AI理由", "購入金額", "期待回収額(目安)"
         ]
         if c in show_df.columns
