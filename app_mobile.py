@@ -145,7 +145,7 @@ def safe_int(v, default=0):
         return int(default)
 
 # =========================================================
-# ROI連動 ランク再判定
+# 発信用 厳選AI / 新ランク判定
 # =========================================================
 def detect_roi_column(df: pd.DataFrame):
     """
@@ -208,41 +208,54 @@ def normalize_confidence_value(value) -> float:
     return conf
 
 
-def _rank_position_label(position: int, total: int, roi: float, confidence: float) -> str:
-    """絶対値だけでなく順位でランクを散らす。"""
-    if total <= 1:
-        if roi >= 130 and confidence >= 30:
-            return "🔥 AI推奨"
-        if roi >= 115:
-            return "💰 期待値高"
-        if confidence >= 35:
-            return "🟢 本命"
-        return "🟡 穴"
+def _get_odds_value(row) -> float:
+    for col in ["オッズ", "odds"]:
+        if col in row.index:
+            return safe_float(row.get(col), 0.0)
+    return 0.0
 
-    rate = position / max(total - 1, 1)
-    if rate <= 0.12:
-        if roi >= 125 or confidence >= 38:
-            return "🔥 AI推奨"
-        return "💰 期待値高"
-    if rate <= 0.35:
-        if confidence >= 38 and roi < 125:
-            return "🟢 本命"
-        return "💰 期待値高"
-    if rate <= 0.70:
-        if confidence >= 40:
-            return "🟢 本命"
-        if roi >= 108:
-            return "🟡 穴"
-        return "⚪ 抑え"
-    if roi >= 115 and confidence >= 25:
-        return "🟡 穴"
-    return "⚪ 抑え"
+
+def _publish_rank_label(position: int, total: int, roi: float, confidence: float, odds: float) -> str:
+    """
+    発信用ランク。
+    熱🔥: 的中率もROIも強い本命寄り
+    堅: 的中率優先で堅い
+    穴: オッズがありつつROI・的中率も最低ライン以上
+    抑え: 中間〜保険
+    """
+    rate = position / max(total - 1, 1) if total > 1 else 0.0
+
+    if confidence >= 38 and roi >= 103 and (odds <= 0 or odds <= 18):
+        return "熱🔥"
+    if confidence >= 33 and (odds <= 0 or odds <= 12):
+        return "堅"
+    if confidence >= 24 and roi >= 115 and odds >= 8:
+        return "穴"
+
+    # 確率列が無い/弱い場合でも、順位で最低限散らす
+    if confidence <= 0:
+        if rate <= 0.12 and roi >= 112:
+            return "熱🔥"
+        if rate <= 0.35 and roi >= 105:
+            return "堅"
+        if roi >= 118 and odds >= 8:
+            return "穴"
+        return "抑え"
+
+    if rate <= 0.15 and roi >= 108:
+        return "熱🔥"
+    if rate <= 0.40 and confidence >= 28:
+        return "堅"
+    if roi >= 110 and odds >= 7:
+        return "穴"
+    return "抑え"
 
 
 def apply_roi_ticket_ranking(pred_df: pd.DataFrame) -> pd.DataFrame:
     """
-    ROI学習結果を使って買い目ランクを再判定する。
-    「期待値」だけの絶対判定で全部「期待値高」になる問題を防ぐため、順位でも分岐する。
+    ROI学習結果・的中率・オッズを使って、発信用ランクへ再判定する。
+    旧表示: AI推奨/期待値高/本命/穴/抑え
+    新表示: 熱🔥/堅/穴/抑え
     """
     if pred_df is None or pred_df.empty:
         return pred_df
@@ -251,23 +264,27 @@ def apply_roi_ticket_ranking(pred_df: pd.DataFrame) -> pd.DataFrame:
     roi_col = detect_roi_column(out)
     confidence_col = detect_confidence_column(out)
 
-    roi_values, conf_values, scores = [], [], []
+    roi_values, conf_values, odds_values, scores = [], [], [], []
     for _, row in out.iterrows():
         roi = normalize_roi_value(row.get(roi_col, 0.0)) if roi_col else 0.0
         conf = normalize_confidence_value(row.get(confidence_col, 0.0)) if confidence_col else 0.0
-        odds = normalize_roi_value(row.get("オッズ", 0.0)) if "オッズ" in out.columns else 0.0
+        odds = _get_odds_value(row)
         current_ev = normalize_roi_value(row.get("期待値", 0.0)) if "期待値" in out.columns else roi
 
         roi_values.append(roi)
         conf_values.append(conf)
+        odds_values.append(odds)
 
         score = roi
         if conf > 0:
-            score += conf * 0.8
+            score += conf * 1.2
         if current_ev > 0 and current_ev != roi:
-            score += current_ev * 0.3
+            score += current_ev * 0.25
         if odds > 0:
-            score += min(odds, 50) * 0.15
+            # 高すぎる穴は発信用では少し減点、ほどよいオッズを加点
+            score += min(odds, 30) * 0.12
+            if odds >= 45:
+                score -= 8
         scores.append(score)
 
     total = len(out)
@@ -276,72 +293,131 @@ def apply_roi_ticket_ranking(pred_df: pd.DataFrame) -> pd.DataFrame:
 
     ranks = []
     for i in range(total):
-        roi = roi_values[i]
-        conf = conf_values[i]
         pos = position_map[i]
-        if roi <= 0 and conf <= 0 and scores[i] <= 0:
-            current_rank = str(out.iloc[i].get("買い目ランク", "")).strip()
-            ranks.append(current_rank if current_rank else "⚪ 抑え")
-        else:
-            ranks.append(_rank_position_label(pos, total, roi, conf))
+        ranks.append(_publish_rank_label(pos, total, roi_values[i], conf_values[i], odds_values[i]))
 
     if total >= 4 and len(set(ranks)) == 1:
-        forced_by_pos = []
-        for pos in range(total):
-            if pos == 0:
-                forced_by_pos.append("🔥 AI推奨")
-            elif pos <= max(1, int(total * 0.30)):
-                forced_by_pos.append("💰 期待値高")
-            elif pos <= max(2, int(total * 0.65)):
-                forced_by_pos.append("🟡 穴")
-            else:
-                forced_by_pos.append("⚪ 抑え")
+        # 全部同じ表示になるのを防ぐ
         for idx, pos in position_map.items():
-            ranks[idx] = forced_by_pos[pos]
+            if pos == 0:
+                ranks[idx] = "熱🔥"
+            elif pos <= max(1, int(total * 0.35)):
+                ranks[idx] = "堅"
+            elif pos <= max(2, int(total * 0.65)):
+                ranks[idx] = "穴" if odds_values[idx] >= 7 and roi_values[idx] >= 105 else "抑え"
+            else:
+                ranks[idx] = "抑え"
 
     out["買い目ランク"] = ranks
-    thick_map = {"🔥 AI推奨": 3.0, "🟢 本命": 2.2, "💰 期待値高": 2.0, "🟡 穴": 1.4, "⚪ 抑え": 1.0}
+    thick_map = {"熱🔥": 3.0, "堅": 2.1, "穴": 1.7, "抑え": 1.0}
     out["厚張り指数"] = [
-        round(thick_map.get(rank, 1.0) + min(max((roi_values[i] - 100.0) / 80.0, 0.0), 1.0), 2)
-        for i, rank in enumerate(ranks)
+        round(thick_map.get(ranks[i], 1.0) + min(max((roi_values[i] - 100.0) / 90.0, 0.0), 0.8), 2)
+        for i in range(total)
     ]
-    return out
 
+    rank_order = {"熱🔥": 0, "堅": 1, "穴": 2, "抑え": 3}
+    out["_rank_order"] = out["買い目ランク"].map(rank_order).fillna(9)
+    out["_publish_score"] = scores
+    out = out.sort_values(["_rank_order", "_publish_score"], ascending=[True, False]).drop(columns=["_rank_order", "_publish_score"])
+    return out.reset_index(drop=True)
 
 
 # =========================================================
-# 厳選AI（買い目フィルタ）
+# 厳選AI（買い目フィルタ＋レース判定を厳しめにする）
 # =========================================================
 def calc_selection_score(row, roi_col=None, confidence_col=None) -> float:
     """買い目を残す/切るための総合スコア。ROI・的中率・オッズ・元期待値を合わせる。"""
     roi = normalize_roi_value(row.get(roi_col, 0.0)) if roi_col else 0.0
     conf = normalize_confidence_value(row.get(confidence_col, 0.0)) if confidence_col else 0.0
     ev = normalize_roi_value(row.get("期待値", 0.0)) if "期待値" in row.index else roi
-    odds = safe_float(row.get("オッズ", 0.0), 0.0) if "オッズ" in row.index else 0.0
+    odds = _get_odds_value(row)
 
     score = 0.0
     score += roi * 1.0
-    score += conf * 0.75
+    score += conf * 1.15
     if ev > 0 and ev != roi:
-        score += ev * 0.25
+        score += ev * 0.20
     if odds > 0:
-        score += min(odds, 80.0) * 0.20
+        score += min(odds, 30.0) * 0.15
+        if odds >= 45:
+            score -= 10
     return round(score, 3)
+
+
+def _strict_race_decision(filtered: pd.DataFrame, before_count: int, min_roi: float) -> dict:
+    if filtered is None or filtered.empty:
+        return {
+            "decision": "見送り",
+            "confidence": 0,
+            "message": "厳選AI: 発信用に残せる買い目が無いため見送り推奨です。",
+        }
+
+    top = filtered.head(5).copy()
+    roi_col = detect_roi_column(top)
+    conf_col = detect_confidence_column(top)
+
+    roi_vals = [normalize_roi_value(r.get(roi_col, 0.0)) if roi_col else normalize_roi_value(r.get("期待値", 0.0)) for _, r in top.iterrows()]
+    conf_vals = [normalize_confidence_value(r.get(conf_col, 0.0)) if conf_col else 0.0 for _, r in top.iterrows()]
+    odds_vals = [_get_odds_value(r) for _, r in top.iterrows()]
+    ranks = top["買い目ランク"].astype(str).tolist() if "買い目ランク" in top.columns else []
+
+    avg_roi = sum(roi_vals) / len(roi_vals) if roi_vals else 0.0
+    max_roi = max(roi_vals) if roi_vals else 0.0
+    avg_conf = sum(conf_vals) / len(conf_vals) if conf_vals else 0.0
+    max_conf = max(conf_vals) if conf_vals else 0.0
+    avg_odds = sum([x for x in odds_vals if x > 0]) / len([x for x in odds_vals if x > 0]) if any(x > 0 for x in odds_vals) else 0.0
+
+    hot_count = ranks.count("熱🔥")
+    solid_count = ranks.count("堅")
+    hole_count = ranks.count("穴")
+
+    confidence = 0
+    confidence += min(max_roi, 150) * 0.22
+    confidence += min(avg_roi, 140) * 0.18
+    confidence += max_conf * 0.70
+    confidence += avg_conf * 0.45
+    confidence += hot_count * 12
+    confidence += solid_count * 6
+    confidence -= hole_count * 2
+    if avg_odds >= 35:
+        confidence -= 10
+    if len(filtered) > max(12, before_count * 0.75):
+        confidence -= 5
+    confidence = int(max(0, min(100, round(confidence))))
+
+    # 発信用なのでかなり厳しめ。勝負は熱ありが基本。
+    if confidence >= 82 and hot_count >= 1 and avg_roi >= max(108, float(min_roi)):
+        return {
+            "decision": "勝負",
+            "confidence": confidence,
+            "message": f"厳選AI: {before_count}点→{len(filtered)}点。🔥勝負候補です。信頼度{confidence}% / 熱{hot_count}点",
+        }
+    if confidence >= 72 and (hot_count >= 1 or solid_count >= 2) and avg_roi >= 103:
+        return {
+            "decision": "厳選候補",
+            "confidence": confidence,
+            "message": f"厳選AI: {before_count}点→{len(filtered)}点。△軽め候補です。信頼度{confidence}%",
+        }
+    return {
+        "decision": "見送り",
+        "confidence": confidence,
+        "message": f"厳選AI: {before_count}点→{len(filtered)}点。見送り推奨です。信頼度{confidence}% / 発信用には弱め",
+    }
 
 
 def apply_strict_selection_ai(
     pred_df: pd.DataFrame,
     max_count: int = 12,
-    min_roi: float = 105.0,
+    min_roi: float = 110.0,
     min_score: float = 0.0,
-    keep_min: int = 3,
+    keep_min: int = 2,
 ):
     """
     厳選AI。
     1) ROI/期待値/的中率で総合スコアを作る
     2) ROIが低すぎる買い目を削る
-    3) 上位 max_count 点だけ残す
-    4) 削りすぎた場合は上位 keep_min 点を必ず復活させる
+    3) 発信用に点数を絞る
+    4) レース自体の勝負/厳選候補/見送りを厳しめに返す
     """
     info = {
         "enabled": True,
@@ -352,16 +428,16 @@ def apply_strict_selection_ai(
         "max_count": int(max_count),
         "avg_roi_before": 0.0,
         "avg_roi_after": 0.0,
-        "decision": "通常",
+        "decision": "見送り",
+        "confidence": 0,
         "message": "",
     }
 
     if pred_df is None or pred_df.empty:
-        info["message"] = "買い目がありません。"
-        info["decision"] = "見送り"
+        info["message"] = "厳選AI: 買い目がありません。"
         return pred_df, info
 
-    out = pred_df.copy()
+    out = apply_roi_ticket_ranking(pred_df.copy())
     info["before_count"] = len(out)
 
     roi_col = detect_roi_column(out)
@@ -382,7 +458,7 @@ def apply_strict_selection_ai(
 
     sorted_out = out.sort_values(["厳選スコア", "厳選ROI"], ascending=False).reset_index(drop=True)
 
-    # ROIが取れている場合だけ低ROIを削る。ROIが全部0なら順位厳選だけにする。
+    # ROIが取れている場合だけ低ROIを削る。発信用なので初期値はやや厳しめ。
     if (sorted_out["厳選ROI"] > 0).any():
         filtered = sorted_out[sorted_out["厳選ROI"] >= float(min_roi)].copy()
     else:
@@ -391,9 +467,9 @@ def apply_strict_selection_ai(
     if float(min_score) > 0:
         filtered = filtered[filtered["厳選スコア"] >= float(min_score)].copy()
 
-    # 削りすぎ防止。最低 keep_min 点は上位から戻す。
     keep_min = max(1, int(keep_min))
     if filtered.empty:
+        # 完全ゼロにすると保存・確認ができないので、上位を少しだけ残して見送り判定にする
         filtered = sorted_out.head(min(keep_min, len(sorted_out))).copy()
     elif len(filtered) < keep_min and len(sorted_out) >= keep_min:
         comeback = sorted_out.head(keep_min).copy()
@@ -404,25 +480,16 @@ def apply_strict_selection_ai(
 
     max_count = max(1, int(max_count))
     filtered = filtered.sort_values(["厳選スコア", "厳選ROI"], ascending=False).head(max_count).reset_index(drop=True)
+    filtered = apply_roi_ticket_ranking(filtered)
 
     info["after_count"] = len(filtered)
     info["removed_count"] = max(0, info["before_count"] - info["after_count"])
-    info["avg_roi_after"] = round(float(filtered["厳選ROI"].mean()), 1) if len(filtered) else 0.0
+    info["avg_roi_after"] = round(float(filtered["厳選ROI"].mean()), 1) if len(filtered) and "厳選ROI" in filtered.columns else 0.0
 
-    if info["after_count"] <= 0:
-        info["decision"] = "見送り"
-        info["message"] = "厳選AI: 残せる買い目が無いため見送り候補です。"
-    elif info["avg_roi_after"] < 100:
-        info["decision"] = "見送り寄り"
-        info["message"] = f"厳選AI: {info['before_count']}点→{info['after_count']}点。平均ROIが低めです。"
-    elif info["avg_roi_after"] < float(min_roi):
-        info["decision"] = "軽め"
-        info["message"] = f"厳選AI: {info['before_count']}点→{info['after_count']}点。強くは買わず軽め推奨です。"
-    else:
-        info["decision"] = "厳選買い"
-        info["message"] = f"厳選AI: {info['before_count']}点→{info['after_count']}点に絞りました。"
-
+    decision = _strict_race_decision(filtered, before_count=info["before_count"], min_roi=min_roi)
+    info.update(decision)
     return filtered, info
+
 
 def widget_key(name: str, idx: int) -> str:
     ver = st.session_state.get("widget_ver", 0)
@@ -476,12 +543,12 @@ def is_valid_player_name(name: str) -> bool:
 # =========================================================
 def rank_base_amount(rank_label: str, unit_bet: int) -> int:
     unit = max(100, int(unit_bet))
-    if rank_label == "🔥 AI推奨":
+    if rank_label == "熱🔥":
         return unit * 3
-    if rank_label == "🟢 本命":
+    if rank_label == "堅":
         return unit * 2
-    if rank_label == "💰 期待値高":
-        return unit
+    if rank_label == "穴":
+        return unit * 2
     return unit
 
 
@@ -494,22 +561,21 @@ def apply_rank_based_amounts(pred_df: pd.DataFrame, unit_bet: int) -> pd.DataFra
     total_budget = int(unit_bet) * len(out)
 
     if "買い目ランク" not in out.columns:
-        out["買い目ランク"] = "⚪ 抑え"
+        out["買い目ランク"] = "抑え"
 
     if "厚張り指数" not in out.columns:
         out["厚張り指数"] = 1.0
 
     rank_weight = {
-        "🔥 AI推奨": 3.0,
-        "🟢 本命": 2.2,
-        "💰 期待値高": 2.0,
-        "🟡 穴": 1.4,
-        "⚪ 抑え": 1.0,
+        "熱🔥": 3.0,
+        "堅": 2.1,
+        "穴": 1.7,
+        "抑え": 1.0,
     }
 
     weights = []
     for _, row in out.iterrows():
-        rank_label = str(row.get("買い目ランク", "⚪ 抑え"))
+        rank_label = str(row.get("買い目ランク", "抑え"))
         thick_score = safe_float(row.get("厚張り指数", 1.0), 1.0)
         weight = rank_weight.get(rank_label, 1.0) * max(thick_score, 0.1)
         weights.append(weight)
@@ -2430,7 +2496,7 @@ with st.sidebar:
         "厳選ROI下限",
         min_value=90,
         max_value=140,
-        value=105,
+        value=110,
         step=5,
         disabled=not strict_ai_on,
     )
@@ -2439,10 +2505,10 @@ with st.sidebar:
     unit_bet = st.number_input("1点あたり金額", min_value=100, max_value=10000, step=100, value=100)
 
     st.caption("厚張り基準")
-    st.caption(f"🔥 AI推奨 = {unit_bet * 3:,}円")
-    st.caption(f"🟢 本命 = {unit_bet * 2:,}円")
-    st.caption(f"💰 期待値高 = {unit_bet:,}円")
-    st.caption(f"🟡 穴 = {unit_bet:,}円")
+    st.caption(f"熱🔥 = {unit_bet * 3:,}円")
+    st.caption(f"堅 = {unit_bet * 2:,}円")
+    st.caption(f"穴 = {unit_bet * 2:,}円")
+    st.caption(f"抑え = {unit_bet:,}円")
 
     if st.button("初期化", use_container_width=True):
         init_state(num_riders)
@@ -2684,7 +2750,7 @@ with p1:
                     pred_df,
                     max_count=min(int(strict_max_count), int(display_count)),
                     min_roi=float(strict_min_roi),
-                    keep_min=3,
+                    keep_min=2,
                 )
             else:
                 selection_info = {
@@ -2756,6 +2822,8 @@ if st.session_state.get("selection_info"):
     if msg:
         if si.get("decision") in ["見送り", "見送り寄り"]:
             st.warning(msg)
+        elif si.get("decision") == "勝負":
+            st.success(msg)
         else:
             st.info(msg)
         if si.get("enabled"):
