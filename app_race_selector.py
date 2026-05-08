@@ -34,7 +34,7 @@ st.set_page_config(
     layout="centered",
 )
 
-APP_VERSION = "race-selector-mobile v2.1（展開ログ保存AI版）"
+APP_VERSION = "race-selector-mobile v2.3（指数印表調整版）"
 
 HEADERS = {
     "User-Agent": (
@@ -1134,6 +1134,231 @@ def save_race_selection_log(df: pd.DataFrame):
 
 
 
+
+# =========================================================
+# AI指数＋印表 noteコピペ用
+# =========================================================
+def extract_player_blocks_for_mark_table(html: str) -> List[Dict[str, object]]:
+    if not html:
+        return []
+
+    player_matches = list(re.finditer(r'"playerId"\s*:\s*"([^"]+)"', html))
+    players: List[Dict[str, object]] = []
+
+    for i, m in enumerate(player_matches):
+        pid = m.group(1)
+        start = m.start()
+        prev_start = player_matches[i - 1].start() if i > 0 else 0
+        next_start = player_matches[i + 1].start() if i + 1 < len(player_matches) else len(html)
+
+        before = html[max(prev_start, start - 1800):start]
+        after = html[start:min(next_start, start + 2600)]
+        around = before + after
+
+        if '"racePoint"' not in after and '"style"' not in after:
+            continue
+
+        race_point_m = re.search(r'"racePoint"\s*:\s*([0-9]+(?:\.[0-9]+)?)', after)
+        style_m = re.search(r'"style"\s*:\s*"([^"]*)"', after)
+
+        home_candidates = re.findall(r'"home"\s*:\s*(\d{1,3})', before)
+        back_candidates = re.findall(r'"back"\s*:\s*(\d{1,3})', after)
+
+        home = int(home_candidates[-1]) if home_candidates else 0
+        back = int(back_candidates[0]) if back_candidates else 0
+
+        name = ""
+        for pat in [r'"name"\s*:\s*"([^"]{2,14})"', r'"playerName"\s*:\s*"([^"]{2,14})"', r'"fullName"\s*:\s*"([^"]{2,14})"']:
+            nm = re.search(pat, around)
+            if nm:
+                cand = normalize_text(nm.group(1))
+                if re.search(r"[一-龥ぁ-んァ-ヶ々]", cand):
+                    name = cand
+                    break
+
+        players.append({
+            "player_id": pid,
+            "name": name,
+            "race_point": safe_float(race_point_m.group(1), 0.0) if race_point_m else 0.0,
+            "style": style_m.group(1) if style_m else "",
+            "back": back,
+            "home": home,
+        })
+
+    unique = []
+    seen = set()
+    for p in players:
+        pid = str(p.get("player_id", ""))
+        if pid in seen:
+            continue
+        seen.add(pid)
+        unique.append(p)
+
+    return unique[:9]
+
+
+def parse_lineup_positions_for_mark(lineup: str) -> Dict[int, Dict[str, int]]:
+    groups = parse_lineup_groups(lineup)
+    info: Dict[int, Dict[str, int]] = {}
+    for line_idx, group in enumerate(groups, start=1):
+        size = len(group)
+        for pos, car in enumerate(group, start=1):
+            info[int(car)] = {
+                "line_no": line_idx,
+                "line_pos": pos,
+                "line_size": size,
+                "is_single": 1 if size == 1 else 0,
+            }
+    return info
+
+
+def mark_from_rank_for_note(rank: int) -> str:
+    return {1: "◎", 2: "○", 3: "▲", 4: "△", 5: "☆"}.get(rank, "")
+
+
+def make_player_index_mark_table(url: str) -> Tuple[pd.DataFrame, str]:
+    html, final_url = fetch_html(url)
+    soup = BeautifulSoup(html, "html.parser")
+    text = normalize_text(soup.get_text(" "))
+
+    lineup = extract_lineup_text(text)
+    line_info = parse_lineup_positions_for_mark(lineup)
+    players = extract_player_blocks_for_mark_table(html)
+
+    if not players:
+        return pd.DataFrame(), lineup
+
+    rows = []
+    for idx, p in enumerate(players, start=1):
+        car_no = idx
+        li = line_info.get(car_no, {})
+
+        race_point = safe_float(p.get("race_point", 0.0), 0.0)
+        back = safe_int(p.get("back", 0), 0)
+        home = safe_int(p.get("home", 0), 0)
+        style = str(p.get("style", ""))
+
+        line_size = safe_int(li.get("line_size", 0), 0)
+        line_pos = safe_int(li.get("line_pos", 0), 0)
+        is_single = safe_int(li.get("is_single", 0), 0)
+
+        index = race_point
+
+        if line_size >= 4:
+            index += 5.0
+        elif line_size == 3:
+            index += 3.0
+        elif line_size == 2:
+            index += 1.0
+        elif is_single:
+            index -= 3.0
+
+        if line_pos == 1:
+            index += min(back, 14) * 0.35
+            index += min(home, 14) * 0.25
+        elif line_pos == 2:
+            index += 3.0
+        elif line_pos >= 3:
+            index += 1.0
+
+        if back >= 10:
+            index += 3.0
+        elif back >= 6:
+            index += 1.5
+
+        if home >= 10:
+            index += 2.0
+        elif home >= 6:
+            index += 1.0
+
+        if "逃" in style:
+            index += 2.0
+        elif "両" in style:
+            index += 1.2
+        elif "追" in style and line_pos == 2:
+            index += 2.0
+
+        if is_single and (back < 6 and home < 6):
+            index -= 2.0
+
+        index = max(0.0, min(120.0, round(index, 1)))
+
+        comment_parts = []
+        if line_size >= 3:
+            comment_parts.append(f"{line_size}車ライン")
+        if line_pos == 1 and (back >= 6 or home >= 6):
+            comment_parts.append("主導権候補")
+        if line_pos == 2:
+            comment_parts.append("番手有利")
+        if is_single:
+            comment_parts.append("単騎")
+        if back >= 10 or home >= 10:
+            comment_parts.append("B/H強め")
+        if not comment_parts:
+            comment_parts.append("展開待ち")
+
+        rows.append({
+            "車番": car_no,
+            "選手名": f"{car_no}番",
+            "AI指数": index,
+            "印": "",
+            "競走得点": round(race_point, 2),
+            "脚質": style,
+            "B": back,
+            "H": home,
+            "ライン": line_size,
+            "ライン順": line_pos,
+            "単騎": "Yes" if is_single else "",
+            "AIコメント": " / ".join(comment_parts[:3]),
+        })
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df, lineup
+
+    df = df.sort_values("AI指数", ascending=False).reset_index(drop=True)
+    # note表示では%やバーではなく、1位から始まる順位型の数字にする
+    df["指数順位"] = [i + 1 for i in range(len(df))]
+    df["印"] = [mark_from_rank_for_note(i + 1) for i in range(len(df))]
+
+    for i, row in df.iterrows():
+        if row["印"] == "" and (safe_int(row["B"], 0) >= 8 or safe_int(row["H"], 0) >= 8):
+            df.at[i, "印"] = "穴"
+            break
+
+    return df, lineup
+
+
+def make_copyable_index_mark_text(mark_df: pd.DataFrame, race_name: str = "", lineup: str = "") -> str:
+    if mark_df is None or mark_df.empty:
+        return "指数表を作成できませんでした。"
+
+    lines = []
+
+    if race_name:
+        lines.append(f"## {race_name} 指数・印")
+        lines.append("")
+
+    if lineup:
+        lines.append(f"想定並び：{lineup}")
+        lines.append("")
+
+    lines.append("※指数表・印とは連動していない場合もございます。")
+    lines.append("")
+    lines.append("| 印 | 車番 | 選手名 | 指数 | 得点 | 脚質 | B | H | AIコメント |")
+    lines.append("|---|---:|---|---:|---:|---|---:|---:|---|")
+
+    for _, r in mark_df.iterrows():
+        lines.append(
+            f"| {r.get('印','')} | {r.get('車番','')} | {r.get('選手名','')} | "
+            f"{r.get('指数順位','')} | {r.get('競走得点','')} | {r.get('脚質','')} | "
+            f"{r.get('B','')} | {r.get('H','')} | {r.get('AIコメント','')} |"
+        )
+
+    lines.append("")
+    lines.append("※指数は、競走得点・ライン構成・B/H・脚質などをもとにAIが順位化した参考値です。")
+    return "\n".join(lines)
+
 st.title("🔥 レース選定AI")
 st.caption(f"{APP_VERSION} / 買い目は出さず、狙うレースだけを選ぶ専用サイト")
 
@@ -1144,6 +1369,7 @@ with st.sidebar:
     only_hot = st.checkbox("勝負・候補だけ表示", value=False)
     national_mode = st.checkbox("全国開催を自動取得して比較", value=False)
     max_national_venues = st.slider("全国取得する最大開催数", 1, 12, 6)
+    show_mark_table = st.checkbox("指数・印表を表示", value=True)
     st.caption("レース形状ログ: race_selection_log.csv")
     st.divider()
     st.caption("レースURLを1つ入れると、同開催の1R〜12Rを自動チェックします。複数URLもOKです。")
@@ -1227,6 +1453,54 @@ if run:
                 st.caption(f"注意点: {r['warnings']}")
                 st.caption(f"人数 {int(r['riders'])} / 得点差 {r['score_gap']} / ライン数 {int(r['line_count'])} / 単騎 {int(r['solo_count'])}")
                 st.link_button("WINTICKETで開く", r['race_url'], use_container_width=True)
+
+
+    if show_mark_table and not show_df.empty:
+        st.subheader("🧠 指数・印表")
+        st.caption("noteにそのままコピペしやすい形式で表示します。")
+
+        race_options = [
+            f"{int(r['rank'])}位 {r['race_name']}｜{r['judge']}｜{int(r['confidence'])}%"
+            for _, r in show_df.head(10).iterrows()
+        ]
+
+        selected_label = st.selectbox("指数表を作るレース", race_options)
+        selected_idx = race_options.index(selected_label)
+        selected_row = show_df.head(10).iloc[selected_idx]
+
+        try:
+            mark_df, lineup_for_mark = make_player_index_mark_table(str(selected_row["race_url"]))
+            if mark_df.empty:
+                st.warning("指数表を作成できませんでした。")
+            else:
+                display_mark_df = mark_df.copy()
+                # 表示は%やバーではなく、1位から始まる「指数順位」をメインにする
+                display_cols = [
+                    "印", "車番", "選手名", "指数順位", "競走得点", "脚質",
+                    "B", "H", "ライン", "ライン順", "単騎", "AIコメント"
+                ]
+                display_cols = [c for c in display_cols if c in display_mark_df.columns]
+                st.dataframe(
+                    display_mark_df[display_cols],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                copy_text = make_copyable_index_mark_text(
+                    mark_df,
+                    race_name=str(selected_row["race_name"]),
+                    lineup=lineup_for_mark,
+                )
+
+                st.text_area(
+                    "noteコピペ用：指数表・印",
+                    value=copy_text,
+                    height=360,
+                )
+
+        except Exception as e:
+            st.warning(f"指数表の作成に失敗しました: {e}")
+
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("勝負", int((df["judge"] == "🔥 勝負").sum()))
