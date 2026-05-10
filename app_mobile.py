@@ -1,5 +1,6 @@
 # app.py
 # -*- coding: utf-8 -*-
+# 本線70_準穴20_ロマン10 配分版
 
 import re
 import csv
@@ -708,13 +709,188 @@ def rank_base_amount(rank_label: str, unit_bet: int) -> int:
     return unit
 
 
+def classify_ticket_tier_for_publish(row, position: int, total: int) -> str:
+    """
+    買い目を3階層に分ける。
+    本線: 的中寄り。全体予算の約70%
+    準穴: 展開ズレ・穴寄り。全体予算の約20%
+    ロマン穴: 的中可能性は残すが配当期待。全体予算の約10%
+
+    重要:
+    - 穴を消さない
+    - ただし穴を厚くしすぎない
+    - 的中率重視の軸は残す
+    """
+    rank = str(row.get("買い目ランク", "抑え"))
+    odds = _get_odds_value(row) if "_get_odds_value" in globals() else safe_float(row.get("オッズ", 0), 0)
+    roi_col_val = 0.0
+    try:
+        roi_col_val = normalize_roi_value(row.get("期待値", 0.0))
+    except Exception:
+        roi_col_val = safe_float(row.get("期待値", 0.0), 0.0)
+
+    rate = position / max(total - 1, 1) if total > 1 else 0.0
+
+    # 配当妙味が大きい穴はロマン枠へ。ただし少数配分。
+    if rank == "穴" and (odds >= 25 or roi_col_val >= 130):
+        return "ロマン穴"
+
+    # 通常の穴は準穴へ
+    if rank == "穴":
+        return "準穴"
+
+    # 上位の熱・堅は本線
+    if rank in ["熱🔥", "堅"] and rate <= 0.70:
+        return "本線"
+
+    # 上位抑えは保険として本線または準穴
+    if rank == "抑え" and rate <= 0.55:
+        return "本線"
+
+    if rate <= 0.70:
+        return "本線"
+    if rate <= 0.90:
+        return "準穴"
+    return "ロマン穴"
+
+
+def apply_70_20_10_amounts(out: pd.DataFrame, unit_bet: int) -> pd.DataFrame:
+    """
+    本線70%・準穴20%・ロマン穴10%の資金配分。
+    最低100円単位で、総予算をなるべく守る。
+    """
+    if out is None or out.empty:
+        return out
+
+    out = out.copy()
+    unit = max(100, int(unit_bet))
+    total_budget = unit * len(out)
+
+    if "買い目タイプ" not in out.columns:
+        out["買い目タイプ"] = [
+            classify_ticket_tier_for_publish(row, i, len(out))
+            for i, (_, row) in enumerate(out.iterrows())
+        ]
+
+    tier_budget_rate = {
+        "本線": 0.70,
+        "準穴": 0.20,
+        "ロマン穴": 0.10,
+    }
+
+    existing_tiers = [t for t in ["本線", "準穴", "ロマン穴"] if (out["買い目タイプ"] == t).any()]
+    if not existing_tiers:
+        out["買い目タイプ"] = "本線"
+        existing_tiers = ["本線"]
+
+    # 存在しない階層の予算は本線側に寄せる
+    total_rate = sum(tier_budget_rate[t] for t in existing_tiers)
+    tier_budgets = {
+        t: int((total_budget * (tier_budget_rate[t] / total_rate)) // 100) * 100
+        for t in existing_tiers
+    }
+
+    # 端数調整
+    diff = total_budget - sum(tier_budgets.values())
+    if diff >= 100:
+        tier_budgets[existing_tiers[0]] += diff
+
+    rank_weight = {
+        "熱🔥": 3.2,
+        "堅": 2.3,
+        "穴": 1.5,
+        "抑え": 1.0,
+    }
+
+    amounts = [0] * len(out)
+    weights_all = []
+
+    for i, (_, row) in enumerate(out.iterrows()):
+        rank_label = str(row.get("買い目ランク", "抑え"))
+        thick_score = safe_float(row.get("厚張り指数", 1.0), 1.0)
+        tier = str(row.get("買い目タイプ", "本線"))
+
+        weight = rank_weight.get(rank_label, 1.0) * max(thick_score, 0.1)
+
+        # ロマン穴は夢枠なので厚くしすぎない
+        if tier == "ロマン穴":
+            weight *= 0.75
+        elif tier == "準穴":
+            weight *= 0.95
+
+        weights_all.append(weight)
+
+    # 階層ごとに配分
+    for tier in existing_tiers:
+        idxs = [i for i, t in enumerate(out["買い目タイプ"].astype(str).tolist()) if t == tier]
+        if not idxs:
+            continue
+
+        tier_budget = max(unit * len(idxs), tier_budgets.get(tier, unit * len(idxs)))
+        tier_budget = min(tier_budget, total_budget)
+
+        weights = [weights_all[i] for i in idxs]
+        total_weight = sum(weights)
+
+        if total_weight <= 0:
+            for i in idxs:
+                amounts[i] = unit
+            continue
+
+        for i, w in zip(idxs, weights):
+            raw = tier_budget * (w / total_weight)
+            amt = int(raw // 100) * 100
+            amounts[i] = max(unit, amt)
+
+    # 総額が超えたら、ロマン穴→準穴→本線の順で削る
+    def reduce_order():
+        tiers = ["ロマン穴", "準穴", "本線"]
+        order = []
+        for tier in tiers:
+            idxs = [
+                i for i, t in enumerate(out["買い目タイプ"].astype(str).tolist())
+                if t == tier and amounts[i] > unit
+            ]
+            idxs = sorted(idxs, key=lambda i: amounts[i], reverse=True)
+            order.extend(idxs)
+        return order
+
+    guard = 0
+    while sum(amounts) > total_budget and guard < 10000:
+        order = reduce_order()
+        if not order:
+            break
+        amounts[order[0]] -= 100
+        guard += 1
+
+    # 余りは本線→準穴に足す。ロマン穴には原則足さない。
+    diff = total_budget - sum(amounts)
+    if diff >= 100:
+        add_order = []
+        for tier in ["本線", "準穴", "ロマン穴"]:
+            idxs = [
+                i for i, t in enumerate(out["買い目タイプ"].astype(str).tolist())
+                if t == tier
+            ]
+            idxs = sorted(idxs, key=lambda i: weights_all[i], reverse=True)
+            add_order.extend(idxs)
+
+        j = 0
+        while diff >= 100 and add_order:
+            amounts[add_order[j % len(add_order)]] += 100
+            diff -= 100
+            j += 1
+
+    out["購入金額"] = [int(x) for x in amounts]
+    return out
+
+
 def apply_rank_based_amounts(pred_df: pd.DataFrame, unit_bet: int) -> pd.DataFrame:
     if pred_df is None or pred_df.empty:
         return pred_df
 
     # ここで必ずROI連動ランクを再判定する
     out = apply_roi_ticket_ranking(pred_df)
-    total_budget = int(unit_bet) * len(out)
 
     if "買い目ランク" not in out.columns:
         out["買い目ランク"] = "抑え"
@@ -722,55 +898,323 @@ def apply_rank_based_amounts(pred_df: pd.DataFrame, unit_bet: int) -> pd.DataFra
     if "厚張り指数" not in out.columns:
         out["厚張り指数"] = 1.0
 
-    rank_weight = {
-        "熱🔥": 3.0,
-        "堅": 2.1,
-        "穴": 1.7,
-        "抑え": 1.0,
-    }
+    # 3階層化：本線70% / 準穴20% / ロマン穴10%
+    out["買い目タイプ"] = [
+        classify_ticket_tier_for_publish(row, i, len(out))
+        for i, (_, row) in enumerate(out.iterrows())
+    ]
 
-    weights = []
-    for _, row in out.iterrows():
-        rank_label = str(row.get("買い目ランク", "抑え"))
-        thick_score = safe_float(row.get("厚張り指数", 1.0), 1.0)
-        weight = rank_weight.get(rank_label, 1.0) * max(thick_score, 0.1)
-        weights.append(weight)
-
-    total_weight = sum(weights)
-    unit = max(100, int(unit_bet))
-
-    if total_weight <= 0:
-        out["購入金額"] = unit
-        return out
-
-    amounts = []
-    for weight in weights:
-        raw_amount = total_budget * (weight / total_weight)
-        rounded_amount = int(raw_amount // 100) * 100
-        rounded_amount = max(rounded_amount, unit)
-        amounts.append(rounded_amount)
-
-    # 予算超過時は金額が大きいところから100円ずつ削る
-    while sum(amounts) > total_budget and max(amounts) > unit:
-        max_index = amounts.index(max(amounts))
-        amounts[max_index] -= 100
-
-    # 予算に余りがある場合は厚張り指数が高い順に100円ずつ足す
-    diff = total_budget - sum(amounts)
-    if diff >= 100 and len(amounts) > 0:
-        order = sorted(range(len(amounts)), key=lambda i: weights[i], reverse=True)
-        idx = 0
-        while diff >= 100 and order:
-            amounts[order[idx % len(order)]] += 100
-            diff -= 100
-            idx += 1
-
-    out["購入金額"] = [int(x) for x in amounts]
+    out = apply_70_20_10_amounts(out, unit_bet)
 
     ev_num = pd.to_numeric(out.get("期待値", 0), errors="coerce").fillna(0)
     out["期待回収額(目安)"] = (ev_num / 100.0 * out["購入金額"]).round(0)
 
     return out
+
+
+
+# =========================================================
+# 単騎復活＋千切れ検知AI
+# =========================================================
+def _ticket_parts(ticket: str):
+    return [safe_int(x, 0) for x in re.findall(r"[1-9]", str(ticket))]
+
+
+def _get_player_value(row, names, default=0.0):
+    for name in names:
+        if name in row.index:
+            return safe_float(row.get(name), default)
+    return float(default)
+
+
+def _is_single_value(v) -> bool:
+    s = normalize_text(v)
+    if s in ["1", "true", "True", "YES", "Yes", "yes", "単騎", "○", "あり"]:
+        return True
+    return False
+
+
+def _build_player_profile_map(current_df: pd.DataFrame) -> dict:
+    """選手データを車番キーで扱いやすくする。B/Hが無い場合も安全に動く。"""
+    profiles = {}
+    if current_df is None or current_df.empty:
+        return profiles
+
+    for _, row in current_df.iterrows():
+        car = safe_int(row.get("車番", 0), 0)
+        if car <= 0:
+            continue
+        line_no = normalize_text(row.get("ライン", ""))
+        line_pos = safe_int(row.get("ライン順", 0), 0)
+        is_single = _is_single_value(row.get("単騎", ""))
+        if not is_single and line_no in ["単騎", "", "0", "nan", "None"] and line_pos == 0:
+            is_single = False
+
+        profiles[car] = {
+            "車番": car,
+            "得点": _get_player_value(row, ["競走得点", "得点", "racePoint", "race_point"], 0.0),
+            "脚質": str(row.get("脚質", "")),
+            "B": safe_int(_get_player_value(row, ["B", "B数", "バック", "back", "back_count"], 0), 0),
+            "H": safe_int(_get_player_value(row, ["H", "H数", "ホーム", "home", "home_count"], 0), 0),
+            "ライン": line_no,
+            "ライン順": line_pos,
+            "単騎": is_single,
+        }
+    return profiles
+
+
+def _line_groups_from_profiles(profiles: dict):
+    groups = {}
+    singles = []
+    for car, p in profiles.items():
+        if p.get("単騎"):
+            singles.append(car)
+            continue
+        line = str(p.get("ライン", "")).strip()
+        if not line or line in ["0", "nan", "None", "単騎"]:
+            continue
+        groups.setdefault(line, []).append(car)
+
+    ordered_groups = []
+    for _, cars in groups.items():
+        cars = sorted(cars, key=lambda c: safe_int(profiles[c].get("ライン順", 99), 99))
+        if cars:
+            ordered_groups.append(cars)
+    return ordered_groups, singles
+
+
+def calc_single_rider_bonus(profile: dict, line_count: int, max_line_size: int):
+    """単騎を消しすぎないための評価。来れる条件がある単騎だけ拾う。"""
+    if not profile or not profile.get("単騎"):
+        return 0.0, []
+
+    score = -2.0
+    reasons = []
+    b = safe_int(profile.get("B", 0), 0)
+    h = safe_int(profile.get("H", 0), 0)
+    style = str(profile.get("脚質", ""))
+    point = safe_float(profile.get("得点", 0), 0.0)
+
+    if b >= 8:
+        score += 4.0
+        reasons.append("単騎B高")
+    if h >= 8:
+        score += 3.0
+        reasons.append("単騎H高")
+    if "両" in style or "逃" in style:
+        score += 2.5
+        reasons.append("単騎自力")
+    if point >= 90:
+        score += 3.0
+        reasons.append("単騎得点上位")
+    if line_count >= 4:
+        score += 2.0
+        reasons.append("混戦で単騎向き")
+    if max_line_size >= 4:
+        score += 1.5
+        reasons.append("長ライン崩れ期待")
+
+    return score, reasons
+
+
+def calc_line_break_risk(leader: dict, second: dict, line_size: int):
+    """千切れ・ライン崩れの危険度。"""
+    risk = 0.0
+    reasons = []
+    if not leader:
+        return risk, reasons
+
+    leader_b = safe_int(leader.get("B", 0), 0)
+    leader_h = safe_int(leader.get("H", 0), 0)
+    second_b = safe_int(second.get("B", 0), 0) if second else 0
+    second_h = safe_int(second.get("H", 0), 0) if second else 0
+    second_point = safe_float(second.get("得点", 0), 0) if second else 0
+
+    if leader_b >= 12:
+        risk += 2.5
+        reasons.append("先行B強")
+    if leader_h >= 12:
+        risk += 2.0
+        reasons.append("先行H強")
+    if second and second_b <= 1 and second_h <= 1 and second_point < 88:
+        risk += 3.0
+        reasons.append("番手やや弱")
+    if line_size >= 4:
+        risk += 2.0
+        reasons.append("長ライン")
+    if line_size == 2 and (leader_b >= 10 or leader_h >= 10):
+        risk += 1.5
+        reasons.append("2車ライン崩れ警戒")
+
+    return risk, reasons
+
+
+def calc_line_keep_confidence(line_break_risk: float, line_size: int, single_count: int) -> float:
+    confidence = 70.0
+    if line_size >= 3:
+        confidence += 5
+    if line_size >= 4:
+        confidence -= 4
+    confidence -= float(line_break_risk) * 5
+    confidence -= int(single_count) * 2
+    return max(0.0, min(100.0, confidence))
+
+
+def _make_extra_ticket_rows(pred_df: pd.DataFrame, tickets, reason: str, rank_label: str = "穴") -> pd.DataFrame:
+    if pred_df is None or pred_df.empty or not tickets:
+        return pd.DataFrame(columns=pred_df.columns if pred_df is not None else [])
+
+    base = pred_df.iloc[0].to_dict()
+    rows = []
+    for t in tickets:
+        r = {c: base.get(c, "") for c in pred_df.columns}
+        r["買い目"] = t
+        r["買い目ランク"] = rank_label
+        if "AI評価" in pred_df.columns:
+            r["AI評価"] = 68
+        if "期待値" in pred_df.columns:
+            r["期待値"] = 106 if rank_label == "抑え" else 112
+        if "オッズ" in pred_df.columns:
+            r["オッズ"] = safe_float(r.get("オッズ", 0), 0)
+        if "学習理由" in pred_df.columns:
+            r["学習理由"] = reason
+        if "判定理由" in pred_df.columns:
+            r["判定理由"] = reason
+        if "買い目タイプ" in pred_df.columns:
+            r["買い目タイプ"] = "準穴" if rank_label == "穴" else "ロマン穴"
+        rows.append(r)
+    return pd.DataFrame(rows)
+
+
+def add_single_and_break_pattern_tickets(
+    pred_df: pd.DataFrame,
+    current_df: pd.DataFrame,
+    ticket_type: str,
+    prediction_style: str = "的中率重視",
+):
+    """
+    ライン中心は維持しつつ、単騎一発・千切れパターンを少しだけ追加する。
+    むやみに点数を増やさないため、追加上限を小さくする。
+    """
+    info = {"added": 0, "reasons": []}
+    if pred_df is None or pred_df.empty or "買い目" not in pred_df.columns:
+        return pred_df, info
+
+    profiles = _build_player_profile_map(current_df)
+    if not profiles:
+        return pred_df, info
+
+    groups, singles = _line_groups_from_profiles(profiles)
+    line_count = len(groups) + len(singles)
+    max_line_size = max([len(g) for g in groups], default=1)
+    max_extra = 5 if str(prediction_style) == "回収率重視" else 4
+
+    existing = set(pred_df["買い目"].astype(str).tolist())
+    extra_tickets = []
+    extra_reasons = []
+
+    # 上位買い目の軸候補を参考にする
+    top_tickets = pred_df["買い目"].astype(str).head(8).tolist()
+    top_heads = []
+    for t in top_tickets:
+        parts = _ticket_parts(t)
+        if parts:
+            top_heads.append(parts[0])
+    head_freq = pd.Series(top_heads).value_counts().to_dict() if top_heads else {}
+    likely_heads = [k for k, _ in sorted(head_freq.items(), key=lambda x: x[1], reverse=True)]
+
+    # ① 単騎を完全に消さない。条件を満たす単騎だけ穴候補にする。
+    single_candidates = []
+    for car in singles:
+        bonus, reasons = calc_single_rider_bonus(profiles.get(car, {}), line_count, max_line_size)
+        if bonus >= 4.0:
+            single_candidates.append((car, bonus, reasons))
+    single_candidates = sorted(single_candidates, key=lambda x: x[1], reverse=True)
+
+    # 相手候補はAI上位買い目に多く出る車番＋得点上位
+    partner_candidates = []
+    for t in top_tickets:
+        for p in _ticket_parts(t):
+            if p not in partner_candidates:
+                partner_candidates.append(p)
+    for car, p in sorted(profiles.items(), key=lambda kv: safe_float(kv[1].get("得点", 0), 0), reverse=True):
+        if car not in partner_candidates:
+            partner_candidates.append(car)
+
+    for car, bonus, reasons in single_candidates[:2]:
+        partners = [p for p in partner_candidates if p != car][:3]
+        if len(partners) >= 2:
+            if ticket_type == "2車単":
+                candidates = [f"{car}-{partners[0]}", f"{partners[0]}-{car}"]
+            else:
+                candidates = [
+                    f"{car}-{partners[0]}-{partners[1]}",
+                    f"{partners[0]}-{car}-{partners[1]}",
+                    f"{partners[0]}-{partners[1]}-{car}",
+                ]
+            for t in candidates:
+                if t not in existing and t not in extra_tickets:
+                    extra_tickets.append(t)
+                    extra_reasons.append("単騎一発警戒: " + "/".join(reasons[:2]))
+                    if len(extra_tickets) >= max_extra:
+                        break
+        if len(extra_tickets) >= max_extra:
+            break
+
+    # ② 千切れ・ライン崩れ。強い理由がある時だけ少し足す。
+    if len(extra_tickets) < max_extra:
+        break_candidates = []
+        for group in groups:
+            if len(group) < 2:
+                continue
+            leader = profiles.get(group[0], {})
+            second = profiles.get(group[1], {})
+            risk, reasons = calc_line_break_risk(leader, second, len(group))
+            keep_conf = calc_line_keep_confidence(risk, len(group), len(singles))
+            if risk >= 3.5 and keep_conf < 66:
+                break_candidates.append((group, risk, reasons, keep_conf))
+        break_candidates = sorted(break_candidates, key=lambda x: x[1], reverse=True)
+
+        hole_pool = [x[0] for x in single_candidates]
+        # 単騎以外でもB/Hや得点がある車を崩れ候補へ
+        for car, p in sorted(profiles.items(), key=lambda kv: (safe_int(kv[1].get("B", 0), 0) + safe_int(kv[1].get("H", 0), 0), safe_float(kv[1].get("得点", 0), 0)), reverse=True):
+            if car not in hole_pool:
+                hole_pool.append(car)
+
+        for group, risk, reasons, keep_conf in break_candidates[:2]:
+            head = group[0]
+            second = group[1]
+            holes = [h for h in hole_pool if h not in [head, second]][:2]
+            for hole in holes:
+                if ticket_type == "2車単":
+                    candidates = [f"{head}-{hole}"]
+                else:
+                    candidates = [f"{head}-{hole}-{second}", f"{head}-{second}-{hole}"]
+                for t in candidates:
+                    if t not in existing and t not in extra_tickets:
+                        extra_tickets.append(t)
+                        extra_reasons.append("千切れ警戒: " + "/".join(reasons[:2]))
+                        if len(extra_tickets) >= max_extra:
+                            break
+                if len(extra_tickets) >= max_extra:
+                    break
+            if len(extra_tickets) >= max_extra:
+                break
+
+    if not extra_tickets:
+        return pred_df, info
+
+    # 理由はまとめて付与
+    reason = " / ".join(list(dict.fromkeys(extra_reasons))[:3])
+    extra_df = _make_extra_ticket_rows(pred_df, extra_tickets[:max_extra], reason=reason, rank_label="穴")
+    if extra_df.empty:
+        return pred_df, info
+
+    out = pd.concat([pred_df, extra_df], ignore_index=True)
+    out = out.drop_duplicates(subset=["買い目"], keep="first").reset_index(drop=True)
+    info["added"] = len(out) - len(pred_df)
+    info["reasons"] = list(dict.fromkeys(extra_reasons))[:5]
+    return out, info
 
 
 # =========================================================
@@ -3014,6 +3458,16 @@ with p1:
             selection_info["race_gate_on"] = bool(race_gate_on)
             if not race_gate_on:
                 selection_info["race_gate_blocked"] = False
+            st.session_state["selection_info"] = selection_info
+
+            pred_df, break_single_info = add_single_and_break_pattern_tickets(
+                pred_df,
+                current_df,
+                ticket_type=ticket_type,
+                prediction_style=prediction_style,
+            )
+            selection_info["single_break_added"] = break_single_info.get("added", 0)
+            selection_info["single_break_reasons"] = " / ".join(break_single_info.get("reasons", []))
             st.session_state["selection_info"] = selection_info
 
             pred_df = apply_rank_based_amounts(pred_df, unit_bet)
