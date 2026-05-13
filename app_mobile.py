@@ -1,7 +1,7 @@
 # app.py
 # -*- coding: utf-8 -*-
-# 本線70_準穴20_ロマン10 配分版
-# AI 3車BOX保険 追加版
+# 旧ロジック寄せ_BOX任意版
+# 紐抜け対策AI ON/OFF 追加版
 
 import re
 import csv
@@ -9,6 +9,7 @@ import json
 import itertools
 from pathlib import Path
 from datetime import datetime
+from typing import List, Tuple
 
 import requests
 import pandas as pd
@@ -28,7 +29,7 @@ st.set_page_config(
     layout="centered",
 )
 
-st.caption("✅ mobile ROIランク分岐版 v16 起動中（レース選別AI・見送り買い目非表示版）")
+st.caption("✅ mobile 旧ロジック寄せ_BOX任意版 v31（紐抜け対策AI ON/OFF追加）")
 
 HEADERS = {
     "User-Agent": (
@@ -892,6 +893,7 @@ def apply_rank_based_amounts(pred_df: pd.DataFrame, unit_bet: int) -> pd.DataFra
 
     # ここで必ずROI連動ランクを再判定する
     out = apply_roi_ticket_ranking(pred_df)
+    total_budget = int(unit_bet) * len(out)
 
     if "買い目ランク" not in out.columns:
         out["買い目ランク"] = "抑え"
@@ -899,19 +901,59 @@ def apply_rank_based_amounts(pred_df: pd.DataFrame, unit_bet: int) -> pd.DataFra
     if "厚張り指数" not in out.columns:
         out["厚張り指数"] = 1.0
 
-    # 3階層化：本線70% / 準穴20% / ロマン穴10%
-    out["買い目タイプ"] = [
-        classify_ticket_tier_for_publish(row, i, len(out))
-        for i, (_, row) in enumerate(out.iterrows())
-    ]
+    rank_weight = {
+        "熱🔥": 3.0,
+        "堅": 2.1,
+        "穴": 1.7,
+        "抑え": 1.0,
+    }
 
-    out = apply_70_20_10_amounts(out, unit_bet)
+    weights = []
+    for _, row in out.iterrows():
+        rank_label = str(row.get("買い目ランク", "抑え"))
+        thick_score = safe_float(row.get("厚張り指数", 1.0), 1.0)
+        # 紐抜け対策AIは必ず薄く抑える
+        if str(row.get("紐抜け対策AI", "")) == "ON":
+            weight = 0.75
+        else:
+            weight = rank_weight.get(rank_label, 1.0) * max(thick_score, 0.1)
+        weights.append(weight)
+
+    total_weight = sum(weights)
+    unit = max(100, int(unit_bet))
+
+    if total_weight <= 0:
+        out["購入金額"] = unit
+        return out
+
+    amounts = []
+    for weight in weights:
+        raw_amount = total_budget * (weight / total_weight)
+        rounded_amount = int(raw_amount // 100) * 100
+        rounded_amount = max(rounded_amount, unit)
+        amounts.append(rounded_amount)
+
+    # 予算超過時は金額が大きいところから100円ずつ削る
+    while sum(amounts) > total_budget and max(amounts) > unit:
+        max_index = amounts.index(max(amounts))
+        amounts[max_index] -= 100
+
+    # 予算に余りがある場合は厚張り指数が高い順に100円ずつ足す
+    diff = total_budget - sum(amounts)
+    if diff >= 100 and len(amounts) > 0:
+        order = sorted(range(len(amounts)), key=lambda i: weights[i], reverse=True)
+        idx = 0
+        while diff >= 100 and order:
+            amounts[order[idx % len(order)]] += 100
+            diff -= 100
+            idx += 1
+
+    out["購入金額"] = [int(x) for x in amounts]
 
     ev_num = pd.to_numeric(out.get("期待値", 0), errors="coerce").fillna(0)
     out["期待回収額(目安)"] = (ev_num / 100.0 * out["購入金額"]).round(0)
 
     return out
-
 
 
 # =========================================================
@@ -1217,6 +1259,179 @@ def add_single_and_break_pattern_tickets(
     info["reasons"] = list(dict.fromkeys(extra_reasons))[:5]
     return out, info
 
+
+
+
+# =========================================================
+# 紐抜け対策AI（チェックONの時だけ追加）
+# =========================================================
+def _score_himo_guard_candidate(profile: dict, appear_count: int = 0, ticket_used_count: int = 0) -> float:
+    """
+    2着・3着の紐抜けを拾うための軽い補助スコア。
+    重要: 軸選定には使わない。相手候補だけを薄く追加する。
+    """
+    point = safe_float(profile.get("得点", 0), 0.0)
+    b = safe_int(profile.get("B", 0), 0)
+    h = safe_int(profile.get("H", 0), 0)
+    style = str(profile.get("脚質", ""))
+    line_pos = safe_int(profile.get("ライン順", 0), 0)
+    is_single = bool(profile.get("単騎", False))
+
+    score = 0.0
+    score += point * 0.55
+    score += appear_count * 5.0
+
+    # 番手・3番手は2着3着の紐に残りやすい
+    if line_pos == 2:
+        score += 9.0
+    elif line_pos == 3:
+        score += 6.0
+    elif line_pos >= 4:
+        score += 2.0
+
+    # 自力・自在・B/Hは3着残りや展開ズレで拾いやすい
+    score += min(b, 16) * 0.85
+    score += min(h, 16) * 0.55
+
+    if "逃" in style or "捲" in style or "両" in style or "自" in style:
+        score += 4.0
+    if "追" in style and line_pos in [2, 3]:
+        score += 3.0
+
+    # すでに買い目に多く出ている車は追加しすぎない
+    score -= max(0, ticket_used_count - 2) * 2.5
+
+    # 単騎は維持。ただし弱い単騎を無理に増やさない
+    if is_single:
+        if point >= 87 or b >= 7 or h >= 7:
+            score += 3.0
+        else:
+            score -= 4.0
+
+    return round(score, 3)
+
+
+def add_himo_guard_tickets_optional(
+    pred_df: pd.DataFrame,
+    current_df: pd.DataFrame,
+    ticket_type: str,
+    prediction_style: str = "的中率重視",
+    max_add: int = 4,
+) -> Tuple[pd.DataFrame, dict]:
+    """
+    紐抜け対策AI。
+    - チェックON時だけ呼ぶ
+    - 1着軸は今の買い目から固定
+    - 2着3着の相手候補だけ最大2〜4点追加
+    - 追加ランクは必ず「抑え」
+    - BOX保険とは独立
+    """
+    info = {"added": 0, "himo_cars": [], "axis": "", "reason": ""}
+    if pred_df is None or pred_df.empty or "買い目" not in pred_df.columns:
+        return pred_df, info
+
+    profiles = _build_player_profile_map(current_df)
+    if not profiles:
+        info["reason"] = "紐抜け対策AI: 選手情報不足"
+        return pred_df, info
+
+    base_tickets = pred_df["買い目"].astype(str).tolist()
+    existing = set(base_tickets)
+
+    heads = []
+    seconds = []
+    used_counts = {}
+    for t in base_tickets[:12]:
+        parts = _ticket_parts(t)
+        if len(parts) >= 1:
+            heads.append(parts[0])
+        if len(parts) >= 2:
+            seconds.append(parts[1])
+        for p in parts:
+            used_counts[p] = used_counts.get(p, 0) + 1
+
+    if not heads:
+        info["reason"] = "紐抜け対策AI: 軸候補なし"
+        return pred_df, info
+
+    axis1 = pd.Series(heads).value_counts().index[0]
+    axis2 = pd.Series(seconds).value_counts().index[0] if seconds else None
+    info["axis"] = str(axis1)
+
+    scored = []
+    for car, prof in profiles.items():
+        # 軸は壊さない。1着軸は追加候補から外す。
+        if car == axis1:
+            continue
+        appear_count = used_counts.get(car, 0)
+        score = _score_himo_guard_candidate(prof, appear_count=appear_count, ticket_used_count=appear_count)
+        scored.append((car, score))
+
+    scored = sorted(scored, key=lambda x: x[1], reverse=True)
+    himo_cars = [c for c, _ in scored[:3]]
+    info["himo_cars"] = himo_cars
+
+    extra_tickets = []
+    if str(ticket_type) == "2車単":
+        # 2車単は軸1着固定を優先。薄く裏も1点だけ候補化。
+        for h in himo_cars:
+            patterns = [f"{axis1}-{h}"]
+            if len(extra_tickets) < 2:
+                patterns.append(f"{h}-{axis1}")
+            for t in patterns:
+                if t not in existing and not _ticket_contains_same_parts(t):
+                    extra_tickets.append(t)
+    else:
+        for h in himo_cars:
+            patterns = []
+            if axis2 and h not in [axis1, axis2]:
+                # 軸はそのまま。3着抜けと2着ズレだけ薄く拾う。
+                patterns.append(f"{axis1}-{axis2}-{h}")
+                patterns.append(f"{axis1}-{h}-{axis2}")
+            else:
+                # axis2が取れない場合は、上位相手を使って3連系の形だけ作る
+                other_candidates = [c for c, _ in scored if c not in [axis1, h]]
+                if other_candidates:
+                    o = other_candidates[0]
+                    patterns.append(f"{axis1}-{o}-{h}")
+
+            for t in patterns:
+                if t not in existing and not _ticket_contains_same_parts(t):
+                    extra_tickets.append(t)
+
+    # 重複を消して最大2〜4点に制限
+    extra_tickets = list(dict.fromkeys(extra_tickets))[:max(2, min(4, int(max_add)))]
+
+    if not extra_tickets:
+        info["reason"] = "紐抜け対策AI: 追加候補なし"
+        return pred_df, info
+
+    reason = f"紐抜け対策AI: 軸{axis1}固定 / 紐候補={','.join(map(str, himo_cars))}"
+    extra_df = _make_extra_ticket_rows(
+        pred_df,
+        extra_tickets,
+        reason=reason,
+        rank_label="抑え",
+    )
+
+    if extra_df.empty:
+        return pred_df, info
+
+    # 紐抜け対策は必ず抑え。ROIランク再判定で変わるのを防ぐ補助列も付ける。
+    if "買い目ランク" in extra_df.columns:
+        extra_df["買い目ランク"] = "抑え"
+    if "AI評価" in extra_df.columns:
+        extra_df["AI評価"] = 62
+    if "期待値" in extra_df.columns:
+        extra_df["期待値"] = 101
+    extra_df["紐抜け対策AI"] = "ON"
+
+    out = pd.concat([pred_df, extra_df], ignore_index=True)
+    out = out.drop_duplicates(subset=["買い目"], keep="first").reset_index(drop=True)
+
+    info["added"] = len(out) - len(pred_df)
+    info["reason"] = reason
+    return out, info
 
 
 # =========================================================
@@ -3340,6 +3555,21 @@ with st.sidebar:
     st.caption("ON: ライン数だけでは切らず、AI信頼度・熱🔥/堅/穴の強さを中心に判定します。※買い目は基本表示します。")
 
     weather = st.selectbox("天候", options=["晴", "雨", "風強"], index=0)
+
+    enable_box_ai = st.checkbox(
+        "BOX保険を追加する",
+        value=st.session_state.get("enable_box_ai", False),
+        help="ONの時だけ、AIが選んだ3車BOXを保険として追加します。通常はOFF推奨です。",
+    )
+    st.session_state["enable_box_ai"] = enable_box_ai
+
+    enable_himo_guard_ai = st.checkbox(
+        "紐抜け対策AIを追加する",
+        value=st.session_state.get("enable_himo_guard_ai", True),
+        help="ONの時だけ、軸はそのままで2着3着候補を最大2〜4点だけ抑え追加します。",
+    )
+    st.session_state["enable_himo_guard_ai"] = enable_himo_guard_ai
+
     unit_bet = st.number_input("1点あたり金額", min_value=100, max_value=10000, step=100, value=100)
 
     st.caption("厚張り基準")
@@ -3686,15 +3916,37 @@ with p1:
             selection_info["single_break_added"] = break_single_info.get("added", 0)
             selection_info["single_break_reasons"] = " / ".join(break_single_info.get("reasons", []))
 
-            pred_df, box_info = add_ai_box_tickets(
-                pred_df,
-                current_df,
-                ticket_type=ticket_type,
-                prediction_style=prediction_style,
-            )
-            selection_info["box_added"] = box_info.get("added", 0)
-            selection_info["box_cars"] = ",".join(map(str, box_info.get("box_cars", [])))
-            selection_info["box_reason"] = box_info.get("reason", "")
+            if st.session_state.get("enable_box_ai", False):
+                pred_df, box_info = add_ai_box_tickets(
+                    pred_df,
+                    current_df,
+                    ticket_type=ticket_type,
+                    prediction_style=prediction_style,
+                )
+                selection_info["box_added"] = box_info.get("added", 0)
+                selection_info["box_cars"] = ",".join(map(str, box_info.get("box_cars", [])))
+                selection_info["box_reason"] = box_info.get("reason", "")
+            else:
+                selection_info["box_added"] = 0
+                selection_info["box_cars"] = ""
+                selection_info["box_reason"] = "BOX保険OFF"
+
+            if st.session_state.get("enable_himo_guard_ai", True):
+                pred_df, himo_info = add_himo_guard_tickets_optional(
+                    pred_df,
+                    current_df,
+                    ticket_type=ticket_type,
+                    prediction_style=prediction_style,
+                    max_add=4,
+                )
+                selection_info["himo_guard_added"] = himo_info.get("added", 0)
+                selection_info["himo_guard_cars"] = ",".join(map(str, himo_info.get("himo_cars", [])))
+                selection_info["himo_guard_reason"] = himo_info.get("reason", "")
+            else:
+                selection_info["himo_guard_added"] = 0
+                selection_info["himo_guard_cars"] = ""
+                selection_info["himo_guard_reason"] = "紐抜け対策AI OFF"
+
             st.session_state["selection_info"] = selection_info
 
             pred_df = apply_rank_based_amounts(pred_df, unit_bet)
