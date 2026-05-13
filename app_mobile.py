@@ -1,6 +1,7 @@
 # app.py
 # -*- coding: utf-8 -*-
 # 本線70_準穴20_ロマン10 配分版
+# AI 3車BOX保険 追加版
 
 import re
 import csv
@@ -1214,6 +1215,222 @@ def add_single_and_break_pattern_tickets(
     out = out.drop_duplicates(subset=["買い目"], keep="first").reset_index(drop=True)
     info["added"] = len(out) - len(pred_df)
     info["reasons"] = list(dict.fromkeys(extra_reasons))[:5]
+    return out, info
+
+
+
+# =========================================================
+# AI 3車BOX保険
+# =========================================================
+def _ticket_contains_same_parts(ticket: str) -> bool:
+    parts = _ticket_parts(ticket)
+    return len(parts) != len(set(parts))
+
+
+def _make_box_tickets(cars: List[int], ticket_type: str) -> List[str]:
+    """
+    3車BOXを作る。
+    3連単: 6点
+    2車単: 6点ではなく、3車の2車単BOXで6点
+    """
+    cars = [safe_int(c, 0) for c in cars if safe_int(c, 0) > 0]
+    cars = list(dict.fromkeys(cars))
+    if len(cars) < 3:
+        return []
+
+    a, b, c = cars[:3]
+
+    if str(ticket_type) == "2車単":
+        return [
+            f"{a}-{b}", f"{a}-{c}",
+            f"{b}-{a}", f"{b}-{c}",
+            f"{c}-{a}", f"{c}-{b}",
+        ]
+
+    return [
+        f"{a}-{b}-{c}",
+        f"{a}-{c}-{b}",
+        f"{b}-{a}-{c}",
+        f"{b}-{c}-{a}",
+        f"{c}-{a}-{b}",
+        f"{c}-{b}-{a}",
+    ]
+
+
+def _score_box_candidate(profile: dict, appears_count: int = 0) -> float:
+    """
+    BOXに入れる3車の評価。
+    的中率重視なので、得点・B/H・AI既存買い目登場回数を重視。
+    """
+    if not profile:
+        return 0.0
+
+    point = safe_float(profile.get("得点", 0), 0.0)
+    b = safe_int(profile.get("B", 0), 0)
+    h = safe_int(profile.get("H", 0), 0)
+    style = str(profile.get("脚質", ""))
+    is_single = bool(profile.get("単騎", False))
+    line_pos = safe_int(profile.get("ライン順", 0), 0)
+
+    score = 0.0
+
+    # 得点は基礎
+    score += point * 0.75
+
+    # 既存AI買い目によく出る車は優先
+    score += appears_count * 8.0
+
+    # 自力・B/HはBOX向き
+    score += min(b, 16) * 1.4
+    score += min(h, 16) * 0.8
+
+    if "逃" in style or "両" in style:
+        score += 5.0
+
+    # 番手も2・3着でBOX向き
+    if line_pos == 2:
+        score += 4.0
+
+    # 単騎は条件付きで残す
+    if is_single:
+        if b >= 8 or h >= 8 or point >= 88:
+            score += 4.0
+        else:
+            score -= 5.0
+
+    return score
+
+
+def should_add_box_tickets(profiles: dict, pred_df: pd.DataFrame, box_cars: List[int], prediction_style: str) -> Tuple[bool, str]:
+    """
+    BOXを出すべきか判定。
+    軸が1人でかなり明確すぎる時はBOX不要。
+    上位3車が拮抗、または崩れ要素がある時だけ出す。
+    """
+    if not box_cars or len(box_cars) < 3:
+        return False, "BOX候補3車不足"
+
+    points = [safe_float(profiles.get(c, {}).get("得点", 0), 0.0) for c in box_cars[:3]]
+    point_gap = max(points) - min(points) if points else 999
+
+    b_sum = sum(safe_int(profiles.get(c, {}).get("B", 0), 0) for c in box_cars[:3])
+    h_sum = sum(safe_int(profiles.get(c, {}).get("H", 0), 0) for c in box_cars[:3])
+    single_count = sum(1 for c in box_cars[:3] if profiles.get(c, {}).get("単騎"))
+
+    top_head_count = 0
+    if pred_df is not None and not pred_df.empty and "買い目" in pred_df.columns:
+        heads = []
+        for t in pred_df["買い目"].astype(str).head(8).tolist():
+            parts = _ticket_parts(t)
+            if parts:
+                heads.append(parts[0])
+        if heads:
+            vc = pd.Series(heads).value_counts()
+            top_head_count = int(vc.iloc[0]) if len(vc) else 0
+
+    reasons = []
+
+    # 上位3車が近い＝BOX向き
+    if point_gap <= 5.0:
+        reasons.append("上位3車拮抗")
+
+    # 自力が複数ある＝着順入替の余地
+    if b_sum + h_sum >= 18:
+        reasons.append("自力要素あり")
+
+    # 単騎や崩れ要素あり
+    if single_count >= 1:
+        reasons.append("単騎絡み")
+
+    # 既存買い目で頭が割れている＝BOX向き
+    if top_head_count <= 3:
+        reasons.append("頭固定しすぎない")
+
+    # 回収率重視なら少し出しやすく
+    if str(prediction_style) == "回収率重視":
+        reasons.append("回収率重視")
+
+    # 軸が強烈に固定されすぎていて、得点差も大きいならBOX不要
+    if top_head_count >= 6 and point_gap >= 7.0 and not reasons:
+        return False, "軸明確でBOX不要"
+
+    if reasons:
+        return True, "BOX保険: " + "/".join(reasons[:3])
+
+    return False, "BOX条件不足"
+
+
+def add_ai_box_tickets(
+    pred_df: pd.DataFrame,
+    current_df: pd.DataFrame,
+    ticket_type: str,
+    prediction_style: str = "的中率重視",
+) -> Tuple[pd.DataFrame, dict]:
+    """
+    AIが的中率高めの3車を選び、BOX保険を追加する。
+    全レースで無条件には出さず、BOX向きの時だけ最大6点追加。
+    """
+    info = {"added": 0, "box_cars": [], "reason": ""}
+    if pred_df is None or pred_df.empty or "買い目" not in pred_df.columns:
+        return pred_df, info
+
+    profiles = _build_player_profile_map(current_df)
+    if not profiles:
+        return pred_df, info
+
+    # 既存買い目に登場する回数を数える
+    appear_counts = {}
+    for t in pred_df["買い目"].astype(str).head(12).tolist():
+        for p in _ticket_parts(t):
+            appear_counts[p] = appear_counts.get(p, 0) + 1
+
+    scored = []
+    for car, prof in profiles.items():
+        score = _score_box_candidate(prof, appear_counts.get(car, 0))
+        scored.append((car, score))
+
+    scored = sorted(scored, key=lambda x: x[1], reverse=True)
+    box_cars = [c for c, _ in scored[:3]]
+
+    ok, reason = should_add_box_tickets(profiles, pred_df, box_cars, prediction_style)
+    info["box_cars"] = box_cars
+    info["reason"] = reason
+
+    if not ok:
+        return pred_df, info
+
+    box_tickets = _make_box_tickets(box_cars, ticket_type)
+    if not box_tickets:
+        return pred_df, info
+
+    existing = set(pred_df["買い目"].astype(str).tolist())
+    box_tickets = [t for t in box_tickets if t not in existing and not _ticket_contains_same_parts(t)]
+
+    if not box_tickets:
+        return pred_df, info
+
+    extra_df = _make_extra_ticket_rows(
+        pred_df,
+        box_tickets[:6],
+        reason=reason + f" / BOX={','.join(map(str, box_cars))}",
+        rank_label="穴",
+    )
+
+    if extra_df.empty:
+        return pred_df, info
+
+    if "買い目タイプ" in extra_df.columns:
+        extra_df["買い目タイプ"] = "準穴"
+
+    # BOXと分かるように補助列を追加
+    if "買い目タイプ" not in pred_df.columns:
+        pred_df = pred_df.copy()
+        pred_df["買い目タイプ"] = ""
+
+    out = pd.concat([pred_df, extra_df], ignore_index=True)
+    out = out.drop_duplicates(subset=["買い目"], keep="first").reset_index(drop=True)
+
+    info["added"] = len(out) - len(pred_df)
     return out, info
 
 
@@ -3468,6 +3685,16 @@ with p1:
             )
             selection_info["single_break_added"] = break_single_info.get("added", 0)
             selection_info["single_break_reasons"] = " / ".join(break_single_info.get("reasons", []))
+
+            pred_df, box_info = add_ai_box_tickets(
+                pred_df,
+                current_df,
+                ticket_type=ticket_type,
+                prediction_style=prediction_style,
+            )
+            selection_info["box_added"] = box_info.get("added", 0)
+            selection_info["box_cars"] = ",".join(map(str, box_info.get("box_cars", [])))
+            selection_info["box_reason"] = box_info.get("reason", "")
             st.session_state["selection_info"] = selection_info
 
             pred_df = apply_rank_based_amounts(pred_df, unit_bet)
