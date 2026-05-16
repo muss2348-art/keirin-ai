@@ -887,44 +887,90 @@ def apply_70_20_10_amounts(out: pd.DataFrame, unit_bet: int) -> pd.DataFrame:
     return out
 
 
+def calc_hit_confidence(row) -> float:
+    cols = [
+        "的中率",
+        "予想的中率",
+        "信頼度",
+        "AI信頼度",
+        "confidence",
+        "prob",
+    ]
+
+    for c in cols:
+        if c in row.index:
+            try:
+                v = float(str(row.get(c, 0)).replace("%", ""))
+                if 0 < v <= 1:
+                    v *= 100
+                return v
+            except:
+                pass
+
+    return 0.0
+
+
 def apply_rank_based_amounts(pred_df: pd.DataFrame, unit_bet: int) -> pd.DataFrame:
     if pred_df is None or pred_df.empty:
         return pred_df
 
-    # ここで必ずROI連動ランクを再判定する
-    out = apply_roi_ticket_ranking(pred_df)
-    total_budget = int(unit_bet) * len(out)
+    out = apply_roi_ticket_ranking(pred_df.copy())
 
-    if "買い目ランク" not in out.columns:
-        out["買い目ランク"] = "抑え"
+    if "購入金額" not in out.columns:
+        out["購入金額"] = unit_bet
 
-    if "厚張り指数" not in out.columns:
-        out["厚張り指数"] = 1.0
+    amounts = []
 
-    rank_weight = {
-        "熱🔥": 3.0,
-        "堅": 2.1,
-        "穴": 1.7,
-        "抑え": 1.0,
-    }
-
-    weights = []
     for _, row in out.iterrows():
-        rank_label = str(row.get("買い目ランク", "抑え"))
-        thick_score = safe_float(row.get("厚張り指数", 1.0), 1.0)
-        # 紐抜け対策AIは必ず薄く抑える
-        if str(row.get("紐抜け対策AI", "")) == "ON":
-            weight = 0.75
+
+        rank = str(row.get("買い目ランク", "抑え"))
+        ai_eval = str(row.get("AI評価", ""))
+        ev = safe_float(row.get("期待値", 0), 0)
+        hit = calc_hit_confidence(row)
+
+        amount = unit_bet
+
+        # 保険系は厚張り禁止
+        if (
+            "BOX" in ai_eval
+            or "紐抜け" in ai_eval
+            or "保険" in ai_eval
+        ):
+            amount = unit_bet
+
+        # 熱🔥
+        elif (
+            rank == "熱🔥"
+            and hit >= 35
+            and ev >= 105
+        ):
+            amount = unit_bet * 3
+
+        # 堅
+        elif (
+            rank == "堅"
+            and hit >= 28
+            and ev >= 100
+        ):
+            amount = unit_bet * 2
+
         else:
-            weight = rank_weight.get(rank_label, 1.0) * max(thick_score, 0.1)
-        weights.append(weight)
+            amount = unit_bet
 
-    total_weight = sum(weights)
-    unit = max(100, int(unit_bet))
+        amounts.append(int(amount))
 
-    if total_weight <= 0:
-        out["購入金額"] = unit
-        return out
+    out["購入金額"] = amounts
+
+    ev_num = pd.to_numeric(
+        out.get("期待値", 0),
+        errors="coerce"
+    ).fillna(0)
+
+    out["期待回収額(目安)"] = (
+        ev_num / 100.0 * out["購入金額"]
+    ).round(0)
+
+    return out
 
     amounts = []
     for weight in weights:
