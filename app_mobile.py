@@ -1,7 +1,7 @@
 # app.py
 # -*- coding: utf-8 -*-
-# 旧ロジック寄せ_BOX任意版
-# 紐抜け対策AI ON/OFF 追加版
+# 旧ロジック寄せ_BOX任意版 v33（G3並び取得補正・厚張り厳選AI）
+# 紐抜け対策AI ON/OFF + G3並び取得補正 + 厚張り厳選AI 追加版
 
 import re
 import csv
@@ -29,7 +29,7 @@ st.set_page_config(
     layout="centered",
 )
 
-st.caption("✅ mobile 旧ロジック寄せ_BOX任意版 v31（紐抜け対策AI ON/OFF追加）")
+st.caption("✅ mobile 旧ロジック寄せ_BOX任意版 v33（G3並び取得補正・厚張り厳選AI）")
 
 HEADERS = {
     "User-Agent": (
@@ -2306,7 +2306,20 @@ def extract_lineup_window(page_text: str):
     return windows[0] if windows else ""
 
 
-def parse_lineup_candidate_string(candidate: str):
+
+def _is_fragmented_single_lineup(groups) -> bool:
+    """G3/通常戦の並び自動取得で、1/2/3/4/5/6/7 のような誤検出を弾く。"""
+    if not groups:
+        return False
+    return len(groups) >= 6 and all(len(g) == 1 for g in groups)
+
+
+def _looks_like_girls_race_text(text: str) -> bool:
+    s = normalize_text(text)
+    return any(x in s for x in ["ガールズ", "L級", "女子", "GIRLS", "Girls"])
+
+
+def parse_lineup_candidate_string(candidate: str, allow_all_single: bool = False):
     groups = parse_lineup_groups(candidate)
     if not groups:
         return None
@@ -2319,10 +2332,15 @@ def parse_lineup_candidate_string(candidate: str):
     if set(flat) != expected:
         return None
 
+    # G3/通常戦で、HTML中の数字を拾って「1 / 2 / 3...」になる誤検出を防ぐ。
+    # ガールズっぽいページだけ全単騎を許可する。
+    if _is_fragmented_single_lineup(groups) and not allow_all_single:
+        return None
+
     return groups_to_lineup_string(groups)
 
 
-def _lineup_from_token_window(text: str):
+def _lineup_from_token_window(text: str, allow_all_single: bool = False):
     """区切りや / がある近辺から、余計な数字を除いて並びを復元する保険。"""
     s = normalize_text(text)
 
@@ -2333,7 +2351,7 @@ def _lineup_from_token_window(text: str):
     for pat in pretty_patterns:
         for m in pat.finditer(s):
             cand = normalize_text(m.group(1)).replace("→", "-")
-            parsed = parse_lineup_candidate_string(cand)
+            parsed = parse_lineup_candidate_string(cand, allow_all_single=allow_all_single)
             if parsed:
                 return parsed
 
@@ -2360,31 +2378,37 @@ def _lineup_from_token_window(text: str):
         if len(flat) in (5, 6, 7, 9) and len(set(flat)) == len(flat):
             expected = set(range(1, len(flat) + 1))
             if set(flat) == expected:
+                if _is_fragmented_single_lineup(groups) and not allow_all_single:
+                    return None
                 return groups_to_lineup_string(groups)
 
-    nums = [int(t) for t in tokens if re.fullmatch(r"[1-9]", t)]
-    for n in (9, 7, 6, 5):
-        if len(nums) < n:
-            continue
-        expected = set(range(1, n + 1))
-        for i in range(0, len(nums) - n + 1):
-            chunk = nums[i:i + n]
-            if len(set(chunk)) == n and set(chunk) == expected:
-                return groups_to_lineup_string([[x] for x in chunk])
+    # v33: 最後の保険として数字列だけから「全単騎」を作る処理は、G3で誤検出が多いため原則禁止。
+    # ガールズ判定のあるページだけ許可する。
+    if allow_all_single:
+        nums = [int(t) for t in tokens if re.fullmatch(r"[1-9]", t)]
+        for n in (9, 7, 6, 5):
+            if len(nums) < n:
+                continue
+            expected = set(range(1, n + 1))
+            for i in range(0, len(nums) - n + 1):
+                chunk = nums[i:i + n]
+                if len(set(chunk)) == n and set(chunk) == expected:
+                    return groups_to_lineup_string([[x] for x in chunk])
 
     return None
 
 
 def parse_lineup_from_page_text(page_text: str):
     s = normalize_text(page_text)
+    allow_all_single = _looks_like_girls_race_text(s)
 
     windows = extract_lineup_windows(s)
     for window in windows:
-        parsed = _lineup_from_token_window(window)
+        parsed = _lineup_from_token_window(window, allow_all_single=allow_all_single)
         if parsed:
             return parsed
 
-    parsed = _lineup_from_token_window(s)
+    parsed = _lineup_from_token_window(s, allow_all_single=allow_all_single)
     if parsed:
         return parsed
 
@@ -2416,7 +2440,7 @@ def fetch_lineup_from_winticket(url: str):
 
             if lineup:
                 st.session_state["lineup_debug_info"] = {
-                    "source_type": "multi_candidate_url_lineup_parse_v3",
+                    "source_type": "multi_candidate_url_lineup_parse_v33_g3_guard",
                     "candidate_results": debug_items,
                 }
                 return lineup
@@ -2425,7 +2449,7 @@ def fetch_lineup_from_winticket(url: str):
             debug_items.append({"url": target_url, "error": str(e)})
 
     st.session_state["lineup_debug_info"] = {
-        "source_type": "multi_candidate_url_lineup_parse_v3",
+        "source_type": "multi_candidate_url_lineup_parse_v33_g3_guard",
         "candidate_results": debug_items,
     }
     raise ValueError("URLから並びを抽出できませんでした。デバッグの lineup_windows_preview を貼ってください。")
