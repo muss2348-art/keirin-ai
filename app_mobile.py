@@ -1,6 +1,6 @@
 # app.py
 # -*- coding: utf-8 -*-
-# 旧ロジック寄せ_BOX任意版 v33（G3並び取得補正・厚張り厳選AI）
+# 旧ロジック寄せ_BOX任意版 v34（G3並び取得補正・厚張り厳選AI）
 # 紐抜け対策AI ON/OFF + G3並び取得補正 + 厚張り厳選AI 追加版
 
 import re
@@ -29,7 +29,7 @@ st.set_page_config(
     layout="centered",
 )
 
-st.caption("✅ mobile 旧ロジック寄せ_BOX任意版 v33（G3並び取得補正・厚張り厳選AI）")
+st.caption("✅ mobile 旧ロジック寄せ_BOX任意版 v34（G3並び取得補正・厚張り厳選AI）")
 
 HEADERS = {
     "User-Agent": (
@@ -2375,18 +2375,19 @@ def _lineup_from_token_window(text: str, allow_all_single: bool = False):
             groups.append(current)
 
         flat = list(itertools.chain.from_iterable(groups))
-        if len(flat) in (5, 6, 7, 9) and len(set(flat)) == len(flat):
+        # G3の8車立ても許可する
+        if len(flat) in (5, 6, 7, 8, 9) and len(set(flat)) == len(flat):
             expected = set(range(1, len(flat) + 1))
             if set(flat) == expected:
                 if _is_fragmented_single_lineup(groups) and not allow_all_single:
                     return None
                 return groups_to_lineup_string(groups)
 
-    # v33: 最後の保険として数字列だけから「全単騎」を作る処理は、G3で誤検出が多いため原則禁止。
+    # v34: 最後の保険として数字列だけから「全単騎」を作る処理は、G3で誤検出が多いため原則禁止。
     # ガールズ判定のあるページだけ許可する。
     if allow_all_single:
         nums = [int(t) for t in tokens if re.fullmatch(r"[1-9]", t)]
-        for n in (9, 7, 6, 5):
+        for n in (9, 8, 7, 6, 5):
             if len(nums) < n:
                 continue
             expected = set(range(1, n + 1))
@@ -2440,7 +2441,7 @@ def fetch_lineup_from_winticket(url: str):
 
             if lineup:
                 st.session_state["lineup_debug_info"] = {
-                    "source_type": "multi_candidate_url_lineup_parse_v33_g3_guard",
+                    "source_type": "multi_candidate_url_lineup_parse_v34_g3_guard_8car",
                     "candidate_results": debug_items,
                 }
                 return lineup
@@ -2449,7 +2450,7 @@ def fetch_lineup_from_winticket(url: str):
             debug_items.append({"url": target_url, "error": str(e)})
 
     st.session_state["lineup_debug_info"] = {
-        "source_type": "multi_candidate_url_lineup_parse_v33_g3_guard",
+        "source_type": "multi_candidate_url_lineup_parse_v34_g3_guard_8car",
         "candidate_results": debug_items,
     }
     raise ValueError("URLから並びを抽出できませんでした。デバッグの lineup_windows_preview を貼ってください。")
