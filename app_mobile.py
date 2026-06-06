@@ -1,6 +1,6 @@
 # app.py
 # -*- coding: utf-8 -*-
-# 旧ロジック寄せ_BOX任意版 v38（勝率自動補完安全版・ライン50千切れ50）
+# 旧ロジック寄せ_BOX任意版 v39（勝率自動取得修正版・ライン50千切れ50）
 # 紐抜け対策AI ON/OFF + G3並び取得補正 + 厚張り厳選AI 追加版
 
 import re
@@ -29,7 +29,7 @@ st.set_page_config(
     layout="centered",
 )
 
-st.caption("✅ mobile 旧ロジック寄せ_BOX任意版 v38（勝率自動補完安全版・ライン50千切れ50）")
+st.caption("✅ mobile 旧ロジック寄せ_BOX任意版 v39（勝率自動取得修正版・ライン50千切れ50）")
 
 HEADERS = {
     "User-Agent": (
@@ -2708,8 +2708,16 @@ def _rate_value(v) -> float:
 
 
 def _extract_rates_from_player_row_text(text: str, score: float = 0.0, style: str = "") -> tuple:
+    """
+    WINTICKET本文から勝率/2連対率/3連対率を拾う。
+    WINTICKETの出走表は、脚質の後ろに
+    逃/捲/差/マ/1着/2着/3着/着外/勝率/2連対率/3連対率/ギヤ倍率
+    の順で数字が並ぶため、ギヤ倍率の直前3つを優先して拾う。
+    """
     try:
         s = normalize_text(text)
+
+        # まずラベル付き表記があればそれを使う
         for pat in [
             r"勝率\s*([0-9]{1,3}(?:\.[0-9]+)?)\s*(?:2連対率|二連対率|連対率)\s*([0-9]{1,3}(?:\.[0-9]+)?)\s*(?:3連対率|三連対率)\s*([0-9]{1,3}(?:\.[0-9]+)?)",
             r"1着率\s*([0-9]{1,3}(?:\.[0-9]+)?)\s*2連対率\s*([0-9]{1,3}(?:\.[0-9]+)?)\s*3連対率\s*([0-9]{1,3}(?:\.[0-9]+)?)",
@@ -2718,36 +2726,46 @@ def _extract_rates_from_player_row_text(text: str, score: float = 0.0, style: st
             if m:
                 return (_rate_value(m.group(1)), _rate_value(m.group(2)), _rate_value(m.group(3)))
 
+        # ギヤ倍率 3.xx の直前までを対象にする
+        gear_match = re.search(r"\s([2-5]\.\d{2})\s", s)
+        target = s[:gear_match.start()] if gear_match else s
+
+        # 脚質が取れている場合、脚質以降の数字列の最後3つを勝率系として扱う
+        if style and style in ["逃", "捲", "追", "両", "自"]:
+            pos = target.find(style)
+            if pos != -1:
+                after_style = target[pos + len(style):]
+                nums = re.findall(r"(?<!\d)([0-9]{1,3}(?:\.[0-9]+)?)(?!\d)", after_style)
+                vals = [_rate_value(x) for x in nums]
+                vals = [v for v in vals if 0.0 <= v <= 100.0]
+                if len(vals) >= 3:
+                    return (vals[-3], vals[-2], vals[-1])
+
+        # 脚質が空の場合は、得点以降〜ギヤ直前の数字列の最後3つ
         if score and 40 <= score <= 130:
             score_patterns = [re.escape(str(score))]
-            if float(score).is_integer():
-                score_patterns.append(rf"{int(score)}(?:\.0+)?")
             try:
                 score_patterns.append(re.escape(f"{float(score):.2f}"))
+                score_patterns.append(re.escape(f"{float(score):.3f}"))
             except Exception:
                 pass
+            if float(score).is_integer():
+                score_patterns.append(rf"{int(score)}(?:\.0+)?")
 
             for sp in score_patterns:
-                m = re.search(
-                    rf"{sp}\s+([0-9]{{1,3}}(?:\.[0-9]+)?)\s+([0-9]{{1,3}}(?:\.[0-9]+)?)\s+([0-9]{{1,3}}(?:\.[0-9]+)?)(?:\s+(?:逃|捲|追|両|自))?",
-                    s,
-                )
-                if m:
-                    vals = [_rate_value(m.group(i)) for i in [1, 2, 3]]
-                    if any(v > 0 for v in vals):
-                        return tuple(vals)
+                m = re.search(sp, target)
+                if not m:
+                    continue
+                after_score = target[m.end():]
+                nums = re.findall(r"(?<!\d)([0-9]{1,3}(?:\.[0-9]+)?)(?!\d)", after_score)
+                vals = [_rate_value(x) for x in nums]
+                vals = [v for v in vals if 0.0 <= v <= 100.0]
+                if len(vals) >= 3:
+                    return (vals[-3], vals[-2], vals[-1])
 
-        if style:
-            m = re.search(
-                rf"([0-9]{{1,3}}(?:\.[0-9]+)?)\s+([0-9]{{1,3}}(?:\.[0-9]+)?)\s+([0-9]{{1,3}}(?:\.[0-9]+)?)\s+{re.escape(style)}",
-                s,
-            )
-            if m:
-                vals = [_rate_value(m.group(i)) for i in [1, 2, 3]]
-                if any(v > 0 for v in vals):
-                    return tuple(vals)
     except Exception:
         pass
+
     return (0.0, 0.0, 0.0)
 
 
