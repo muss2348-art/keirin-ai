@@ -29,7 +29,7 @@ st.set_page_config(
     layout="centered",
 )
 
-st.caption("✅ mobile 旧ロジック寄せ_BOX任意版 v36（元取得維持・勝率追加・ライン50千切れ50）")
+st.caption("✅ mobile 旧ロジック寄せ_BOX任意版 v37（WINTICKET勝率自動取得・脚質維持）")
 
 HEADERS = {
     "User-Agent": (
