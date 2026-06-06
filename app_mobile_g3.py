@@ -1,6 +1,6 @@
 # app.py
 # -*- coding: utf-8 -*-
-# 旧ロジック寄せ_BOX任意版 v35.2（選手取得元戻し）
+# 旧ロジック寄せ_BOX任意版 v36（元取得維持・勝率追加・ライン50千切れ50）
 # 紐抜け対策AI ON/OFF + G3並び取得補正 + 厚張り厳選AI 追加版
 
 import re
@@ -29,7 +29,7 @@ st.set_page_config(
     layout="centered",
 )
 
-st.caption("✅ mobile 旧ロジック寄せ_BOX任意版 v35.2（選手取得元戻し）")
+st.caption("✅ mobile 旧ロジック寄せ_BOX任意版 v36（元取得維持・勝率追加・ライン50千切れ50）")
 
 HEADERS = {
     "User-Agent": (
@@ -1316,116 +1316,45 @@ def add_single_and_break_pattern_tickets(
 
 
 # =========================================================
-# 勝率取得 + ライン50%/千切れ50%補正
+# 勝率機能 + ライン50%/千切れ50%補正
 # =========================================================
-def _pick_win_rate_from_keys(d: dict, keys: List[str], default=0.0) -> float:
-    """JSON内の勝率/連対率系キーを広めに拾う。0.35なら35扱い。"""
-    try:
-        v = _pick_from_keys(d, keys)
-    except Exception:
-        v = None
-    val = safe_float(v, default)
-    if 0 < val <= 1:
-        val *= 100.0
-    if val < 0:
-        val = 0.0
-    if val > 100:
-        # まれに別数値を拾った時は捨てる
-        return 0.0
-    return round(val, 1)
-
-
-def extract_rate_stats_from_text_block(block: str) -> dict:
-    """
-    テキストブロックから勝率/2連対率/3連対率を拾う保険。
-    表記ゆれを許容。
-    """
-    b = normalize_text(block)
-    out = {"勝率": 0.0, "2連対率": 0.0, "3連対率": 0.0}
-
-    patterns = {
-        "勝率": [
-            r"勝率\s*([0-9]{1,3}(?:\.[0-9]+)?)",
-            r"1着率\s*([0-9]{1,3}(?:\.[0-9]+)?)",
-            r"一着率\s*([0-9]{1,3}(?:\.[0-9]+)?)",
-        ],
-        "2連対率": [
-            r"2連対率\s*([0-9]{1,3}(?:\.[0-9]+)?)",
-            r"二連対率\s*([0-9]{1,3}(?:\.[0-9]+)?)",
-            r"連対率\s*([0-9]{1,3}(?:\.[0-9]+)?)",
-        ],
-        "3連対率": [
-            r"3連対率\s*([0-9]{1,3}(?:\.[0-9]+)?)",
-            r"三連対率\s*([0-9]{1,3}(?:\.[0-9]+)?)",
-        ],
-    }
-
-    for key, pats in patterns.items():
-        for pat in pats:
-            m = re.search(pat, b)
-            if m:
-                val = safe_float(m.group(1), 0.0)
-                if 0 < val <= 1:
-                    val *= 100.0
-                if 0 <= val <= 100:
-                    out[key] = round(val, 1)
-                    break
-
-    return out
-
-
-def enrich_player_rates_from_page_text(players_df: pd.DataFrame, page_text: str) -> pd.DataFrame:
-    """
-    JSONで勝率が取れなかった時、ページテキストから名前付近を見て補完する。
-    完全取得できなくても落とさない。
-    """
-    if players_df is None or players_df.empty:
-        return players_df
-
-    df = players_df.copy()
-    for col in ["勝率", "2連対率", "3連対率"]:
-        if col not in df.columns:
-            df[col] = 0.0
-
-    s = normalize_text(page_text)
-    for idx, row in df.iterrows():
-        name = normalize_text(row.get("選手名", ""))
-        if not name:
-            continue
-        pos = s.find(name)
-        if pos == -1:
-            continue
-        block = s[max(0, pos - 250):pos + 900]
-        stats = extract_rate_stats_from_text_block(block)
-        for col in ["勝率", "2連対率", "3連対率"]:
-            if safe_float(df.at[idx, col], 0.0) <= 0 and stats.get(col, 0.0) > 0:
-                df.at[idx, col] = stats[col]
-
-    return df
-
-
 def _rate_score(profile: dict) -> float:
-    """勝率系を0〜100基準で紐/展開評価に使う。"""
+    """
+    勝率/2連対率/3連対率を0〜100基準で評価。
+    取得できていない場合は0で安全に扱う。
+    """
     win = safe_float(profile.get("勝率", 0), 0.0)
     quin = safe_float(profile.get("2連対率", 0), 0.0)
     trio = safe_float(profile.get("3連対率", 0), 0.0)
+
+    # 0.35形式で入ってきた場合だけ35扱い
+    if 0 < win <= 1:
+        win *= 100
+    if 0 < quin <= 1:
+        quin *= 100
+    if 0 < trio <= 1:
+        trio *= 100
+
     return win * 0.55 + quin * 0.32 + trio * 0.18
 
 
 def _line_bias_penalty(profile: dict) -> float:
-    """ラインに寄りすぎないため、ライン後方の過剰評価を少し落とす。"""
+    """
+    ライン後方を強く拾いすぎないための軽い減点。
+    ラインは見るが、過信しない。
+    """
     line_pos = safe_int(profile.get("ライン順", 0), 0)
     if line_pos >= 4:
         return 6.0
     if line_pos == 3:
-        return 3.5
+        return 3.0
     return 0.0
 
 
 def _break_side_score(profile: dict, appear_count: int = 0, used_count: int = 0) -> float:
     """
     千切れ/別線/紐ズレ向きの相手スコア。
-    ライン評価だけに寄らず、勝率・連対率・B/H・自力・単騎を強めに見る。
+    ライン評価だけに寄らず、勝率・B/H・自力・単騎を評価する。
     """
     point = safe_float(profile.get("得点", 0), 0.0)
     b = safe_int(profile.get("B", 0), 0)
@@ -1437,19 +1366,21 @@ def _break_side_score(profile: dict, appear_count: int = 0, used_count: int = 0)
     score = 0.0
     score += point * 0.42
     score += _rate_score(profile) * 0.75
-    score += appear_count * 3.2
+    score += appear_count * 3.0
 
-    # ライン番手評価は残すが、以前より弱め
+    # ライン番手評価は残すが弱める
     if line_pos == 2:
         score += 4.0
     elif line_pos == 3:
         score += 2.0
 
-    # 千切れ/別線寄り: 自力・B/H・単騎の評価を上げる
+    # 千切れ/別線寄り
     score += min(b, 18) * 1.2
     score += min(h, 18) * 0.75
+
     if "逃" in style or "捲" in style or "両" in style or "自" in style:
         score += 6.0
+
     if is_single and (b >= 7 or h >= 7 or point >= 86 or _rate_score(profile) >= 32):
         score += 5.0
 
@@ -1470,7 +1401,8 @@ def add_line50_break50_tickets(
     ライン半分・千切れ半分へ寄せる補正。
     - 軸は既存予想から維持
     - 2着3着に別線/自力/勝率高めを薄く追加
-    - 追加は最大2〜4点、ランクは抑え
+    - 最大2〜4点
+    - 追加ランクは抑え
     """
     info = {"added": 0, "axis": "", "break_cars": [], "reason": ""}
     if pred_df is None or pred_df.empty or "買い目" not in pred_df.columns:
@@ -1484,16 +1416,16 @@ def add_line50_break50_tickets(
     base_tickets = pred_df["買い目"].astype(str).tolist()
     existing = set(base_tickets)
 
-    heads, seconds, thirds = [], [], []
+    heads = []
+    seconds = []
     used_counts = {}
+
     for t in base_tickets[:14]:
         parts = _ticket_parts(t)
         if len(parts) >= 1:
             heads.append(parts[0])
         if len(parts) >= 2:
             seconds.append(parts[1])
-        if len(parts) >= 3:
-            thirds.append(parts[2])
         for p in parts:
             used_counts[p] = used_counts.get(p, 0) + 1
 
@@ -1503,14 +1435,15 @@ def add_line50_break50_tickets(
 
     axis1 = pd.Series(heads).value_counts().index[0]
     axis2 = pd.Series(seconds).value_counts().index[0] if seconds else None
+    axis_line = str(profiles.get(axis1, {}).get("ライン", ""))
+
     info["axis"] = str(axis1)
 
-    # 軸ラインを推定。別線候補を優先的に拾う。
-    axis_line = str(profiles.get(axis1, {}).get("ライン", ""))
     scored = []
     for car, prof in profiles.items():
         if car == axis1:
             continue
+
         line_no = str(prof.get("ライン", ""))
         score = _break_side_score(
             prof,
@@ -1518,9 +1451,11 @@ def add_line50_break50_tickets(
             used_count=used_counts.get(car, 0),
         )
 
-        # 同ライン後方ばかり拾わない。別線/単騎をやや優先。
+        # 同ライン後方ばかり拾わない
         if line_no and axis_line and line_no == axis_line and safe_int(prof.get("ライン順", 0), 0) >= 3:
             score -= 5.0
+
+        # 別線・単騎を少し優先
         if (line_no != axis_line) or prof.get("単騎"):
             score += 4.0
 
@@ -1531,30 +1466,34 @@ def add_line50_break50_tickets(
     info["break_cars"] = break_cars
 
     extra_tickets = []
+
     if str(ticket_type) == "2車単":
         for h in break_cars:
-            # 2車単は軸1着中心＋強い別線は裏を少し
             patterns = [f"{axis1}-{h}"]
-            if profiles.get(h, {}).get("単騎") or _rate_score(profiles.get(h, {})) >= 35:
+
+            prof = profiles.get(h, {})
+            if prof.get("単騎") or _rate_score(prof) >= 35 or safe_int(prof.get("B", 0), 0) >= 10:
                 patterns.append(f"{h}-{axis1}")
+
             for t in patterns:
                 if t not in existing and not _ticket_contains_same_parts(t):
                     extra_tickets.append(t)
+
     else:
-        # 3連単: 軸1着を残しつつ、2着3着の千切れ/別線を追加
         for h in break_cars:
+            patterns = []
+
             if axis2 and h not in [axis1, axis2]:
-                patterns = [
-                    f"{axis1}-{axis2}-{h}",
-                    f"{axis1}-{h}-{axis2}",
-                ]
+                patterns.append(f"{axis1}-{axis2}-{h}")
+                patterns.append(f"{axis1}-{h}-{axis2}")
             else:
                 other = None
                 for c, _ in scored:
                     if c not in [axis1, h]:
                         other = c
                         break
-                patterns = [f"{axis1}-{h}-{other}"] if other else []
+                if other:
+                    patterns.append(f"{axis1}-{h}-{other}")
 
             # 強い別線/単騎なら頭ズレも1点だけ
             prof = profiles.get(h, {})
@@ -1574,12 +1513,14 @@ def add_line50_break50_tickets(
         return pred_df, info
 
     reason = f"ライン50/千切れ50補正: 軸{axis1} / 別線候補={','.join(map(str, break_cars[:3]))}"
+
     extra_df = _make_extra_ticket_rows(
         pred_df,
         extra_tickets,
         reason=reason,
         rank_label="抑え",
     )
+
     if extra_df.empty:
         return pred_df, info
 
@@ -1589,6 +1530,7 @@ def add_line50_break50_tickets(
         extra_df["AI評価"] = 64
     if "期待値" in extra_df.columns:
         extra_df["期待値"] = 101
+
     extra_df["ライン50千切れ50"] = "ON"
 
     out = pd.concat([pred_df, extra_df], ignore_index=True)
@@ -3592,15 +3534,6 @@ def apply_players_to_df(df: pd.DataFrame, players_df: pd.DataFrame) -> pd.DataFr
         if style in ["逃", "捲", "追", "両", "自"]:
             out.loc[out["車番"] == car, "脚質"] = style
 
-        # 勝率系は取れている場合だけ反映。取れなくても選手情報取得の成功判定には影響させない。
-        for rate_col in ["勝率", "2連対率", "3連対率"]:
-            if rate_col in row.index:
-                rate_val = safe_float(row.get(rate_col, 0.0), 0.0)
-                if 0.0 <= rate_val <= 100.0:
-                    if rate_col not in out.columns:
-                        out[rate_col] = 0.0
-                    out.loc[out["車番"] == car, rate_col] = rate_val
-
     return out
 
 def extract_script_texts(html: str):
@@ -4081,23 +4014,20 @@ st.subheader("出走表入力")
 df = get_df().sort_values("車番").reset_index(drop=True)
 
 with st.form("runner_form"):
-    header = st.columns([0.7, 1.5, 1.0, 0.8, 0.8, 0.8, 0.9, 0.7, 0.7, 0.7])
+    header = st.columns([0.8, 1.8, 1.2, 1.0, 0.8, 0.8, 0.8])
     header[0].markdown("**車番**")
     header[1].markdown("**選手名**")
     header[2].markdown("**競走得点**")
-    header[3].markdown("**勝率**")
-    header[4].markdown("**2連対**")
-    header[5].markdown("**3連対**")
-    header[6].markdown("**脚質**")
-    header[7].markdown("**ライン**")
-    header[8].markdown("**順**")
-    header[9].markdown("**単騎**")
+    header[3].markdown("**脚質**")
+    header[4].markdown("**ライン**")
+    header[5].markdown("**ライン順**")
+    header[6].markdown("**単騎**")
 
     updated_rows = []
     style_options = ["", "逃", "捲", "追", "両", "自"]
 
     for i, row in df.iterrows():
-        cols = st.columns([0.7, 1.5, 1.0, 0.8, 0.8, 0.8, 0.9, 0.7, 0.7, 0.7])
+        cols = st.columns([0.8, 1.8, 1.2, 1.0, 0.8, 0.8, 0.8])
 
         car_num = cols[0].number_input(
             f"車番_{i}", min_value=1, max_value=9, value=int(row["車番"]), step=1, key=widget_key("car", i)
@@ -4106,26 +4036,17 @@ with st.form("runner_form"):
         score = cols[2].number_input(
             f"競走得点_{i}", min_value=0.0, max_value=200.0, value=float(row["競走得点"]), step=0.1, key=widget_key("score", i)
         )
-        win_rate = cols[3].number_input(
-            f"勝率_{i}", min_value=0.0, max_value=100.0, value=float(row.get("勝率", 0.0)), step=0.1, key=widget_key("win_rate", i)
-        )
-        quinella_rate = cols[4].number_input(
-            f"2連対率_{i}", min_value=0.0, max_value=100.0, value=float(row.get("2連対率", 0.0)), step=0.1, key=widget_key("quinella_rate", i)
-        )
-        trio_rate = cols[5].number_input(
-            f"3連対率_{i}", min_value=0.0, max_value=100.0, value=float(row.get("3連対率", 0.0)), step=0.1, key=widget_key("trio_rate", i)
-        )
         style_now = str(row["脚質"]) if str(row["脚質"]) in style_options else ""
-        style = cols[6].selectbox(
+        style = cols[3].selectbox(
             f"脚質_{i}", options=style_options, index=style_options.index(style_now), key=widget_key("style", i)
         )
-        line_id = cols[7].number_input(
+        line_id = cols[4].number_input(
             f"ライン_{i}", min_value=0, max_value=9, value=int(row["ライン"]), step=1, key=widget_key("line", i)
         )
-        line_order = cols[8].number_input(
+        line_order = cols[5].number_input(
             f"ライン順_{i}", min_value=0, max_value=9, value=int(row["ライン順"]), step=1, key=widget_key("line_order", i)
         )
-        single = cols[9].selectbox(
+        single = cols[6].selectbox(
             f"単騎_{i}", options=[0, 1], index=1 if int(row["単騎"]) == 1 else 0, key=widget_key("single", i)
         )
 
@@ -4134,9 +4055,9 @@ with st.form("runner_form"):
                 "車番": car_num,
                 "選手名": name,
                 "競走得点": score,
-                "勝率": win_rate,
-                "2連対率": quinella_rate,
-                "3連対率": trio_rate,
+                "勝率": float(row.get("勝率", 0.0)),
+                "2連対率": float(row.get("2連対率", 0.0)),
+                "3連対率": float(row.get("3連対率", 0.0)),
                 "脚質": style,
                 "ライン": line_id,
                 "ライン順": line_order,
@@ -4150,6 +4071,69 @@ if submit_rows:
     st.session_state["race_rows"] = updated_rows
     st.session_state["message"] = "出走表を反映しました。"
     st.rerun()
+
+with st.expander("勝率・連対率を入力する（任意）", expanded=False):
+    rate_df = get_df().sort_values("車番").reset_index(drop=True)
+
+    with st.form("rate_form"):
+        rate_rows = []
+        rate_header = st.columns([0.8, 1.5, 1.0, 1.0, 1.0])
+        rate_header[0].markdown("**車番**")
+        rate_header[1].markdown("**選手名**")
+        rate_header[2].markdown("**勝率**")
+        rate_header[3].markdown("**2連対**")
+        rate_header[4].markdown("**3連対**")
+
+        for i, row in rate_df.iterrows():
+            rcols = st.columns([0.8, 1.5, 1.0, 1.0, 1.0])
+            rcols[0].markdown(str(int(row["車番"])))
+            rcols[1].markdown(str(row["選手名"]))
+
+            win_rate = rcols[2].number_input(
+                f"勝率_rate_{i}",
+                min_value=0.0,
+                max_value=100.0,
+                value=float(row.get("勝率", 0.0)),
+                step=0.1,
+                key=widget_key("rate_win", i),
+            )
+            quinella_rate = rcols[3].number_input(
+                f"2連対_rate_{i}",
+                min_value=0.0,
+                max_value=100.0,
+                value=float(row.get("2連対率", 0.0)),
+                step=0.1,
+                key=widget_key("rate_quinella", i),
+            )
+            trio_rate = rcols[4].number_input(
+                f"3連対_rate_{i}",
+                min_value=0.0,
+                max_value=100.0,
+                value=float(row.get("3連対率", 0.0)),
+                step=0.1,
+                key=widget_key("rate_trio", i),
+            )
+
+            rate_rows.append(
+                {
+                    "車番": int(row["車番"]),
+                    "勝率": win_rate,
+                    "2連対率": quinella_rate,
+                    "3連対率": trio_rate,
+                }
+            )
+
+        submit_rates = st.form_submit_button("勝率系を反映", use_container_width=True)
+
+    if submit_rates:
+        base_df = get_df()
+        for rr in rate_rows:
+            car = int(rr["車番"])
+            for rate_col in ["勝率", "2連対率", "3連対率"]:
+                base_df.loc[base_df["車番"] == car, rate_col] = float(rr[rate_col])
+        set_df(base_df)
+        st.session_state["message"] = "勝率・連対率を反映しました。"
+        st.rerun()
 
 st.markdown("---")
 st.subheader("現在の出走表")
