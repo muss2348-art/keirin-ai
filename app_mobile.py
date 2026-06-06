@@ -234,6 +234,21 @@ def extract_rates_from_text_block(block: str) -> dict:
 # =========================================================
 # 発信用 厳選AI / 新ランク判定
 # =========================================================
+
+
+def make_rate_search_block(text: str, match, before: int = 900, after: int = 1400) -> str:
+    """
+    勝率系は選手名・脚質の短い一致文字列内に無いことが多いため、
+    正規表現で当たった場所の前後を広めに切り出して探す。
+    脚質取得ロジック自体は変更しない。
+    """
+    try:
+        start = max(0, match.start() - int(before))
+        end = min(len(text), match.end() + int(after))
+        return text[start:end]
+    except Exception:
+        return str(text or "")
+
 def detect_roi_column(df: pd.DataFrame):
     """
     ROI/回収率系の列を優先して探す。
@@ -2934,7 +2949,8 @@ def extract_single_player_by_car(text: str, car: int):
         style = normalize_text(m.group(6))
 
         if is_valid_player_name(name) and 40.0 <= score <= 130.0 and style in ["逃", "捲", "追", "両", "自"]:
-            rates = extract_rates_from_text_block(m.group(0))
+            rate_block = make_rate_search_block(s, m)
+            rates = extract_rates_from_text_block(rate_block)
             return {
                 "車番": car,
                 "選手名": name,
@@ -2967,7 +2983,8 @@ def extract_single_player_by_car(text: str, car: int):
         style = extract_style_from_block(block)
 
         if is_valid_player_name(name) and 40.0 <= score <= 130.0 and style in ["逃", "捲", "追", "両", "自"]:
-            rates = extract_rates_from_text_block(block)
+            rate_block = make_rate_search_block(s, mm)
+            rates = extract_rates_from_text_block(rate_block)
             return {
                 "車番": car,
                 "選手名": name,
@@ -3016,7 +3033,8 @@ def extract_players_with_regex(text: str, num_riders: int):
             and style in ["逃", "捲", "追", "両", "自"]
         ):
             seen.add(car)
-            rates = extract_rates_from_text_block(m.group(0))
+            rate_block = make_rate_search_block(s, m)
+            rates = extract_rates_from_text_block(rate_block)
             rows.append({
                 "車番": car,
                 "選手名": name,
@@ -3353,7 +3371,8 @@ def extract_players_from_json_html(html: str, num_riders: int):
                 score = safe_float(m.group(2), 0.0)
                 style = _normalize_style_value(m.group(3))
                 if is_valid_player_name(name) and 40 <= score <= 130 and style:
-                    rates = extract_rates_from_text_block(m.group(0))
+                    rate_block = make_rate_search_block(nt, m)
+                    rates = extract_rates_from_text_block(rate_block)
                     item = {
                         "車番": car,
                         "選手名": name,
@@ -3440,7 +3459,8 @@ def extract_players_loose_entries(text: str, num_riders: int):
             score = safe_float(m.group(2), 0.0)
             style = normalize_text(m.group(3))
             if is_valid_player_name(name) and 40 <= score <= 130 and style in ["逃", "捲", "追", "両", "自"]:
-                rates = extract_rates_from_text_block(m.group(0))
+                rate_block = make_rate_search_block(s, m)
+                rates = extract_rates_from_text_block(rate_block)
                 item = {
                     "車番": car,
                     "選手名": name,
