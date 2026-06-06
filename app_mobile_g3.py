@@ -1,6 +1,6 @@
 # app.py
 # -*- coding: utf-8 -*-
-# 旧ロジック寄せ_BOX任意版 v37（勝率自動取得・ライン50千切れ50）
+# 旧ロジック寄せ_BOX任意版 v38（勝率自動補完安全版・ライン50千切れ50）
 # 紐抜け対策AI ON/OFF + G3並び取得補正 + 厚張り厳選AI 追加版
 
 import re
@@ -29,7 +29,7 @@ st.set_page_config(
     layout="centered",
 )
 
-st.caption("✅ mobile 旧ロジック寄せ_BOX任意版 v37（勝率自動取得・ライン50千切れ50）")
+st.caption("✅ mobile 旧ロジック寄せ_BOX任意版 v38（勝率自動補完安全版・ライン50千切れ50）")
 
 HEADERS = {
     "User-Agent": (
@@ -2693,6 +2693,115 @@ def fetch_lineup_from_winticket(url: str):
     raise ValueError("URLから並びを抽出できませんでした。デバッグの lineup_windows_preview を貼ってください。")
 
 
+
+# =========================================================
+# 勝率自動補完（選手取得後の後処理専用）
+# =========================================================
+def _rate_value(v) -> float:
+    val = safe_float(v, 0.0)
+    if 0 < val <= 1:
+        val *= 100.0
+    if val < 0 or val > 100:
+        return 0.0
+    return round(val, 1)
+
+
+def _extract_rates_from_player_row_text(text: str, score: float = 0.0, style: str = "") -> tuple:
+    try:
+        s = normalize_text(text)
+        for pat in [
+            r"勝率\s*([0-9]{1,3}(?:\.[0-9]+)?)\s*(?:2連対率|二連対率|連対率)\s*([0-9]{1,3}(?:\.[0-9]+)?)\s*(?:3連対率|三連対率)\s*([0-9]{1,3}(?:\.[0-9]+)?)",
+            r"1着率\s*([0-9]{1,3}(?:\.[0-9]+)?)\s*2連対率\s*([0-9]{1,3}(?:\.[0-9]+)?)\s*3連対率\s*([0-9]{1,3}(?:\.[0-9]+)?)",
+        ]:
+            m = re.search(pat, s)
+            if m:
+                return (_rate_value(m.group(1)), _rate_value(m.group(2)), _rate_value(m.group(3)))
+
+        if score and 40 <= score <= 130:
+            score_patterns = [re.escape(str(score))]
+            if float(score).is_integer():
+                score_patterns.append(rf"{int(score)}(?:\.0+)?")
+            try:
+                score_patterns.append(re.escape(f"{float(score):.2f}"))
+            except Exception:
+                pass
+
+            for sp in score_patterns:
+                m = re.search(
+                    rf"{sp}\s+([0-9]{{1,3}}(?:\.[0-9]+)?)\s+([0-9]{{1,3}}(?:\.[0-9]+)?)\s+([0-9]{{1,3}}(?:\.[0-9]+)?)(?:\s+(?:逃|捲|追|両|自))?",
+                    s,
+                )
+                if m:
+                    vals = [_rate_value(m.group(i)) for i in [1, 2, 3]]
+                    if any(v > 0 for v in vals):
+                        return tuple(vals)
+
+        if style:
+            m = re.search(
+                rf"([0-9]{{1,3}}(?:\.[0-9]+)?)\s+([0-9]{{1,3}}(?:\.[0-9]+)?)\s+([0-9]{{1,3}}(?:\.[0-9]+)?)\s+{re.escape(style)}",
+                s,
+            )
+            if m:
+                vals = [_rate_value(m.group(i)) for i in [1, 2, 3]]
+                if any(v > 0 for v in vals):
+                    return tuple(vals)
+    except Exception:
+        pass
+    return (0.0, 0.0, 0.0)
+
+
+def enrich_rates_for_players_from_url(players_df: pd.DataFrame, url: str) -> Tuple[pd.DataFrame, dict]:
+    info = {"rate_auto": "not_run", "filled": 0, "error": ""}
+    if players_df is None or players_df.empty:
+        return players_df, info
+
+    out = players_df.copy()
+    for col in ["勝率", "2連対率", "3連対率"]:
+        if col not in out.columns:
+            out[col] = 0.0
+
+    try:
+        page = fetch_page_response(url)
+        s = normalize_text(page.get("text", ""))
+
+        filled = 0
+        for idx, row in out.iterrows():
+            name = normalize_text(row.get("選手名", ""))
+            if not name:
+                continue
+            pos = s.find(name)
+            if pos == -1:
+                continue
+
+            block = s[max(0, pos - 250):pos + 1200]
+            score = safe_float(row.get("競走得点", 0.0), 0.0)
+            style = normalize_text(row.get("脚質", ""))
+
+            win_rate, quinella_rate, trio_rate = _extract_rates_from_player_row_text(block, score=score, style=style)
+
+            changed = False
+            if safe_float(out.at[idx, "勝率"], 0.0) <= 0 and win_rate > 0:
+                out.at[idx, "勝率"] = win_rate
+                changed = True
+            if safe_float(out.at[idx, "2連対率"], 0.0) <= 0 and quinella_rate > 0:
+                out.at[idx, "2連対率"] = quinella_rate
+                changed = True
+            if safe_float(out.at[idx, "3連対率"], 0.0) <= 0 and trio_rate > 0:
+                out.at[idx, "3連対率"] = trio_rate
+                changed = True
+
+            if changed:
+                filled += 1
+
+        info["rate_auto"] = "ok"
+        info["filled"] = filled
+        return out, info
+    except Exception as e:
+        info["rate_auto"] = "failed"
+        info["error"] = str(e)
+        return out, info
+
+
 # =========================================================
 # 選手情報抽出
 # =========================================================
@@ -2926,28 +3035,8 @@ def extract_players_with_regex(text: str, num_riders: int):
             and style in ["逃", "捲", "追", "両", "自"]
         ):
             seen.add(car)
-            win_rate = _rate_value(m.group(8))
-            quinella_rate = _rate_value(m.group(9))
-            trio_rate = _rate_value(m.group(10))
-            rows.append({
-                "車番": car,
-                "選手名": name,
-                "競走得点": score,
-                "勝率": win_rate,
-                "2連対率": quinella_rate,
-                "3連対率": trio_rate,
-                "脚質": style,
-            })
-            preview.append({
-                "車番": car,
-                "選手名": name,
-                "競走得点": score,
-                "勝率": win_rate,
-                "2連対率": quinella_rate,
-                "3連対率": trio_rate,
-                "脚質": style,
-                "source": "entry_pattern",
-            })
+            rows.append({"車番": car, "選手名": name, "競走得点": score, "脚質": style})
+            preview.append({"車番": car, "選手名": name, "競走得点": score, "脚質": style, "source": "entry_pattern"})
 
     if len(rows) < num_riders:
         for car in range(1, num_riders + 1):
@@ -2962,9 +3051,6 @@ def extract_players_with_regex(text: str, num_riders: int):
                         "車番": hit["車番"],
                         "選手名": hit["選手名"],
                         "競走得点": hit["競走得点"],
-                        "勝率": hit.get("勝率", 0.0),
-                        "2連対率": hit.get("2連対率", 0.0),
-                        "3連対率": hit.get("3連対率", 0.0),
                         "脚質": hit["脚質"],
                     }
                 )
@@ -3017,93 +3103,6 @@ def extract_players_by_car_blocks(text: str, num_riders: int):
 
 
 
-
-def _rate_value(v) -> float:
-    """勝率系を0〜100へ丸める。"""
-    val = safe_float(v, 0.0)
-    if 0 < val <= 1:
-        val *= 100.0
-    if val < 0 or val > 100:
-        return 0.0
-    return round(val, 1)
-
-
-def _extract_rates_from_player_row_text(text: str, score: float = 0.0, style: str = "") -> tuple:
-    """WINTICKET出走表の選手行テキストから勝率 / 2連対率 / 3連対率を拾う。"""
-    s = normalize_text(text)
-
-    label_patterns = [
-        r"勝率\s*([0-9]{1,3}(?:\.[0-9]+)?)\s*(?:2連対率|二連対率|連対率)\s*([0-9]{1,3}(?:\.[0-9]+)?)\s*(?:3連対率|三連対率)\s*([0-9]{1,3}(?:\.[0-9]+)?)",
-        r"1着率\s*([0-9]{1,3}(?:\.[0-9]+)?)\s*2連対率\s*([0-9]{1,3}(?:\.[0-9]+)?)\s*3連対率\s*([0-9]{1,3}(?:\.[0-9]+)?)",
-    ]
-    for pat in label_patterns:
-        m = re.search(pat, s)
-        if m:
-            return (_rate_value(m.group(1)), _rate_value(m.group(2)), _rate_value(m.group(3)))
-
-    if score and 40 <= score <= 130:
-        if float(score).is_integer():
-            score_pat = rf"{int(score)}(?:\.0+)?"
-        else:
-            score_pat = re.escape(str(score))
-        m = re.search(
-            rf"{score_pat}\s+([0-9]{{1,3}}(?:\.[0-9]+)?)\s+([0-9]{{1,3}}(?:\.[0-9]+)?)\s+([0-9]{{1,3}}(?:\.[0-9]+)?)(?:\s+(?:逃|捲|追|両|自))?",
-            s,
-        )
-        if m:
-            vals = [_rate_value(m.group(i)) for i in [1, 2, 3]]
-            if any(v > 0 for v in vals):
-                return tuple(vals)
-
-    if style:
-        m = re.search(
-            rf"([0-9]{{1,3}}(?:\.[0-9]+)?)\s+([0-9]{{1,3}}(?:\.[0-9]+)?)\s+([0-9]{{1,3}}(?:\.[0-9]+)?)\s+{re.escape(style)}",
-            s,
-        )
-        if m:
-            vals = [_rate_value(m.group(i)) for i in [1, 2, 3]]
-            if any(v > 0 for v in vals):
-                return tuple(vals)
-
-    return (0.0, 0.0, 0.0)
-
-
-def enrich_rates_by_player_text(players_df: pd.DataFrame, page_text: str) -> pd.DataFrame:
-    """既存の選手情報取得は壊さず、取得後に勝率系だけ補完する。"""
-    if players_df is None or players_df.empty:
-        return players_df
-
-    df = players_df.copy()
-    for col in ["勝率", "2連対率", "3連対率"]:
-        if col not in df.columns:
-            df[col] = 0.0
-
-    s = normalize_text(page_text)
-    for idx, row in df.iterrows():
-        name = normalize_text(row.get("選手名", ""))
-        if not name:
-            continue
-
-        pos = s.find(name)
-        if pos == -1:
-            continue
-
-        block = s[max(0, pos - 180):pos + 950]
-        score = safe_float(row.get("競走得点", 0.0), 0.0)
-        style = normalize_text(row.get("脚質", ""))
-
-        win_rate, quinella_rate, trio_rate = _extract_rates_from_player_row_text(block, score=score, style=style)
-
-        if safe_float(row.get("勝率", 0.0), 0.0) <= 0 and win_rate > 0:
-            df.at[idx, "勝率"] = win_rate
-        if safe_float(row.get("2連対率", 0.0), 0.0) <= 0 and quinella_rate > 0:
-            df.at[idx, "2連対率"] = quinella_rate
-        if safe_float(row.get("3連対率", 0.0), 0.0) <= 0 and trio_rate > 0:
-            df.at[idx, "3連対率"] = trio_rate
-
-    return df
-
-
 def normalize_player_df(players_df: pd.DataFrame, num_riders: int) -> pd.DataFrame:
     """
     通常版・選手取得の最終安全整形 v8。
@@ -3114,7 +3113,7 @@ def normalize_player_df(players_df: pd.DataFrame, num_riders: int) -> pd.DataFra
     - 同じ車番は品質の高い候補を採用
     - 同じ選手名が複数車番に出た場合は、品質の高い方を残す
     """
-    cols = ["車番", "選手名", "競走得点", "勝率", "2連対率", "3連対率", "脚質"]
+    cols = ["車番", "選手名", "競走得点", "脚質"]
     if players_df is None or players_df.empty:
         return pd.DataFrame(columns=cols)
 
@@ -3129,8 +3128,6 @@ def normalize_player_df(players_df: pd.DataFrame, num_riders: int) -> pd.DataFra
     df["車番"] = pd.to_numeric(df["車番"], errors="coerce").fillna(0).astype(int)
     df["選手名"] = df["選手名"].astype(str).map(normalize_text)
     df["競走得点"] = pd.to_numeric(df["競走得点"], errors="coerce").fillna(0.0)
-    for rate_col in ["勝率", "2連対率", "3連対率"]:
-        df[rate_col] = pd.to_numeric(df[rate_col], errors="coerce").fillna(0.0).clip(lower=0.0, upper=100.0)
     df["脚質"] = df["脚質"].astype(str).map(normalize_text)
     df["source"] = df["source"].astype(str)
 
@@ -4050,12 +4047,18 @@ with c4:
         try:
             df = get_df()
             players_df, debug_info = fetch_players_from_winticket(url, len(df))
+
+            # 勝率系は選手取得成功後にだけ安全補完。失敗しても選手取得は成功扱い。
+            players_df, rate_info = enrich_rates_for_players_from_url(players_df, url)
+            if isinstance(debug_info, dict):
+                debug_info["rate_auto_info"] = rate_info
+
             df = apply_players_to_df(df, players_df)
             set_df(df)
 
             st.session_state["player_debug_info"] = debug_info
             st.session_state["widget_ver"] = st.session_state.get("widget_ver", 0) + 1
-            st.session_state["message"] = f"選手情報取得成功: {len(players_df)}人"
+            st.session_state["message"] = f"選手情報取得成功: {len(players_df)}人 / 勝率補完: {rate_info.get('filled', 0)}人"
             st.rerun()
         except Exception as e:
             st.session_state["player_debug_info"] = {"error": str(e)}
