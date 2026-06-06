@@ -1,6 +1,6 @@
 # app.py
 # -*- coding: utf-8 -*-
-# 旧ロジック寄せ_BOX任意版 v39（勝率自動取得修正版・ライン50千切れ50）
+# 旧ロジック寄せ_BOX任意版 v40（勝率直接取得版・ライン50千切れ50）
 # 紐抜け対策AI ON/OFF + G3並び取得補正 + 厚張り厳選AI 追加版
 
 import re
@@ -29,7 +29,7 @@ st.set_page_config(
     layout="centered",
 )
 
-st.caption("✅ mobile 旧ロジック寄せ_BOX任意版 v39（勝率自動取得修正版・ライン50千切れ50）")
+st.caption("✅ mobile 旧ロジック寄せ_BOX任意版 v40（勝率直接取得版・ライン50千切れ50）")
 
 HEADERS = {
     "User-Agent": (
@@ -2695,8 +2695,9 @@ def fetch_lineup_from_winticket(url: str):
 
 
 
+
 # =========================================================
-# 勝率自動補完（選手取得後の後処理専用）
+# 勝率自動取得 直接反映版
 # =========================================================
 def _rate_value(v) -> float:
     val = safe_float(v, 0.0)
@@ -2707,70 +2708,13 @@ def _rate_value(v) -> float:
     return round(val, 1)
 
 
-def _extract_rates_from_player_row_text(text: str, score: float = 0.0, style: str = "") -> tuple:
+def extract_rates_direct_by_name(page_text: str, players_df: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
     """
-    WINTICKET本文から勝率/2連対率/3連対率を拾う。
-    WINTICKETの出走表は、脚質の後ろに
-    逃/捲/差/マ/1着/2着/3着/着外/勝率/2連対率/3連対率/ギヤ倍率
-    の順で数字が並ぶため、ギヤ倍率の直前3つを優先して拾う。
+    WINTICKET本文から選手名を起点に勝率/2連対率/3連対率を直接拾う。
+    既存の選手取得・脚質取得には触らず、最後に勝率列だけ埋める。
     """
-    try:
-        s = normalize_text(text)
+    info = {"rate_auto": "direct", "filled": 0, "details": [], "error": ""}
 
-        # まずラベル付き表記があればそれを使う
-        for pat in [
-            r"勝率\s*([0-9]{1,3}(?:\.[0-9]+)?)\s*(?:2連対率|二連対率|連対率)\s*([0-9]{1,3}(?:\.[0-9]+)?)\s*(?:3連対率|三連対率)\s*([0-9]{1,3}(?:\.[0-9]+)?)",
-            r"1着率\s*([0-9]{1,3}(?:\.[0-9]+)?)\s*2連対率\s*([0-9]{1,3}(?:\.[0-9]+)?)\s*3連対率\s*([0-9]{1,3}(?:\.[0-9]+)?)",
-        ]:
-            m = re.search(pat, s)
-            if m:
-                return (_rate_value(m.group(1)), _rate_value(m.group(2)), _rate_value(m.group(3)))
-
-        # ギヤ倍率 3.xx の直前までを対象にする
-        gear_match = re.search(r"\s([2-5]\.\d{2})\s", s)
-        target = s[:gear_match.start()] if gear_match else s
-
-        # 脚質が取れている場合、脚質以降の数字列の最後3つを勝率系として扱う
-        if style and style in ["逃", "捲", "追", "両", "自"]:
-            pos = target.find(style)
-            if pos != -1:
-                after_style = target[pos + len(style):]
-                nums = re.findall(r"(?<!\d)([0-9]{1,3}(?:\.[0-9]+)?)(?!\d)", after_style)
-                vals = [_rate_value(x) for x in nums]
-                vals = [v for v in vals if 0.0 <= v <= 100.0]
-                if len(vals) >= 3:
-                    return (vals[-3], vals[-2], vals[-1])
-
-        # 脚質が空の場合は、得点以降〜ギヤ直前の数字列の最後3つ
-        if score and 40 <= score <= 130:
-            score_patterns = [re.escape(str(score))]
-            try:
-                score_patterns.append(re.escape(f"{float(score):.2f}"))
-                score_patterns.append(re.escape(f"{float(score):.3f}"))
-            except Exception:
-                pass
-            if float(score).is_integer():
-                score_patterns.append(rf"{int(score)}(?:\.0+)?")
-
-            for sp in score_patterns:
-                m = re.search(sp, target)
-                if not m:
-                    continue
-                after_score = target[m.end():]
-                nums = re.findall(r"(?<!\d)([0-9]{1,3}(?:\.[0-9]+)?)(?!\d)", after_score)
-                vals = [_rate_value(x) for x in nums]
-                vals = [v for v in vals if 0.0 <= v <= 100.0]
-                if len(vals) >= 3:
-                    return (vals[-3], vals[-2], vals[-1])
-
-    except Exception:
-        pass
-
-    return (0.0, 0.0, 0.0)
-
-
-def enrich_rates_for_players_from_url(players_df: pd.DataFrame, url: str) -> Tuple[pd.DataFrame, dict]:
-    info = {"rate_auto": "not_run", "filled": 0, "error": ""}
     if players_df is None or players_df.empty:
         return players_df, info
 
@@ -2780,45 +2724,122 @@ def enrich_rates_for_players_from_url(players_df: pd.DataFrame, url: str) -> Tup
             out[col] = 0.0
 
     try:
-        page = fetch_page_response(url)
-        s = normalize_text(page.get("text", ""))
+        s = normalize_text(page_text)
 
-        filled = 0
+        # 出走表本体だけに絞る。オッズやフッターの数字混入を避ける。
+        start_pos = s.find("AI 競走得点")
+        if start_pos == -1:
+            start_pos = s.find("競走得点")
+        end_pos = s.find("並び予想", start_pos if start_pos != -1 else 0)
+        if start_pos != -1:
+            table_text = s[start_pos:end_pos if end_pos != -1 else len(s)]
+        else:
+            table_text = s
+
         for idx, row in out.iterrows():
             name = normalize_text(row.get("選手名", ""))
-            if not name:
-                continue
-            pos = s.find(name)
-            if pos == -1:
-                continue
-
-            block = s[max(0, pos - 250):pos + 1200]
             score = safe_float(row.get("競走得点", 0.0), 0.0)
             style = normalize_text(row.get("脚質", ""))
 
-            win_rate, quinella_rate, trio_rate = _extract_rates_from_player_row_text(block, score=score, style=style)
+            if not name:
+                continue
 
-            changed = False
-            if safe_float(out.at[idx, "勝率"], 0.0) <= 0 and win_rate > 0:
-                out.at[idx, "勝率"] = win_rate
-                changed = True
-            if safe_float(out.at[idx, "2連対率"], 0.0) <= 0 and quinella_rate > 0:
-                out.at[idx, "2連対率"] = quinella_rate
-                changed = True
-            if safe_float(out.at[idx, "3連対率"], 0.0) <= 0 and trio_rate > 0:
-                out.at[idx, "3連対率"] = trio_rate
-                changed = True
+            pos = table_text.find(name)
+            if pos == -1:
+                # WINTICKET側で姓名の一部だけになることがあるので前方2〜3文字でも保険
+                key = name[:3] if len(name) >= 3 else name
+                pos = table_text.find(key)
+            if pos == -1:
+                continue
 
-            if changed:
-                filled += 1
+            # 次の選手名までを1選手ブロックにする
+            next_positions = []
+            for _, r2 in out.iterrows():
+                other = normalize_text(r2.get("選手名", ""))
+                if other and other != name:
+                    p = table_text.find(other, pos + 1)
+                    if p != -1:
+                        next_positions.append(p)
 
-        info["rate_auto"] = "ok"
-        info["filled"] = filled
+            block_end = min(next_positions) if next_positions else pos + 900
+            block = table_text[pos:block_end]
+
+            # ギヤ倍率の直前3つが 勝率/2連対率/3連対率
+            # 例: ... 3 19 0.0 12.0 24.0 3.92 コメント
+            gear = re.search(r"([2-5]\.\d{2})", block)
+            before_gear = block[:gear.start()] if gear else block
+
+            # 得点より後ろだけを見る
+            if score and score > 0:
+                score_patterns = []
+                try:
+                    score_patterns.extend([
+                        re.escape(str(score)),
+                        re.escape(f"{float(score):.2f}"),
+                        re.escape(f"{float(score):.3f}"),
+                    ])
+                    if float(score).is_integer():
+                        score_patterns.append(rf"{int(score)}(?:\.0+)?")
+                except Exception:
+                    score_patterns.append(re.escape(str(score)))
+
+                cut = before_gear
+                for sp in score_patterns:
+                    m = re.search(sp, before_gear)
+                    if m:
+                        cut = before_gear[m.end():]
+                        break
+            else:
+                cut = before_gear
+
+            # 脚質がある場合は脚質より後ろに絞る
+            if style and style in ["逃", "捲", "追", "両", "自"]:
+                p_style = cut.find(style)
+                if p_style != -1:
+                    cut = cut[p_style + len(style):]
+
+            nums = re.findall(r"(?<!\d)([0-9]{1,3}(?:\.[0-9]+)?)(?!\d)", cut)
+            vals = [_rate_value(x) for x in nums]
+            vals = [v for v in vals if 0.0 <= v <= 100.0]
+
+            if len(vals) < 3:
+                info["details"].append({"name": name, "status": "not_found", "nums": nums[-8:]})
+                continue
+
+            win_rate, quinella_rate, trio_rate = vals[-3], vals[-2], vals[-1]
+
+            out.at[idx, "勝率"] = win_rate
+            out.at[idx, "2連対率"] = quinella_rate
+            out.at[idx, "3連対率"] = trio_rate
+            info["filled"] += 1
+            info["details"].append(
+                {
+                    "name": name,
+                    "勝率": win_rate,
+                    "2連対率": quinella_rate,
+                    "3連対率": trio_rate,
+                }
+            )
+
         return out, info
+
     except Exception as e:
         info["rate_auto"] = "failed"
         info["error"] = str(e)
         return out, info
+
+
+def enrich_rates_for_players_from_url(players_df: pd.DataFrame, url: str) -> Tuple[pd.DataFrame, dict]:
+    """
+    URLからページ本文を取り直して、勝率系だけ直接反映。
+    失敗しても players_df はそのまま返す。
+    """
+    try:
+        page = fetch_page_response(url)
+        return extract_rates_direct_by_name(page.get("text", ""), players_df)
+    except Exception as e:
+        info = {"rate_auto": "failed", "filled": 0, "details": [], "error": str(e)}
+        return players_df, info
 
 
 # =========================================================
