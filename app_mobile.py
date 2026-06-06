@@ -29,7 +29,7 @@ st.set_page_config(
     layout="centered",
 )
 
-st.caption("✅ mobile 旧ロジック寄せ_BOX任意版 v37.6（WINTICKET勝率3列取得・脚質維持）")
+st.caption("✅ mobile 旧ロジック寄せ_BOX任意版 v37.7（勝率誤取得ガード・脚質維持）")
 
 HEADERS = {
     "User-Agent": (
@@ -196,38 +196,38 @@ def _extract_labeled_rate(text: str, labels) -> float:
     return 0.0
 
 
-
-def rates_from_triplet(win, quinella, trio) -> dict:
-    """
-    WINTICKETの出走表テキストでは、
-    「競走得点 勝率 2連対率 3連対率 脚質」の順で数値だけ並ぶ場合がある。
-    ラベルが消えた状態でも、この3列を勝率系として保持する。
-    """
-    return {
-        "勝率": normalize_rate_value(win, 0.0),
-        "2連対率": normalize_rate_value(quinella, 0.0),
-        "3連対率": normalize_rate_value(trio, 0.0),
-    }
-
 def extract_rates_from_text_block(block: str) -> dict:
-    """選手1人分らしいブロックから勝率・2連対率・3連対率を抽出する保険。"""
+    """
+    選手1人分らしいブロックから勝率・2連対率・3連対率を抽出する保険。
+
+    v37.7修正:
+    - 「100 / 2 / 2」など、級班・期別・B/H・着順系の数字を勝率として誤取得しない
+    - ラベル付き、または「勝率 2連対率 3連対率」の直後に%/小数で並ぶ場合だけ採用
+    - 取れない時は0のままにして、間違った数字を入れない
+    """
     s = normalize_text(block)
     rates = {
-        "勝率": _extract_labeled_rate(s, ["勝率", "1着率", "一着率", "勝ち上がり率"]),
-        "2連対率": _extract_labeled_rate(s, ["2連対率", "二連対率", "連対率", "2着内率", "二着内率"]),
-        "3連対率": _extract_labeled_rate(s, ["3連対率", "三連対率", "3着内率", "三着内率"]),
+        "勝率": _extract_labeled_rate(s, ["勝率", "1着率", "一着率", "1着", "一着"]),
+        "2連対率": _extract_labeled_rate(s, ["2連対率", "二連対率", "2連対", "二連対", "連対率"]),
+        "3連対率": _extract_labeled_rate(s, ["3連対率", "三連対率", "3連対", "三連対", "3着内率", "三着内率"]),
     }
 
-    # WINTICKETの表が「勝率 2連対率 3連対率 12.3 34.5 56.7」のように並ぶ時の保険
-    if not any(rates.values()) and re.search(r"勝率.*(?:2連対率|二連対率).*(?:3連対率|三連対率)", s):
+    if any(v > 0 for v in rates.values()):
+        return rates
+
+    # 危険な「最後の数字3つ」取得は廃止。
+    # ラベル行の直後に 11.3% 22.6% 32.1% のような%/小数が並ぶ時だけ拾う。
+    header = re.search(r"(?:勝率|1着率).*?(?:2連対率|二連対率|2連対).*?(?:3連対率|三連対率|3連対)(.{0,120})", s)
+    if header:
+        tail = header.group(1)
         nums = []
-        for m in re.finditer(r"([0-9]{1,3}(?:\.[0-9]{1,2})?)\s*[%％]?", s):
-            v = normalize_rate_value(m.group(1), -1)
-            if 0 <= v <= 100:
-                nums.append(v)
-        # 競走得点(80〜100台)が混じることがあるため、後方の3個を優先
+        for m in re.finditer(r"([0-9]{1,2}(?:\.[0-9]{1,2})?|100(?:\.0{1,2})?)\s*[%％]", tail):
+            nums.append(normalize_rate_value(m.group(1), 0.0))
+        if len(nums) < 3:
+            # %が無い場合は、小数を含む数値だけ採用。整数の100/2/2誤爆を避ける。
+            nums = [normalize_rate_value(m.group(1), 0.0) for m in re.finditer(r"([0-9]{1,2}\.[0-9]{1,2}|100\.0{1,2})", tail)]
         if len(nums) >= 3:
-            rates["勝率"], rates["2連対率"], rates["3連対率"] = nums[-3], nums[-2], nums[-1]
+            rates["勝率"], rates["2連対率"], rates["3連対率"] = nums[0], nums[1], nums[2]
 
     return rates
 
@@ -2998,9 +2998,7 @@ def extract_players_with_regex(text: str, num_riders: int):
         rf'(\d{{2,3}})期\s+'
         rf'(?:本命|対抗|単穴|連下)?\s*'
         rf'([4-9]\d(?:\.\d{{1,3}})?)\s+'
-        rf'([0-9]{{1,3}}(?:\.\d{{1,2}})?)\s+'
-        rf'([0-9]{{1,3}}(?:\.\d{{1,2}})?)\s+'
-        rf'([0-9]{{1,3}}(?:\.\d{{1,2}})?)\s+'
+        rf'(\d+)\s+(\d+)\s+(\d+)\s+'
         rf'(逃|捲|追|両|自)'
     )
 
@@ -3018,13 +3016,7 @@ def extract_players_with_regex(text: str, num_riders: int):
             and style in ["逃", "捲", "追", "両", "自"]
         ):
             seen.add(car)
-            # ここが重要:
-            # WINTICKETの画面テキストはラベルが落ちて
-            # 「得点 勝率 2連対率 3連対率 脚質」の3数値だけ残ることがある。
-            rates = rates_from_triplet(m.group(8), m.group(9), m.group(10))
-            if not any(rates.values()):
-                rates = extract_rates_from_text_block(m.group(0))
-
+            rates = extract_rates_from_text_block(m.group(0))
             rows.append({
                 "車番": car,
                 "選手名": name,
@@ -3033,7 +3025,6 @@ def extract_players_with_regex(text: str, num_riders: int):
                 "2連対率": rates.get("2連対率", 0.0),
                 "3連対率": rates.get("3連対率", 0.0),
                 "脚質": style,
-                "source": "entry_pattern_rate_triplet",
             })
             preview.append({
                 "車番": car,
@@ -3043,7 +3034,7 @@ def extract_players_with_regex(text: str, num_riders: int):
                 "2連対率": rates.get("2連対率", 0.0),
                 "3連対率": rates.get("3連対率", 0.0),
                 "脚質": style,
-                "source": "entry_pattern_rate_triplet",
+                "source": "entry_pattern",
             })
 
     if len(rows) < num_riders:
@@ -3073,11 +3064,7 @@ def extract_players_with_regex(text: str, num_riders: int):
     df = pd.DataFrame(rows).groupby("車番", as_index=False).first()
     df = df.sort_values("車番").reset_index(drop=True)
 
-    cols = ["車番", "選手名", "競走得点", "勝率", "2連対率", "3連対率", "脚質"]
-    if "source" in df.columns:
-        cols.append("source")
-
-    return df[cols].copy(), {
+    return df[["車番", "選手名", "競走得点", "勝率", "2連対率", "3連対率", "脚質"]].copy(), {
         "hit_count": len(df),
         "preview": preview[:12],
     }
@@ -3113,11 +3100,7 @@ def extract_players_by_car_blocks(text: str, num_riders: int):
     df = pd.DataFrame(rows).groupby("車番", as_index=False).first()
     df = df.sort_values("車番").reset_index(drop=True)
 
-    cols = ["車番", "選手名", "競走得点", "勝率", "2連対率", "3連対率", "脚質"]
-    if "source" in df.columns:
-        cols.append("source")
-
-    return df[cols].copy(), {
+    return df[["車番", "選手名", "競走得点", "勝率", "2連対率", "3連対率", "脚質"]].copy(), {
         "hit_count": len(df),
         "preview": preview[:12],
     }
@@ -3171,7 +3154,6 @@ def normalize_player_df(players_df: pd.DataFrame, num_riders: int) -> pd.DataFra
         "json_recursive": 115,
         "html_card": 100,
         "entry_pattern": 90,
-        "entry_pattern_rate_triplet": 98,
         "loose_entry": 75,
         "single_block": 65,
         "car_block_safe": 60,
@@ -3648,10 +3630,6 @@ def fetch_players_from_winticket(url: str, num_riders: int):
                 "loose_hits": len(df_loose),
                 "sequence_hits": len(df_sequence),
                 "final_hits": len(final_df),
-                "rate_hits": int(sum(
-                    1 for _, r in final_df.iterrows()
-                    if any(normalize_rate_value(r.get(c, 0), 0.0) > 0 for c in RATE_COLUMNS)
-                )) if final_df is not None and not final_df.empty else 0,
                 "missing_after": missing,
                 "final_players": final_df.to_dict(orient="records") if not final_df.empty else [],
                 "preview_json": dbg_json.get("preview", [])[:6],
@@ -3678,10 +3656,6 @@ def fetch_players_from_winticket(url: str, num_riders: int):
         "missing": missing,
         "candidate_results": debug_items,
         "final_players": best_df.to_dict(orient="records") if not best_df.empty else [],
-        "rate_hits": int(sum(
-            1 for _, r in best_df.iterrows()
-            if any(normalize_rate_value(r.get(c, 0), 0.0) > 0 for c in RATE_COLUMNS)
-        )) if best_df is not None and not best_df.empty else 0,
     }
 
     if best_df.empty:
@@ -4140,7 +4114,7 @@ with c4:
 
             st.session_state["player_debug_info"] = debug_info
             st.session_state["widget_ver"] = st.session_state.get("widget_ver", 0) + 1
-            st.session_state["message"] = f"選手情報取得成功: {len(players_df)}人"
+            st.session_state["message"] = f"選手情報取得成功: {len(players_df)}人 / 勝率系: {int((players_df[["勝率", "2連対率", "3連対率"]].fillna(0).astype(float).sum(axis=1) > 0).sum())}人"
             st.rerun()
         except Exception as e:
             st.session_state["player_debug_info"] = {"error": str(e)}
