@@ -378,6 +378,72 @@ def extract_rates_for_car_block(text: str, car: int, num_riders: int, style: str
     except Exception:
         return {"勝率": 0.0, "2連対率": 0.0, "3連対率": 0.0}
 
+
+def fill_missing_rates_from_text_by_name(players_df: pd.DataFrame, text: str, num_riders: int) -> pd.DataFrame:
+    """
+    v38.3 最終補完。
+    1〜6番は取れていて7番だけ0になるケース対策。
+    選手名の出現位置から直接その選手行を切り出し、脚質後の勝率列を再解析する。
+    脚質取得・ライン取得は触らず、勝率/2連対率/3連対率だけを0の行に補完する。
+    """
+    if players_df is None or players_df.empty:
+        return players_df
+
+    out = players_df.copy()
+    s = normalize_text(text)
+
+    for idx, row in out.iterrows():
+        try:
+            current_rates = {k: normalize_rate_value(row.get(k, 0.0), 0.0) for k in RATE_COLUMNS}
+            # 2連対率 or 3連対率が入っている行は基本的に成功扱い
+            if current_rates.get("2連対率", 0.0) > 0 or current_rates.get("3連対率", 0.0) > 0:
+                continue
+
+            car = safe_int(row.get("車番", 0), 0)
+            name = normalize_text(row.get("選手名", ""))
+            style = normalize_text(row.get("脚質", ""))
+            if not name:
+                continue
+
+            candidates = []
+
+            # ① 選手名から直接切る。短縮名でも前方一致しやすい。
+            for nm in [name, name[:3], name[:2]]:
+                if len(nm) < 2:
+                    continue
+                m = re.search(re.escape(nm), s)
+                if m:
+                    candidates.append(s[m.start(): min(len(s), m.start() + 650)])
+
+            # ② 車番+名前周辺でも切る。最終車番は次車番が無いので特に有効。
+            if car > 0:
+                pat = re.compile(rf'(?<!\d){car}\s+(?:{car}\s+)?(.{{0,900}})')
+                for m in pat.finditer(s):
+                    blk = m.group(1)
+                    if name and name[:2] not in blk:
+                        continue
+                    candidates.append(blk)
+                    break
+
+            # ③ 最終車番は「並び予想」手前までを最後の保険にする。
+            if car == safe_int(num_riders, 7):
+                m = re.search(rf'(?<!\d){car}\s+(?:{car}\s+)?(.{{0,1200}}?)(?:並び予想|※基本情報|現在、投票|$)', s)
+                if m:
+                    candidates.append(m.group(1))
+
+            for block in candidates:
+                rates = extract_rates_from_winticket_row_block(block, style=style)
+                if not _has_any_rate(rates):
+                    rates = extract_rates_from_text_block(block)
+                if _has_any_rate(rates):
+                    for k in RATE_COLUMNS:
+                        out.at[idx, k] = normalize_rate_value(rates.get(k, 0.0), 0.0)
+                    break
+        except Exception:
+            continue
+
+    return out
+
 def detect_roi_column(df: pd.DataFrame):
     """
     ROI/回収率系の列を優先して探す。
@@ -3167,6 +3233,8 @@ def extract_players_with_regex(text: str, num_riders: int):
         ):
             seen.add(car)
             rates = extract_rates_for_match(s, m, style)
+            if not _has_any_rate(rates):
+                rates = extract_rates_for_car_block(s, car, num_riders, style=style)
             rows.append({
                 "車番": car,
                 "選手名": name,
@@ -3770,6 +3838,7 @@ def fetch_players_from_winticket(url: str, num_riders: int):
             ]
             combined = pd.concat(valid_frames, ignore_index=True) if valid_frames else pd.DataFrame()
             final_df = normalize_player_df(combined, num_riders)
+            final_df = fill_missing_rates_from_text_by_name(final_df, full_text, num_riders)
 
             # 足りない場合は、順番候補で不足車番だけ補完
             if len(final_df) < num_riders and df_sequence is not None and not df_sequence.empty:
@@ -3790,6 +3859,7 @@ def fetch_players_from_winticket(url: str, num_riders: int):
                             pd.concat([final_df, pd.DataFrame(fill_rows)], ignore_index=True),
                             num_riders,
                         )
+                        final_df = fill_missing_rates_from_text_by_name(final_df, full_text, num_riders)
 
             missing = sorted(list(set(range(1, num_riders + 1)) - set(final_df["車番"].astype(int).tolist()))) if not final_df.empty else list(range(1, num_riders + 1))
 
