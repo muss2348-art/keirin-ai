@@ -29,7 +29,7 @@ st.set_page_config(
     layout="centered",
 )
 
-st.caption("✅ mobile 旧ロジック寄せ_BOX任意版 v38.0（WINTICKET勝率行解析・脚質維持）")
+st.caption("✅ mobile 旧ロジック寄せ_BOX任意版 v38.1（WINTICKET勝率行解析・最終車番補正・脚質維持）")
 
 HEADERS = {
     "User-Agent": (
@@ -3039,7 +3039,7 @@ def extract_single_player_by_car(text: str, car: int):
     next_car = car + 1
     block_patterns = []
 
-    if next_car <= 9:
+    if car < num_riders:
         block_patterns.append(re.compile(rf'(?<!\d){car}\s+{car}\s+(.*?)(?=(?<!\d){next_car}\s+{next_car}\s+|$)'))
         block_patterns.append(re.compile(rf'(?<!\d){car}\s+(.*?)(?=(?<!\d){next_car}\s+{next_car}\s+|$)'))
     else:
@@ -3051,7 +3051,7 @@ def extract_single_player_by_car(text: str, car: int):
         if not mm:
             continue
 
-        block = normalize_text(mm.group(1))[:500]
+        block = normalize_text(mm.group(1))[:1200]
         name = extract_name_from_block(block)
         score = extract_score_from_block(block)
         style = extract_style_from_block(block)
