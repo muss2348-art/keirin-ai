@@ -29,7 +29,7 @@ st.set_page_config(
     layout="centered",
 )
 
-st.caption("✅ mobile グレードレース用 v38.3（WINTICKET勝率取得・G3並び補正・脚質維持）")
+st.caption("✅ mobile 旧ロジック寄せ_BOX任意版 v38.4（G3/9車取得補強・勝率取得・脚質維持）")
 
 HEADERS = {
     "User-Agent": (
@@ -2600,7 +2600,7 @@ def init_state(num_riders: int = 7):
 def get_df() -> pd.DataFrame:
     rows = st.session_state.get("race_rows", [])
     if not rows:
-        init_state(9)
+        init_state(7)
         rows = st.session_state.get("race_rows", [])
 
     df = pd.DataFrame(rows)
@@ -3398,6 +3398,7 @@ def normalize_player_df(players_df: pd.DataFrame, num_riders: int) -> pd.DataFra
         "loose_entry": 75,
         "single_block": 65,
         "car_block_safe": 60,
+        "basic_table": 110,
         "sequence_card": 45,
         "sequence_text": 35,
     }
@@ -3703,6 +3704,83 @@ def extract_players_loose_entries(text: str, num_riders: int):
     return df, {"hit_count": len(df), "preview": preview[:20]}
 
 
+def extract_players_from_winticket_basic_table(text: str, num_riders: int):
+    """
+    G3/9車立て補強 v38.4。
+    WINTICKETの「基本情報」行を、車番1〜9の行単位で直接読む。
+    7車立てでは取れていたが、9車立ての8・9番が抜けるケースの保険。
+    脚質取得ロジックは壊さず、取れた候補を統合用に返す。
+    """
+    s = normalize_text(text)
+    rows = []
+    preview = []
+
+    # 基本情報〜並び予想/直近成績あたりを優先。失敗したら全文で見る。
+    sections = []
+    for kw in ["基本情報", "出走表", "選手名"]:
+        pos = s.find(kw)
+        if pos >= 0:
+            sections.append(s[pos:pos + 12000])
+    sections.append(s)
+
+    row_re = re.compile(
+        rf'(?<!\d)'
+        rf'([1-9])\s+(?:\1\s+)?'
+        rf'([一-龥ぁ-んァ-ヶ々]{{2,12}})\s+'
+        rf'({PREF_PATTERN})\s+'
+        rf'([ALS]\d)\s+'
+        rf'(\d{{2}})歳\s+'
+        rf'(\d{{2,3}})期\s+'
+        rf'(?:本命|対抗|単穴|連下)?\s*'
+        rf'([4-9]\d(?:\.\d{{1,3}})?)\s+'
+        rf'(\d+)\s+(\d+)\s+(\d+)\s+'
+        rf'(逃|捲|追|両|自)\s+'
+        rf'(.{{0,260}}?)'
+        rf'(?=(?<!\d)[1-9]\s+(?:[1-9]\s+)?[一-龥ぁ-んァ-ヶ々]{{2,12}}\s+(?:{PREF_PATTERN})\s+[ALS]\d\s+\d{{2}}歳\s+\d{{2,3}}期|並び予想|直近成績|前検|オッズ|$)'
+    )
+
+    seen = set()
+    for sec in sections:
+        for m in row_re.finditer(sec):
+            car = safe_int(m.group(1), 0)
+            if not (1 <= car <= int(num_riders)) or car in seen:
+                continue
+            name = normalize_text(m.group(2))
+            score = safe_float(m.group(7), 0.0)
+            style = normalize_text(m.group(11))
+            if not (is_valid_player_name(name) and 40.0 <= score <= 130.0 and style in ["逃", "捲", "追", "両", "自"]):
+                continue
+
+            block = m.group(0)
+            rates = extract_rates_from_winticket_row_block(block, style=style)
+            if not _has_any_rate(rates):
+                rates = extract_rates_for_car_block(sec, car, num_riders, style=style)
+            if not _has_any_rate(rates):
+                rates = extract_rates_for_car_block(s, car, num_riders, style=style)
+
+            item = {
+                "車番": car,
+                "選手名": name,
+                "競走得点": score,
+                "勝率": rates.get("勝率", 0.0),
+                "2連対率": rates.get("2連対率", 0.0),
+                "3連対率": rates.get("3連対率", 0.0),
+                "脚質": style,
+                "source": "basic_table",
+            }
+            rows.append(item)
+            preview.append(item)
+            seen.add(car)
+
+        if len(seen) >= int(num_riders):
+            break
+
+    if not rows:
+        return pd.DataFrame(columns=["車番", "選手名", "競走得点", "勝率", "2連対率", "3連対率", "脚質"]), {"hit_count": 0, "preview": []}
+    df = normalize_player_df(pd.DataFrame(rows), num_riders)
+    return df, {"hit_count": len(df), "preview": preview[:20]}
+
+
 def merge_player_dfs(base_df: pd.DataFrame, add_df: pd.DataFrame, num_riders=None) -> pd.DataFrame:
     frames = []
     for x in [base_df, add_df]:
@@ -3829,11 +3907,12 @@ def fetch_players_from_winticket(url: str, num_riders: int):
             df_full, dbg_full = extract_players_with_regex(full_text, num_riders)
             df_block, dbg_block = extract_players_by_car_blocks(full_text, num_riders)
             df_loose, dbg_loose = extract_players_loose_entries(full_text, num_riders)
+            df_basic, dbg_basic = extract_players_from_winticket_basic_table(full_text, num_riders)
             df_sequence, seq_preview = extract_sequence_candidates(html, full_text, num_riders)
 
             # まず高精度候補を統合
             valid_frames = [
-                x for x in [df_json, df_cards, df_section, df_full, df_block, df_loose]
+                x for x in [df_json, df_cards, df_section, df_full, df_block, df_loose, df_basic]
                 if x is not None and not x.empty
             ]
             combined = pd.concat(valid_frames, ignore_index=True) if valid_frames else pd.DataFrame()
@@ -3873,6 +3952,7 @@ def fetch_players_from_winticket(url: str, num_riders: int):
                 "full_hits": len(df_full),
                 "block_hits": len(df_block),
                 "loose_hits": len(df_loose),
+                "basic_hits": len(df_basic),
                 "sequence_hits": len(df_sequence),
                 "final_hits": len(final_df),
                 "missing_after": missing,
@@ -3880,6 +3960,7 @@ def fetch_players_from_winticket(url: str, num_riders: int):
                 "preview_json": dbg_json.get("preview", [])[:6],
                 "preview_cards": dbg_cards.get("preview", [])[:6],
                 "preview_regex": (dbg_section.get("preview", [])[:4] + dbg_full.get("preview", [])[:4] + dbg_block.get("preview", [])[:4] + dbg_loose.get("preview", [])[:4]),
+                "preview_basic": dbg_basic.get("preview", [])[:9],
                 "preview_sequence": seq_preview[:8],
                 "section_head": section_text[:300],
             })
@@ -3896,7 +3977,7 @@ def fetch_players_from_winticket(url: str, num_riders: int):
     missing = sorted(list(set(range(1, num_riders + 1)) - set(best_df["車番"].astype(int).tolist()))) if not best_df.empty else list(range(1, num_riders + 1))
 
     debug_info = {
-        "source_type": "winticket_player_auto_v8_safe_normal",
+        "source_type": "winticket_player_auto_v38_4_grade_9car_guard",
         "hit_count": len(best_df),
         "missing": missing,
         "candidate_results": debug_items,
@@ -4208,8 +4289,8 @@ def save_current_prediction(
 # =========================================================
 # UI
 # =========================================================
-st.title("🚴 競輪AI モバイル版 グレードレース用")
-st.caption("モバイル版 / グレードレース用 / 勝率・2連対率・3連対率取得 / G3並び補正 / 学習補正・ROI・見送りAI・賭け金AI")
+st.title("🚴 競輪AI モバイル版")
+st.caption("モバイル版 / 通常版の安全取得ロジック反映 / 学習補正・ROI・見送りAI・賭け金AI")
 
 if "race_rows" not in st.session_state:
     init_state(7)
@@ -4217,13 +4298,13 @@ if "race_rows" not in st.session_state:
 with st.sidebar:
     st.header("設定")
 
-    rider_options = [5, 6, 7, 8, 9]
-    current_num = st.session_state.get("num_riders", 9)
-    current_index = rider_options.index(current_num) if current_num in rider_options else 4
+    rider_options = [5, 6, 7, 9]
+    current_num = st.session_state.get("num_riders", 7)
+    current_index = rider_options.index(current_num) if current_num in rider_options else 2
 
     num_riders = st.radio("車立て", options=rider_options, index=current_index, horizontal=True)
 
-    if num_riders != st.session_state.get("num_riders", 9):
+    if num_riders != st.session_state.get("num_riders", 7):
         init_state(num_riders)
         st.rerun()
 
@@ -4235,7 +4316,7 @@ with st.sidebar:
     st.session_state["ticket_type"] = ticket_type
 
     race_type_options = ["通常", "ガールズ", "G3"]
-    race_type_default = st.session_state.get("race_type", "G3")
+    race_type_default = st.session_state.get("race_type", "通常")
     race_type = st.selectbox(
         "レース種別",
         options=race_type_options,
