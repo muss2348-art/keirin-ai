@@ -29,7 +29,7 @@ st.set_page_config(
     layout="centered",
 )
 
-st.caption("✅ mobile 旧ロジック寄せ_BOX任意版 v37.7（勝率誤取得ガード・脚質維持）")
+st.caption("✅ mobile 旧ロジック寄せ_BOX任意版 v37.9（勝率誤取得停止・脚質維持）")
 
 HEADERS = {
     "User-Agent": (
@@ -177,14 +177,14 @@ def _pick_rate_from_keys(d: dict, keys, default=0.0) -> float:
 
 def _extract_labeled_rate(text: str, labels) -> float:
     """
-    テキストから「勝率 12.3」「勝率12.3%」「1着率 12.3」などを拾う。
-    ラベル近辺だけを見るので、競走得点や期別を勝率として誤取得しにくい。
+    ラベル付きの勝率だけを拾う。
+    v37.9: 「1着」「2連対」など短い語は、車番・着順・B/Hの数字を拾いやすいので使わない。
     """
     s = normalize_text(text)
     label_pat = "|".join([re.escape(x) for x in labels])
     patterns = [
-        rf"(?:{label_pat})\s*[:：]?\s*([0-9]{{1,3}}(?:\.[0-9]{{1,2}})?)\s*[%％]?",
-        rf"([0-9]{{1,3}}(?:\.[0-9]{{1,2}})?)\s*[%％]?\s*(?:{label_pat})",
+        rf"(?:{label_pat})\s*[:：]?\s*([0-9]{{1,2}}(?:\.[0-9]{{1,2}})?|100(?:\.0{{1,2}})?)\s*[%％]",
+        rf"([0-9]{{1,2}}(?:\.[0-9]{{1,2}})?|100(?:\.0{{1,2}})?)\s*[%％]\s*(?:{label_pat})",
     ]
     for pat in patterns:
         m = re.search(pat, s)
@@ -200,31 +200,33 @@ def extract_rates_from_text_block(block: str) -> dict:
     """
     選手1人分らしいブロックから勝率・2連対率・3連対率を抽出する保険。
 
-    v37.7修正:
-    - 「100 / 2 / 2」など、級班・期別・B/H・着順系の数字を勝率として誤取得しない
-    - ラベル付き、または「勝率 2連対率 3連対率」の直後に%/小数で並ぶ場合だけ採用
-    - 取れない時は0のままにして、間違った数字を入れない
+    v37.9修正:
+    - 2.00 / 0 / 0 のような誤取得を止める
+    - %付き、またはヘッダー直後の小数3つだけ採用
+    - 取れない時は0のままにして、間違った数字をAIに入れない
     """
     s = normalize_text(block)
     rates = {
-        "勝率": _extract_labeled_rate(s, ["勝率", "1着率", "一着率", "1着", "一着"]),
-        "2連対率": _extract_labeled_rate(s, ["2連対率", "二連対率", "2連対", "二連対", "連対率"]),
-        "3連対率": _extract_labeled_rate(s, ["3連対率", "三連対率", "3連対", "三連対", "3着内率", "三着内率"]),
+        "勝率": _extract_labeled_rate(s, ["勝率", "1着率", "一着率"]),
+        "2連対率": _extract_labeled_rate(s, ["2連対率", "二連対率", "連対率"]),
+        "3連対率": _extract_labeled_rate(s, ["3連対率", "三連対率", "3着内率", "三着内率"]),
     }
 
-    if any(v > 0 for v in rates.values()):
+    # 3項目のうち2項目以上が取れた時だけ採用。1項目だけは誤爆しやすい。
+    if sum(1 for v in rates.values() if v > 0) >= 2:
         return rates
 
-    # 危険な「最後の数字3つ」取得は廃止。
-    # ラベル行の直後に 11.3% 22.6% 32.1% のような%/小数が並ぶ時だけ拾う。
-    header = re.search(r"(?:勝率|1着率).*?(?:2連対率|二連対率|2連対).*?(?:3連対率|三連対率|3連対)(.{0,120})", s)
+    rates = {"勝率": 0.0, "2連対率": 0.0, "3連対率": 0.0}
+
+    header = re.search(r"(?:勝率|1着率|一着率).*?(?:2連対率|二連対率|連対率).*?(?:3連対率|三連対率|3着内率|三着内率)(.{0,180})", s)
     if header:
         tail = header.group(1)
         nums = []
+        # まずは%付きだけ採用
         for m in re.finditer(r"([0-9]{1,2}(?:\.[0-9]{1,2})?|100(?:\.0{1,2})?)\s*[%％]", tail):
             nums.append(normalize_rate_value(m.group(1), 0.0))
         if len(nums) < 3:
-            # %が無い場合は、小数を含む数値だけ採用。整数の100/2/2誤爆を避ける。
+            # %が無い場合は小数を含む3つだけ採用。整数の2/0/0は拾わない。
             nums = [normalize_rate_value(m.group(1), 0.0) for m in re.finditer(r"([0-9]{1,2}\.[0-9]{1,2}|100\.0{1,2})", tail)]
         if len(nums) >= 3:
             rates["勝率"], rates["2連対率"], rates["3連対率"] = nums[0], nums[1], nums[2]
@@ -236,7 +238,7 @@ def extract_rates_from_text_block(block: str) -> dict:
 # =========================================================
 
 
-def make_rate_search_block(text: str, match, before: int = 900, after: int = 1400) -> str:
+def make_rate_search_block(text: str, match, before: int = 250, after: int = 450) -> str:
     """
     勝率系は選手名・脚質の短い一致文字列内に無いことが多いため、
     正規表現で当たった場所の前後を広めに切り出して探す。
@@ -3153,6 +3155,29 @@ def normalize_player_df(players_df: pd.DataFrame, num_riders: int) -> pd.DataFra
     df["競走得点"] = pd.to_numeric(df["競走得点"], errors="coerce").fillna(0.0)
     for rate_col in RATE_COLUMNS:
         df[rate_col] = df[rate_col].map(lambda x: normalize_rate_value(x, 0.0))
+
+    # v37.9: 2.00/0/0 や 100/2/2 など、WINTICKET本文の別数字を勝率として拾った候補を破棄
+    def _bad_rate_row(r):
+        w = normalize_rate_value(r.get("勝率", 0), 0.0)
+        q = normalize_rate_value(r.get("2連対率", 0), 0.0)
+        t = normalize_rate_value(r.get("3連対率", 0), 0.0)
+        src = str(r.get("source", ""))
+        # JSONキーから直接取れたものは比較的信頼する
+        if src == "json_recursive" and (q > 0 or t > 0):
+            return False
+        if w > 0 and q == 0 and t == 0:
+            return True
+        if w >= 95 and q <= 3 and t <= 3:
+            return True
+        if q >= 95 and t >= 95 and w <= 3:
+            return True
+        return False
+
+    bad_mask = df.apply(_bad_rate_row, axis=1)
+    if bad_mask.any():
+        for rate_col in RATE_COLUMNS:
+            df.loc[bad_mask, rate_col] = 0.0
+
     df["脚質"] = df["脚質"].astype(str).map(normalize_text)
     df["source"] = df["source"].astype(str)
 
