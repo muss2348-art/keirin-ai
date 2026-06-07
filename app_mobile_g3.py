@@ -3048,9 +3048,9 @@ def extract_score_from_block(block: str) -> float:
     b = normalize_text(block)
 
     patterns = [
-        re.compile(r'\d{2,3}期\s+(?:本命|対抗|単穴|連下)?\s*([4-9]\d(?:\.\d{1,3})?)'),
-        re.compile(r'(?:本命|対抗|単穴|連下)\s*([4-9]\d(?:\.\d{1,3})?)'),
-        re.compile(r'([4-9]\d(?:\.\d{1,3})?)\s+\d+\s+\d+\s+\d+\s+(?:逃|捲|追|両|自)'),
+        re.compile(r'\d{2,3}期\s+(?:本命|対抗|単穴|連下)?\s*((?:[4-9]\d|1[0-2]\d)(?:\.\d{1,3})?)'),
+        re.compile(r'(?:本命|対抗|単穴|連下)\s*((?:[4-9]\d|1[0-2]\d)(?:\.\d{1,3})?)'),
+        re.compile(r'((?:[4-9]\d|1[0-2]\d)(?:\.\d{1,3})?)\s+\d+\s+\d+\s+\d+\s+(?:逃|捲|追|両|自)'),
     ]
 
     for pat in patterns:
@@ -3061,7 +3061,7 @@ def extract_score_from_block(block: str) -> float:
                 return v
 
     candidates = []
-    for m in re.finditer(r'([4-9]\d(?:\.\d{1,3})?)', b):
+    for m in re.finditer(r'((?:[4-9]\d|1[0-2]\d)(?:\.\d{1,3})?)', b):
         raw = m.group(1)
         v = safe_float(raw, 0.0)
 
@@ -3088,8 +3088,8 @@ def extract_style_from_block(block: str) -> str:
     b = normalize_text(block)
 
     patterns = [
-        re.compile(r'(?:本命|対抗|単穴|連下)?\s*[4-9]\d(?:\.\d{1,3})?\s+\d+\s+\d+\s+\d+\s+(逃|捲|追|両|自)'),
-        re.compile(r'[4-9]\d(?:\.\d{1,3})?(?:\s+\d+){0,6}\s+(逃|捲|追|両|自)'),
+        re.compile(r'(?:本命|対抗|単穴|連下)?\s*(?:[4-9]\d|1[0-2]\d)(?:\.\d{1,3})?\s+\d+\s+\d+\s+\d+\s+(逃|捲|追|両|自)'),
+        re.compile(r'(?:[4-9]\d|1[0-2]\d)(?:\.\d{1,3})?(?:\s+\d+){0,6}\s+(逃|捲|追|両|自)'),
     ]
 
     for pat in patterns:
@@ -3116,7 +3116,7 @@ def extract_single_player_by_car(text: str, car: int, num_riders: int = 7):
             rf'(\d{{2}})歳\s+'
             rf'(\d{{2,3}})期\s+'
             rf'(?:本命|対抗|単穴|連下)?\s*'
-            rf'([4-9]\d(?:\.\d{{1,3}})?)\s+'
+            rf'((?:[4-9]\d|1[0-2]\d)(?:\.\d{{1,3}})?)\s+'
             rf'(?:\d+\s+){{2,5}}'
             rf'(逃|捲|追|両|自)'
         ),
@@ -3128,7 +3128,7 @@ def extract_single_player_by_car(text: str, car: int, num_riders: int = 7):
             rf'(\d{{2}})歳\s+'
             rf'(\d{{2,3}})期\s+'
             rf'(?:本命|対抗|単穴|連下)?\s*'
-            rf'([4-9]\d(?:\.\d{{1,3}})?)\s+'
+            rf'((?:[4-9]\d|1[0-2]\d)(?:\.\d{{1,3}})?)\s+'
             rf'(?:\d+\s+){{2,5}}'
             rf'(逃|捲|追|両|自)'
         ),
@@ -3213,7 +3213,7 @@ def extract_players_with_regex(text: str, num_riders: int):
         rf'(\d{{2}})歳\s+'
         rf'(\d{{2,3}})期\s+'
         rf'(?:本命|対抗|単穴|連下)?\s*'
-        rf'([4-9]\d(?:\.\d{{1,3}})?)\s+'
+        rf'((?:[4-9]\d|1[0-2]\d)(?:\.\d{{1,3}})?)\s+'
         rf'(\d+)\s+(\d+)\s+(\d+)\s+'
         rf'(逃|捲|追|両|自)'
     )
@@ -3399,6 +3399,7 @@ def normalize_player_df(players_df: pd.DataFrame, num_riders: int) -> pd.DataFra
         "single_block": 65,
         "car_block_safe": 60,
         "basic_table": 110,
+        "wide_car_window": 95,
         "sequence_card": 45,
         "sequence_text": 35,
     }
@@ -3585,7 +3586,7 @@ def extract_players_from_json_html(html: str, num_riders: int):
             pattern = re.compile(
                 rf'(?:racerNumber|racerNo|riderNumber|bikeNumber|carNumber|車番)["\':\s]{{1,10}}{car}.{{0,900}}?'
                 rf'([一-龥ぁ-んァ-ヶ々]{{2,12}}).{{0,900}}?'
-                rf'([4-9]\d(?:\.\d{{1,3}})?).{{0,300}}?'
+                rf'((?:[4-9]\d|1[0-2]\d)(?:\.\d{{1,3}})?).{{0,300}}?'
                 rf'(逃|捲|追|両|自|逃げ|捲り|追込|自在)',
                 re.DOTALL,
             )
@@ -3635,8 +3636,8 @@ def extract_players_from_html_cards(html: str, num_riders: int):
             seen_texts.add(text)
             for car in range(1, num_riders + 1):
                 pats = [
-                    rf'(?<!\d){car}\s+{car}\s+([一-龥ぁ-んァ-ヶ々]{{2,12}})\s+(?:{PREF_PATTERN})\s+[ALS]\d\s+\d{{2}}歳\s+\d{{2,3}}期.*?([4-9]\d(?:\.\d{{1,3}})?).*?(逃|捲|追|両|自)',
-                    rf'(?<!\d){car}\s+([一-龥ぁ-んァ-ヶ々]{{2,12}})\s+(?:{PREF_PATTERN}).*?([4-9]\d(?:\.\d{{1,3}})?).*?(逃|捲|追|両|自)',
+                    rf'(?<!\d){car}\s+{car}\s+([一-龥ぁ-んァ-ヶ々]{{2,12}})\s+(?:{PREF_PATTERN})\s+[ALS]\d\s+\d{{2}}歳\s+\d{{2,3}}期.*?((?:[4-9]\d|1[0-2]\d)(?:\.\d{{1,3}})?).*?(逃|捲|追|両|自)',
+                    rf'(?<!\d){car}\s+([一-龥ぁ-んァ-ヶ々]{{2,12}})\s+(?:{PREF_PATTERN}).*?((?:[4-9]\d|1[0-2]\d)(?:\.\d{{1,3}})?).*?(逃|捲|追|両|自)',
                 ]
                 for pat in pats:
                     m = re.search(pat, text)
@@ -3672,8 +3673,8 @@ def extract_players_loose_entries(text: str, num_riders: int):
     preview = []
     for car in range(1, num_riders + 1):
         patterns = [
-            rf'(?<!\d){car}\s+{car}\s+([一-龥ぁ-んァ-ヶ々]{{2,12}})\s+(?:{PREF_PATTERN})\s+[ALS]\d\s+\d{{2}}歳\s+\d{{2,3}}期\s+(?:本命|対抗|単穴|連下)?\s*([4-9]\d(?:\.\d{{1,3}})?).{{0,160}}?(逃|捲|追|両|自)',
-            rf'(?<!\d){car}\s+([一-龥ぁ-んァ-ヶ々]{{2,12}})\s+(?:{PREF_PATTERN}).{{0,220}}?([4-9]\d(?:\.\d{{1,3}})?).{{0,160}}?(逃|捲|追|両|自)',
+            rf'(?<!\d){car}\s+{car}\s+([一-龥ぁ-んァ-ヶ々]{{2,12}})\s+(?:{PREF_PATTERN})\s+[ALS]\d\s+\d{{2}}歳\s+\d{{2,3}}期\s+(?:本命|対抗|単穴|連下)?\s*((?:[4-9]\d|1[0-2]\d)(?:\.\d{{1,3}})?).{{0,160}}?(逃|捲|追|両|自)',
+            rf'(?<!\d){car}\s+([一-龥ぁ-んァ-ヶ々]{{2,12}})\s+(?:{PREF_PATTERN}).{{0,220}}?((?:[4-9]\d|1[0-2]\d)(?:\.\d{{1,3}})?).{{0,160}}?(逃|捲|追|両|自)',
         ]
         for pat in patterns:
             m = re.search(pat, s)
@@ -3732,7 +3733,7 @@ def extract_players_from_winticket_basic_table(text: str, num_riders: int):
         rf'(\d{{2}})歳\s+'
         rf'(\d{{2,3}})期\s+'
         rf'(?:本命|対抗|単穴|連下)?\s*'
-        rf'([4-9]\d(?:\.\d{{1,3}})?)\s+'
+        rf'((?:[4-9]\d|1[0-2]\d)(?:\.\d{{1,3}})?)\s+'
         rf'(\d+)\s+(\d+)\s+(\d+)\s+'
         rf'(逃|捲|追|両|自)\s+'
         rf'(.{{0,260}}?)'
@@ -3780,6 +3781,91 @@ def extract_players_from_winticket_basic_table(text: str, num_riders: int):
     df = normalize_player_df(pd.DataFrame(rows), num_riders)
     return df, {"hit_count": len(df), "preview": preview[:20]}
 
+
+
+def extract_players_by_wide_car_windows(text: str, num_riders: int):
+    """
+    G3/9車立て最終保険 v38.5。
+    8・9番が抜けるケース向けに、車番ごとの広い窓から選手名・得点・脚質を拾う。
+    100点台の競走得点にも対応し、得点/脚質が弱くても名前が取れた車番は残す。
+    """
+    s = normalize_text(text)
+    rows = []
+    preview = []
+    num_riders = safe_int(num_riders, 9)
+
+    for car in range(1, num_riders + 1):
+        next_car = car + 1
+        blocks = []
+
+        if car < num_riders:
+            patterns = [
+                rf'(?<!\d){car}\s+{car}\s+(.{{0,2600}}?)(?=(?<!\d){next_car}\s+(?:{next_car}\s+)?[一-龥ぁ-んァ-ヶ々]{{2,12}}|(?<!\d){next_car}\s+{next_car}\s+|並び予想|$)',
+                rf'(?<!\d){car}\s+(.{{0,2600}}?)(?=(?<!\d){next_car}\s+(?:{next_car}\s+)?[一-龥ぁ-んァ-ヶ々]{{2,12}}|(?<!\d){next_car}\s+{next_car}\s+|並び予想|$)',
+            ]
+        else:
+            patterns = [
+                rf'(?<!\d){car}\s+{car}\s+(.{{0,3000}}?)(?:並び予想|直近成績|オッズ|払戻|$)',
+                rf'(?<!\d){car}\s+(.{{0,3000}}?)(?:並び予想|直近成績|オッズ|払戻|$)',
+            ]
+
+        for pat in patterns:
+            for m in re.finditer(pat, s):
+                blk = normalize_text(m.group(1))
+                if len(blk) >= 4:
+                    blocks.append(blk)
+                if len(blocks) >= 3:
+                    break
+            if blocks:
+                break
+
+        # 車番境界で拾えない場合は、車番の出現位置から広く見る
+        if not blocks:
+            for m in re.finditer(rf'(?<!\d){car}(?!\d)', s):
+                blk = s[m.start():min(len(s), m.start() + 2200)]
+                if re.search(PREF_PATTERN, blk) or re.search(r'(逃|捲|追|両|自)', blk):
+                    blocks.append(blk)
+                    break
+
+        best = None
+        for block in blocks:
+            name = extract_name_from_block(block)
+            if not is_valid_player_name(name):
+                # 直接「名前 都道府県」で再探索
+                mm = re.search(rf'([一-龥ぁ-んァ-ヶ々]{{2,12}})\s+(?:{PREF_PATTERN})', block)
+                if mm:
+                    name = normalize_text(mm.group(1))
+            if not is_valid_player_name(name):
+                continue
+
+            score = extract_score_from_block(block)
+            style = extract_style_from_block(block)
+            rates = extract_rates_from_winticket_row_block(block, style=style)
+            if not _has_any_rate(rates):
+                rates = extract_rates_for_car_block(s, car, num_riders, style=style)
+            item = {
+                "車番": car,
+                "選手名": name,
+                "競走得点": score,
+                "勝率": rates.get("勝率", 0.0),
+                "2連対率": rates.get("2連対率", 0.0),
+                "3連対率": rates.get("3連対率", 0.0),
+                "脚質": style,
+                "source": "wide_car_window",
+            }
+            best = item
+            # 得点か脚質が取れている候補を優先して即採用
+            if (40.0 <= safe_float(score, 0.0) <= 130.0) or style in ["逃", "捲", "追", "両", "自"]:
+                break
+
+        if best:
+            rows.append(best)
+            preview.append(best)
+
+    if not rows:
+        return pd.DataFrame(columns=["車番", "選手名", "競走得点", "勝率", "2連対率", "3連対率", "脚質"]), {"hit_count": 0, "preview": []}
+    df = normalize_player_df(pd.DataFrame(rows), num_riders)
+    return df, {"hit_count": len(df), "preview": preview[:20]}
 
 def merge_player_dfs(base_df: pd.DataFrame, add_df: pd.DataFrame, num_riders=None) -> pd.DataFrame:
     frames = []
@@ -3908,11 +3994,12 @@ def fetch_players_from_winticket(url: str, num_riders: int):
             df_block, dbg_block = extract_players_by_car_blocks(full_text, num_riders)
             df_loose, dbg_loose = extract_players_loose_entries(full_text, num_riders)
             df_basic, dbg_basic = extract_players_from_winticket_basic_table(full_text, num_riders)
+            df_wide, dbg_wide = extract_players_by_wide_car_windows(full_text, num_riders)
             df_sequence, seq_preview = extract_sequence_candidates(html, full_text, num_riders)
 
             # まず高精度候補を統合
             valid_frames = [
-                x for x in [df_json, df_cards, df_section, df_full, df_block, df_loose, df_basic]
+                x for x in [df_json, df_cards, df_section, df_full, df_block, df_loose, df_basic, df_wide]
                 if x is not None and not x.empty
             ]
             combined = pd.concat(valid_frames, ignore_index=True) if valid_frames else pd.DataFrame()
@@ -3953,6 +4040,7 @@ def fetch_players_from_winticket(url: str, num_riders: int):
                 "block_hits": len(df_block),
                 "loose_hits": len(df_loose),
                 "basic_hits": len(df_basic),
+                "wide_hits": len(df_wide),
                 "sequence_hits": len(df_sequence),
                 "final_hits": len(final_df),
                 "missing_after": missing,
@@ -3961,6 +4049,7 @@ def fetch_players_from_winticket(url: str, num_riders: int):
                 "preview_cards": dbg_cards.get("preview", [])[:6],
                 "preview_regex": (dbg_section.get("preview", [])[:4] + dbg_full.get("preview", [])[:4] + dbg_block.get("preview", [])[:4] + dbg_loose.get("preview", [])[:4]),
                 "preview_basic": dbg_basic.get("preview", [])[:9],
+                "preview_wide": dbg_wide.get("preview", [])[:9],
                 "preview_sequence": seq_preview[:8],
                 "section_head": section_text[:300],
             })
@@ -3977,7 +4066,7 @@ def fetch_players_from_winticket(url: str, num_riders: int):
     missing = sorted(list(set(range(1, num_riders + 1)) - set(best_df["車番"].astype(int).tolist()))) if not best_df.empty else list(range(1, num_riders + 1))
 
     debug_info = {
-        "source_type": "winticket_player_auto_v38_4_grade_9car_guard",
+        "source_type": "winticket_player_auto_v38_5_grade_9car_score_guard",
         "hit_count": len(best_df),
         "missing": missing,
         "candidate_results": debug_items,
