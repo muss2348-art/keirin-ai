@@ -29,7 +29,7 @@ st.set_page_config(
     layout="centered",
 )
 
-st.caption("✅ mobile 旧ロジック寄せ_BOX任意版 v38.4（G3/9車取得補強・勝率取得・脚質維持）")
+st.caption("✅ mobile 一本化版 v39.1（点数絶対遵守・千切れ60/雨65・勝率/G3維持）")
 
 HEADERS = {
     "User-Agent": (
@@ -941,7 +941,148 @@ def apply_prediction_style_filter(
         f"熱🔥{rank_counts.get('熱🔥', 0)} / 堅{rank_counts.get('堅', 0)} / "
         f"穴{rank_counts.get('穴', 0)} / 抑え{rank_counts.get('抑え', 0)}"
     )
+
     return selected, info
+
+
+# =========================================================
+# v39.1 最終買い目点数制御
+# =========================================================
+def _row_ticket_key(row) -> str:
+    if hasattr(row, "index") and "買い目" in row.index:
+        return normalize_ticket(row.get("買い目", ""))
+    return ""
+
+
+def _ticket_strength_score(row, position: int = 0) -> float:
+    """最終採用用スコア。紐抜け/千切れ/穴候補も点数内で評価する。"""
+    rank = str(row.get("買い目ランク", ""))
+    rank_bonus = {"熱🔥": 80.0, "堅": 62.0, "穴": 54.0, "抑え": 36.0}.get(rank, 30.0)
+    ai_eval = safe_float(row.get("AI評価", 0), 0.0)
+    ev = normalize_roi_value(row.get("期待値", 0.0)) if "期待値" in row.index else 0.0
+    odds = _get_odds_value(row) if "_get_odds_value" in globals() else safe_float(row.get("オッズ", 0), 0.0)
+    thick = safe_float(row.get("厚張り指数", 1.0), 1.0)
+
+    score = rank_bonus + ai_eval * 0.18 + ev * 0.22 + thick * 4.0
+    if 5 <= odds <= 35:
+        score += min(odds, 35) * 0.15
+    elif odds > 45:
+        score -= 5
+
+    # 点数内で拾うため、追加AIは抑え別枠ではなく穴候補として加点
+    if str(row.get("紐抜け対策AI", "")) == "ON":
+        score += 8.0
+    if str(row.get("ライン40千切れ60", "")):
+        score += 7.0
+    if str(row.get("ライン50千切れ50", "")):
+        score += 5.0
+    if "千切れ" in str(row.get("判定理由", "")) or "千切れ" in str(row.get("学習理由", "")):
+        score += 4.0
+
+    # 元の上位順を少し尊重
+    score -= position * 0.35
+    return round(score, 3)
+
+
+def _desired_rank_counts(max_count: int) -> dict:
+    """B案: 紐抜けは穴に統合。5点なら 熱1/堅2/穴2。"""
+    n = max(1, int(max_count))
+    if n <= 2:
+        return {"熱🔥": 1, "堅": max(0, n - 1), "穴": 0}
+    if n == 3:
+        return {"熱🔥": 1, "堅": 1, "穴": 1}
+    hot = max(1, int(round(n * 0.20)))
+    solid = max(1, int(round(n * 0.40)))
+    if n == 5:
+        hot, solid = 1, 2
+    if hot + solid >= n:
+        solid = max(1, n - hot - 1)
+    hole = max(0, n - hot - solid)
+    return {"熱🔥": hot, "堅": solid, "穴": hole}
+
+
+def apply_final_ticket_limit_v39_1(pred_df: pd.DataFrame, max_count: int, unit_bet: int = 100) -> pd.DataFrame:
+    """
+    v39.1 指定点数絶対遵守。
+    - 5点指定なら最終5点にする
+    - 紐抜けAI/千切れ補正は穴候補に統合して、点数を増やしっぱなしにしない
+    - 抑えは原則、穴枠に吸収。候補不足時だけ残す
+    """
+    if pred_df is None or pred_df.empty:
+        return pred_df
+
+    max_count = max(1, int(max_count))
+    out = pred_df.copy()
+    if "買い目" in out.columns:
+        out["_ticket_key"] = out["買い目"].astype(str).map(normalize_ticket)
+        out = out[out["_ticket_key"] != ""].drop_duplicates(subset=["_ticket_key"], keep="first")
+    else:
+        out["_ticket_key"] = [str(i) for i in range(len(out))]
+
+    # 追加AI由来の抑えは穴枠へ統合
+    if "買い目ランク" not in out.columns:
+        out["買い目ランク"] = "穴"
+    added_mask = pd.Series(False, index=out.index)
+    for col in ["紐抜け対策AI", "ライン40千切れ60", "ライン50千切れ50"]:
+        if col in out.columns:
+            added_mask = added_mask | out[col].astype(str).ne("")
+    out.loc[added_mask & out["買い目ランク"].astype(str).eq("抑え"), "買い目ランク"] = "穴"
+
+    out["_final_score"] = [_ticket_strength_score(row, i) for i, (_, row) in enumerate(out.iterrows())]
+    out = out.sort_values("_final_score", ascending=False).reset_index(drop=True)
+
+    counts = _desired_rank_counts(max_count)
+    selected_idx = []
+    used = set()
+
+    def add_from_rank(rank_label: str, limit: int):
+        nonlocal selected_idx, used
+        if limit <= 0:
+            return
+        part = out[out["買い目ランク"].astype(str) == rank_label]
+        for idx, row in part.iterrows():
+            if len([x for x in selected_idx if x is not None]) >= max_count:
+                break
+            key = row.get("_ticket_key", str(idx))
+            if key in used:
+                continue
+            selected_idx.append(idx)
+            used.add(key)
+            if sum(1 for x in selected_idx if x in part.index) >= limit:
+                break
+
+    add_from_rank("熱🔥", counts.get("熱🔥", 0))
+    add_from_rank("堅", counts.get("堅", 0))
+    # 穴枠には穴・紐抜け・千切れ候補を優先して入れる
+    add_from_rank("穴", counts.get("穴", 0))
+
+    # 足りない分は全体上位から補充
+    for idx, row in out.iterrows():
+        if len(selected_idx) >= min(max_count, len(out)):
+            break
+        key = row.get("_ticket_key", str(idx))
+        if key in used:
+            continue
+        selected_idx.append(idx)
+        used.add(key)
+
+    selected = out.loc[selected_idx].head(max_count).copy().reset_index(drop=True)
+
+    # B案: 最終表示は熱🔥/堅/穴中心。抑えは候補不足時以外できるだけ穴へ。
+    if "買い目ランク" in selected.columns:
+        selected.loc[selected["買い目ランク"].astype(str).eq("抑え"), "買い目ランク"] = "穴"
+
+    # 金額は再ランキングで崩さず、最終ランクに沿って軽く付け直す
+    unit = max(100, int(unit_bet))
+    if "購入金額" in selected.columns:
+        selected["購入金額"] = [rank_base_amount(str(r), unit) for r in selected["買い目ランク"].astype(str).tolist()]
+    if "期待値" in selected.columns:
+        ev_num = pd.to_numeric(selected.get("期待値", 0), errors="coerce").fillna(0)
+        if "購入金額" in selected.columns:
+            selected["期待回収額(目安)"] = (ev_num / 100.0 * selected["購入金額"]).round(0)
+
+    drop_cols = [c for c in ["_ticket_key", "_final_score"] if c in selected.columns]
+    return selected.drop(columns=drop_cols).reset_index(drop=True)
 
 
 def widget_key(name: str, idx: int) -> str:
@@ -1607,7 +1748,7 @@ def add_single_and_break_pattern_tickets(
 
 
 # =========================================================
-# 勝率機能 + ライン50%/千切れ50%補正
+# 勝率機能 + ライン40%/千切れ60%補正
 # =========================================================
 def _rate_score(profile: dict) -> float:
     """
@@ -1659,15 +1800,15 @@ def _break_side_score(profile: dict, appear_count: int = 0, used_count: int = 0)
     score += _rate_score(profile) * 0.75
     score += appear_count * 3.0
 
-    # ライン番手評価は残すが弱める
+    # v39.1: ライン番手評価は残すが、千切れ寄りにするためさらに弱める
     if line_pos == 2:
-        score += 4.0
-    elif line_pos == 3:
         score += 2.0
+    elif line_pos == 3:
+        score += 1.0
 
-    # 千切れ/別線寄り
-    score += min(b, 18) * 1.2
-    score += min(h, 18) * 0.75
+    # v39.1: 千切れ/別線寄りを強化
+    score += min(b, 18) * 1.45
+    score += min(h, 18) * 0.95
 
     if "逃" in style or "捲" in style or "両" in style or "自" in style:
         score += 6.0
@@ -1687,15 +1828,19 @@ def add_line50_break50_tickets(
     current_df: pd.DataFrame,
     ticket_type: str,
     max_add: int = 4,
+    weather: str = "晴",
 ) -> Tuple[pd.DataFrame, dict]:
     """
-    ライン半分・千切れ半分へ寄せる補正。
+    v39.1: ライン40%・千切れ60%へ寄せる補正。
+    雨の日はライン35%・千切れ65%目安まで別線/展開ズレを強める。
     - 軸は既存予想から維持
     - 2着3着に別線/自力/勝率高めを薄く追加
-    - 最大2〜4点
-    - 追加ランクは抑え
+    - 最大2〜4点。ただし最終出力では指定点数を絶対遵守する。
+    - 追加ランクは穴候補として扱う
     """
     info = {"added": 0, "axis": "", "break_cars": [], "reason": ""}
+    weather_text = normalize_text(weather)
+    is_rain = "雨" in weather_text
     if pred_df is None or pred_df.empty or "買い目" not in pred_df.columns:
         return pred_df, info
 
@@ -1742,13 +1887,13 @@ def add_line50_break50_tickets(
             used_count=used_counts.get(car, 0),
         )
 
-        # 同ライン後方ばかり拾わない
+        # v39.1: 同ライン後方ばかり拾わない。雨はさらに千切れ寄り。
         if line_no and axis_line and line_no == axis_line and safe_int(prof.get("ライン順", 0), 0) >= 3:
-            score -= 5.0
+            score -= 7.0 if is_rain else 6.0
 
-        # 別線・単騎を少し優先
+        # v39.1: 別線・単騎を優先。通常は40/60、雨は35/65のイメージ。
         if (line_no != axis_line) or prof.get("単騎"):
-            score += 4.0
+            score += 9.0 if is_rain else 7.0
 
         scored.append((car, score))
 
@@ -1803,26 +1948,27 @@ def add_line50_break50_tickets(
         info["reason"] = "ライン50補正: 追加候補なし"
         return pred_df, info
 
-    reason = f"ライン50/千切れ50補正: 軸{axis1} / 別線候補={','.join(map(str, break_cars[:3]))}"
+    balance_label = "ライン35/千切れ65" if is_rain else "ライン40/千切れ60"
+    reason = f"{balance_label}補正: 軸{axis1} / 別線候補={','.join(map(str, break_cars[:3]))}"
 
     extra_df = _make_extra_ticket_rows(
         pred_df,
         extra_tickets,
         reason=reason,
-        rank_label="抑え",
+        rank_label="穴",
     )
 
     if extra_df.empty:
         return pred_df, info
 
     if "買い目ランク" in extra_df.columns:
-        extra_df["買い目ランク"] = "抑え"
+        extra_df["買い目ランク"] = "穴"
     if "AI評価" in extra_df.columns:
-        extra_df["AI評価"] = 64
+        extra_df["AI評価"] = 67 if is_rain else 65
     if "期待値" in extra_df.columns:
-        extra_df["期待値"] = 101
+        extra_df["期待値"] = 106 if is_rain else 104
 
-    extra_df["ライン50千切れ50"] = "ON"
+    extra_df["ライン40千切れ60"] = "雨ON" if is_rain else "ON"
 
     out = pd.concat([pred_df, extra_df], ignore_index=True)
     out = out.drop_duplicates(subset=["買い目"], keep="first").reset_index(drop=True)
@@ -1892,8 +2038,8 @@ def add_himo_guard_tickets_optional(
     紐抜け対策AI。
     - チェックON時だけ呼ぶ
     - 1着軸は今の買い目から固定
-    - 2着3着の相手候補だけ最大2〜4点追加
-    - 追加ランクは必ず「抑え」
+    - 2着3着の相手候補を穴候補として作る
+    - v39.1では最終出力で指定点数を絶対遵守するため、買い目を増やしっぱなしにしない
     - BOX保険とは独立
     """
     info = {"added": 0, "himo_cars": [], "axis": "", "reason": ""}
@@ -1987,13 +2133,13 @@ def add_himo_guard_tickets_optional(
     if extra_df.empty:
         return pred_df, info
 
-    # 紐抜け対策は必ず抑え。ROIランク再判定で変わるのを防ぐ補助列も付ける。
+    # v39.1: 紐抜けは別枠の抑えではなく、穴候補に統合する。
     if "買い目ランク" in extra_df.columns:
-        extra_df["買い目ランク"] = "抑え"
+        extra_df["買い目ランク"] = "穴"
     if "AI評価" in extra_df.columns:
-        extra_df["AI評価"] = 62
+        extra_df["AI評価"] = 66
     if "期待値" in extra_df.columns:
-        extra_df["期待値"] = 101
+        extra_df["期待値"] = 105
     extra_df["紐抜け対策AI"] = "ON"
 
     out = pd.concat([pred_df, extra_df], ignore_index=True)
@@ -4891,6 +5037,7 @@ with p1:
                     current_df,
                     ticket_type=ticket_type,
                     max_add=4,
+                    weather=weather,
                 )
                 selection_info["line50_added"] = line50_info.get("added", 0)
                 selection_info["line50_cars"] = ",".join(map(str, line50_info.get("break_cars", [])))
@@ -4898,7 +5045,7 @@ with p1:
             else:
                 selection_info["line50_added"] = 0
                 selection_info["line50_cars"] = ""
-                selection_info["line50_reason"] = "ライン50補正OFF"
+                selection_info["line50_reason"] = "ライン40/千切れ60補正OFF"
 
             if st.session_state.get("enable_box_ai", False):
                 pred_df, box_info = add_ai_box_tickets(
@@ -4943,6 +5090,14 @@ with p1:
             pred_df = apply_roi_ticket_ranking(pred_df)
             pred_df = apply_rank_based_amounts(pred_df, unit_bet)
             pred_df = ensure_prediction_amounts(pred_df, unit_bet=unit_bet)
+            pred_df = apply_final_ticket_limit_v39_1(
+                pred_df,
+                max_count=int(display_count),
+                unit_bet=unit_bet,
+            )
+            selection_info["final_ticket_limit"] = int(display_count)
+            selection_info["after_count"] = len(pred_df) if pred_df is not None else 0
+            st.session_state["selection_info"] = selection_info
             st.session_state["pred_df"] = pred_df
             st.session_state["message"] = "買い目生成成功"
             st.rerun()
