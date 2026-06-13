@@ -29,7 +29,7 @@ st.set_page_config(
     layout="centered",
 )
 
-st.caption("✅ mobile 一本化版 v39.1（点数絶対遵守・千切れ60/雨65・勝率/G3維持）")
+st.caption("✅ mobile 一本化版 v39.2（千切れ強化・番手評価UP・穴寄り調整・点数遵守）")
 
 HEADERS = {
     "User-Agent": (
@@ -946,7 +946,7 @@ def apply_prediction_style_filter(
 
 
 # =========================================================
-# v39.1 最終買い目点数制御
+# v39.2 最終買い目点数制御
 # =========================================================
 def _row_ticket_key(row) -> str:
     if hasattr(row, "index") and "買い目" in row.index:
@@ -957,7 +957,7 @@ def _row_ticket_key(row) -> str:
 def _ticket_strength_score(row, position: int = 0) -> float:
     """最終採用用スコア。紐抜け/千切れ/穴候補も点数内で評価する。"""
     rank = str(row.get("買い目ランク", ""))
-    rank_bonus = {"熱🔥": 80.0, "堅": 62.0, "穴": 54.0, "抑え": 36.0}.get(rank, 30.0)
+    rank_bonus = {"熱🔥": 78.0, "堅": 60.0, "穴": 62.0, "抑え": 42.0}.get(rank, 32.0)
     ai_eval = safe_float(row.get("AI評価", 0), 0.0)
     ev = normalize_roi_value(row.get("期待値", 0.0)) if "期待値" in row.index else 0.0
     odds = _get_odds_value(row) if "_get_odds_value" in globals() else safe_float(row.get("オッズ", 0), 0.0)
@@ -971,12 +971,16 @@ def _ticket_strength_score(row, position: int = 0) -> float:
 
     # 点数内で拾うため、追加AIは抑え別枠ではなく穴候補として加点
     if str(row.get("紐抜け対策AI", "")) == "ON":
-        score += 8.0
+        score += 10.0
+    if str(row.get("ライン30千切れ70", "")):
+        score += 11.0
     if str(row.get("ライン40千切れ60", "")):
         score += 7.0
     if str(row.get("ライン50千切れ50", "")):
         score += 5.0
     if "千切れ" in str(row.get("判定理由", "")) or "千切れ" in str(row.get("学習理由", "")):
+        score += 6.0
+    if "番手" in str(row.get("判定理由", "")) or "番手" in str(row.get("学習理由", "")):
         score += 4.0
 
     # 元の上位順を少し尊重
@@ -985,25 +989,28 @@ def _ticket_strength_score(row, position: int = 0) -> float:
 
 
 def _desired_rank_counts(max_count: int) -> dict:
-    """B案: 紐抜けは穴に統合。5点なら 熱1/堅2/穴2。"""
+    """v39.2: 穴寄り多め。5点なら 熱1/堅1/穴3。"""
     n = max(1, int(max_count))
     if n <= 2:
-        return {"熱🔥": 1, "堅": max(0, n - 1), "穴": 0}
+        return {"熱🔥": 1, "堅": 0, "穴": max(0, n - 1)}
     if n == 3:
         return {"熱🔥": 1, "堅": 1, "穴": 1}
-    hot = max(1, int(round(n * 0.20)))
-    solid = max(1, int(round(n * 0.40)))
+    if n == 4:
+        return {"熱🔥": 1, "堅": 1, "穴": 2}
     if n == 5:
-        hot, solid = 1, 2
+        return {"熱🔥": 1, "堅": 1, "穴": 3}
+
+    hot = max(1, int(round(n * 0.18)))
+    solid = max(1, int(round(n * 0.28)))
     if hot + solid >= n:
         solid = max(1, n - hot - 1)
-    hole = max(0, n - hot - solid)
+    hole = max(1, n - hot - solid)
     return {"熱🔥": hot, "堅": solid, "穴": hole}
 
 
 def apply_final_ticket_limit_v39_1(pred_df: pd.DataFrame, max_count: int, unit_bet: int = 100) -> pd.DataFrame:
     """
-    v39.1 指定点数絶対遵守。
+    v39.2 指定点数絶対遵守。
     - 5点指定なら最終5点にする
     - 紐抜けAI/千切れ補正は穴候補に統合して、点数を増やしっぱなしにしない
     - 抑えは原則、穴枠に吸収。候補不足時だけ残す
@@ -1023,7 +1030,7 @@ def apply_final_ticket_limit_v39_1(pred_df: pd.DataFrame, max_count: int, unit_b
     if "買い目ランク" not in out.columns:
         out["買い目ランク"] = "穴"
     added_mask = pd.Series(False, index=out.index)
-    for col in ["紐抜け対策AI", "ライン40千切れ60", "ライン50千切れ50"]:
+    for col in ["紐抜け対策AI", "ライン30千切れ70", "ライン40千切れ60", "ライン50千切れ50"]:
         if col in out.columns:
             added_mask = added_mask | out[col].astype(str).ne("")
     out.loc[added_mask & out["買い目ランク"].astype(str).eq("抑え"), "買い目ランク"] = "穴"
@@ -1558,11 +1565,17 @@ def calc_line_break_risk(leader: dict, second: dict, line_size: int):
     second_point = safe_float(second.get("得点", 0), 0) if second else 0
 
     if leader_b >= 12:
-        risk += 2.5
+        risk += 3.2
         reasons.append("先行B強")
+    elif leader_b >= 9:
+        risk += 1.4
+        reasons.append("先行B警戒")
     if leader_h >= 12:
-        risk += 2.0
+        risk += 2.6
         reasons.append("先行H強")
+    elif leader_h >= 9:
+        risk += 1.2
+        reasons.append("先行H警戒")
     if second and second_b <= 1 and second_h <= 1 and second_point < 88:
         risk += 3.0
         reasons.append("番手やや弱")
@@ -1800,18 +1813,22 @@ def _break_side_score(profile: dict, appear_count: int = 0, used_count: int = 0)
     score += _rate_score(profile) * 0.75
     score += appear_count * 3.0
 
-    # v39.1: ライン番手評価は残すが、千切れ寄りにするためさらに弱める
+    # v39.2: 番手評価を強化。番手は千切れ/別線だけでなく2着・3着の柱として扱う
     if line_pos == 2:
-        score += 2.0
+        score += 9.0
     elif line_pos == 3:
-        score += 1.0
+        score += 4.0
 
-    # v39.1: 千切れ/別線寄りを強化
-    score += min(b, 18) * 1.45
-    score += min(h, 18) * 0.95
+    # v39.2: 千切れ/別線寄りをさらに強化
+    score += min(b, 18) * 1.65
+    score += min(h, 18) * 1.10
 
     if "逃" in style or "捲" in style or "両" in style or "自" in style:
-        score += 6.0
+        score += 6.5
+    if "追" in style and line_pos == 2:
+        score += 5.5
+    elif "追" in style and line_pos == 3:
+        score += 2.5
 
     if is_single and (b >= 7 or h >= 7 or point >= 86 or _rate_score(profile) >= 32):
         score += 5.0
@@ -1831,8 +1848,8 @@ def add_line50_break50_tickets(
     weather: str = "晴",
 ) -> Tuple[pd.DataFrame, dict]:
     """
-    v39.1: ライン40%・千切れ60%へ寄せる補正。
-    雨の日はライン35%・千切れ65%目安まで別線/展開ズレを強める。
+    v39.2: ライン30%・千切れ70%へ寄せる補正。
+    雨の日はライン20%・千切れ80%目安まで別線/展開ズレを強める。
     - 軸は既存予想から維持
     - 2着3着に別線/自力/勝率高めを薄く追加
     - 最大2〜4点。ただし最終出力では指定点数を絶対遵守する。
@@ -1887,18 +1904,22 @@ def add_line50_break50_tickets(
             used_count=used_counts.get(car, 0),
         )
 
-        # v39.1: 同ライン後方ばかり拾わない。雨はさらに千切れ寄り。
+        # v39.2: 同ライン後方ばかり拾わない。雨はさらに千切れ寄り。
         if line_no and axis_line and line_no == axis_line and safe_int(prof.get("ライン順", 0), 0) >= 3:
-            score -= 7.0 if is_rain else 6.0
+            score -= 9.0 if is_rain else 7.5
 
-        # v39.1: 別線・単騎を優先。通常は40/60、雨は35/65のイメージ。
+        # v39.2: 番手は評価する。番手はライン残り/千切れ後の2着候補として残す。
+        if line_no and axis_line and line_no == axis_line and safe_int(prof.get("ライン順", 0), 0) == 2:
+            score += 8.0
+
+        # v39.2: 別線・単騎を優先。通常は30/70、雨は20/80のイメージ。
         if (line_no != axis_line) or prof.get("単騎"):
-            score += 9.0 if is_rain else 7.0
+            score += 13.0 if is_rain else 10.5
 
         scored.append((car, score))
 
     scored = sorted(scored, key=lambda x: x[1], reverse=True)
-    break_cars = [c for c, _ in scored[:4]]
+    break_cars = [c for c, _ in scored[:5]]
     info["break_cars"] = break_cars
 
     extra_tickets = []
@@ -1933,7 +1954,7 @@ def add_line50_break50_tickets(
 
             # 強い別線/単騎なら頭ズレも1点だけ
             prof = profiles.get(h, {})
-            if prof and h != axis1 and (_rate_score(prof) >= 38 or safe_int(prof.get("B", 0), 0) >= 10):
+            if prof and h != axis1 and (_rate_score(prof) >= 34 or safe_int(prof.get("B", 0), 0) >= 8):
                 partner = axis2
                 if partner and h not in [axis1, partner]:
                     patterns.append(f"{h}-{axis1}-{partner}")
@@ -1942,13 +1963,13 @@ def add_line50_break50_tickets(
                 if t not in existing and not _ticket_contains_same_parts(t):
                     extra_tickets.append(t)
 
-    extra_tickets = list(dict.fromkeys(extra_tickets))[:max(2, min(4, int(max_add)))]
+    extra_tickets = list(dict.fromkeys(extra_tickets))[:max(3, min(5, int(max_add) + 1))]
 
     if not extra_tickets:
         info["reason"] = "ライン50補正: 追加候補なし"
         return pred_df, info
 
-    balance_label = "ライン35/千切れ65" if is_rain else "ライン40/千切れ60"
+    balance_label = "ライン20/千切れ80" if is_rain else "ライン30/千切れ70"
     reason = f"{balance_label}補正: 軸{axis1} / 別線候補={','.join(map(str, break_cars[:3]))}"
 
     extra_df = _make_extra_ticket_rows(
@@ -1964,11 +1985,11 @@ def add_line50_break50_tickets(
     if "買い目ランク" in extra_df.columns:
         extra_df["買い目ランク"] = "穴"
     if "AI評価" in extra_df.columns:
-        extra_df["AI評価"] = 67 if is_rain else 65
+        extra_df["AI評価"] = 70 if is_rain else 68
     if "期待値" in extra_df.columns:
-        extra_df["期待値"] = 106 if is_rain else 104
+        extra_df["期待値"] = 110 if is_rain else 107
 
-    extra_df["ライン40千切れ60"] = "雨ON" if is_rain else "ON"
+    extra_df["ライン30千切れ70"] = "雨ON" if is_rain else "ON"
 
     out = pd.concat([pred_df, extra_df], ignore_index=True)
     out = out.drop_duplicates(subset=["買い目"], keep="first").reset_index(drop=True)
@@ -1997,22 +2018,24 @@ def _score_himo_guard_candidate(profile: dict, appear_count: int = 0, ticket_use
     score += point * 0.55
     score += appear_count * 5.0
 
-    # 番手・3番手は2着3着の紐に残りやすい
+    # v39.2: 番手・3番手は2着3着の紐に残りやすいので強化
     if line_pos == 2:
-        score += 9.0
+        score += 13.0
     elif line_pos == 3:
-        score += 6.0
+        score += 7.5
     elif line_pos >= 4:
-        score += 2.0
+        score += 2.5
 
     # 自力・自在・B/Hは3着残りや展開ズレで拾いやすい
-    score += min(b, 16) * 0.85
-    score += min(h, 16) * 0.55
+    score += min(b, 16) * 1.00
+    score += min(h, 16) * 0.70
 
     if "逃" in style or "捲" in style or "両" in style or "自" in style:
         score += 4.0
-    if "追" in style and line_pos in [2, 3]:
-        score += 3.0
+    if "追" in style and line_pos == 2:
+        score += 5.0
+    elif "追" in style and line_pos == 3:
+        score += 3.5
 
     # すでに買い目に多く出ている車は追加しすぎない
     score -= max(0, ticket_used_count - 2) * 2.5
@@ -2116,7 +2139,7 @@ def add_himo_guard_tickets_optional(
                     extra_tickets.append(t)
 
     # 重複を消して最大2〜4点に制限
-    extra_tickets = list(dict.fromkeys(extra_tickets))[:max(2, min(4, int(max_add)))]
+    extra_tickets = list(dict.fromkeys(extra_tickets))[:max(3, min(5, int(max_add) + 1))]
 
     if not extra_tickets:
         info["reason"] = "紐抜け対策AI: 追加候補なし"
@@ -2133,7 +2156,7 @@ def add_himo_guard_tickets_optional(
     if extra_df.empty:
         return pred_df, info
 
-    # v39.1: 紐抜けは別枠の抑えではなく、穴候補に統合する。
+    # v39.2: 紐抜けは別枠の抑えではなく、穴候補に統合する。
     if "買い目ランク" in extra_df.columns:
         extra_df["買い目ランク"] = "穴"
     if "AI評価" in extra_df.columns:
