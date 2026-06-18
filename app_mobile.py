@@ -29,7 +29,7 @@ st.set_page_config(
     layout="centered",
 )
 
-st.caption("✅ mobile 一本化版 v39.2（千切れ強化・番手評価UP・穴寄り調整・点数遵守）")
+st.caption("✅ mobile 一本化版 v39.3（紐抜け特化・3連対率重視・番手超強化）")
 
 HEADERS = {
     "User-Agent": (
@@ -946,7 +946,7 @@ def apply_prediction_style_filter(
 
 
 # =========================================================
-# v39.2 最終買い目点数制御
+# v39.3 最終買い目点数制御
 # =========================================================
 def _row_ticket_key(row) -> str:
     if hasattr(row, "index") and "買い目" in row.index:
@@ -955,41 +955,60 @@ def _row_ticket_key(row) -> str:
 
 
 def _ticket_strength_score(row, position: int = 0) -> float:
-    """最終採用用スコア。紐抜け/千切れ/穴候補も点数内で評価する。"""
+    """v39.3 最終採用用スコア。紐抜け特化/千切れ/番手/穴候補を点数内で評価する。"""
     rank = str(row.get("買い目ランク", ""))
-    rank_bonus = {"熱🔥": 78.0, "堅": 60.0, "穴": 62.0, "抑え": 42.0}.get(rank, 32.0)
+    rank_bonus = {"熱🔥": 78.0, "堅": 58.0, "穴": 64.0, "抑え": 40.0}.get(rank, 32.0)
     ai_eval = safe_float(row.get("AI評価", 0), 0.0)
     ev = normalize_roi_value(row.get("期待値", 0.0)) if "期待値" in row.index else 0.0
     odds = _get_odds_value(row) if "_get_odds_value" in globals() else safe_float(row.get("オッズ", 0), 0.0)
     thick = safe_float(row.get("厚張り指数", 1.0), 1.0)
 
-    score = rank_bonus + ai_eval * 0.18 + ev * 0.22 + thick * 4.0
-    if 5 <= odds <= 35:
-        score += min(odds, 35) * 0.15
-    elif odds > 45:
-        score -= 5
+    score = rank_bonus + ai_eval * 0.20 + ev * 0.24 + thick * 4.0
 
-    # 点数内で拾うため、追加AIは抑え別枠ではなく穴候補として加点
+    # ほどよい穴を優先。高すぎるロマン穴は少しだけ減点。
+    if 5 <= odds <= 40:
+        score += min(odds, 40) * 0.18
+    elif odds > 55:
+        score -= 6
+
+    reason_text = (
+        str(row.get("判定理由", "")) + " " +
+        str(row.get("学習理由", "")) + " " +
+        str(row.get("買い目タイプ", ""))
+    )
+
+    # v39.3: 紐抜け特化を強めに採用候補へ残す。
     if str(row.get("紐抜け対策AI", "")) == "ON":
-        score += 10.0
+        score += 18.0
+    if str(row.get("紐抜け特化v39_3", "")) == "ON":
+        score += 16.0
+
+    # 千切れ補正はv39.2の良い感触を維持。
     if str(row.get("ライン30千切れ70", "")):
         score += 11.0
     if str(row.get("ライン40千切れ60", "")):
         score += 7.0
     if str(row.get("ライン50千切れ50", "")):
         score += 5.0
-    if "千切れ" in str(row.get("判定理由", "")) or "千切れ" in str(row.get("学習理由", "")):
+    if "千切れ" in reason_text:
         score += 6.0
-    if "番手" in str(row.get("判定理由", "")) or "番手" in str(row.get("学習理由", "")):
-        score += 4.0
 
-    # 元の上位順を少し尊重
-    score -= position * 0.35
+    # 番手/3番手評価をさらに上げる。
+    if "番手" in reason_text:
+        score += 8.0
+    if "3番手" in reason_text or "三番手" in reason_text:
+        score += 5.0
+
+    # 3着穴固定候補を残しやすくする。
+    if "3着" in reason_text or "紐" in reason_text:
+        score += 6.0
+
+    # 元の上位順を少し尊重。ただし下位の紐穴も消しすぎない。
+    score -= position * 0.28
     return round(score, 3)
 
-
 def _desired_rank_counts(max_count: int) -> dict:
-    """v39.2: 穴寄り多め。5点なら 熱1/堅1/穴3。"""
+    """v39.3: 紐抜け特化を穴枠に含める。5点なら 熱1/堅1/穴3。"""
     n = max(1, int(max_count))
     if n <= 2:
         return {"熱🔥": 1, "堅": 0, "穴": max(0, n - 1)}
@@ -1010,7 +1029,7 @@ def _desired_rank_counts(max_count: int) -> dict:
 
 def apply_final_ticket_limit_v39_1(pred_df: pd.DataFrame, max_count: int, unit_bet: int = 100) -> pd.DataFrame:
     """
-    v39.2 指定点数絶対遵守。
+    v39.3 指定点数絶対遵守。
     - 5点指定なら最終5点にする
     - 紐抜けAI/千切れ補正は穴候補に統合して、点数を増やしっぱなしにしない
     - 抑えは原則、穴枠に吸収。候補不足時だけ残す
@@ -1030,7 +1049,7 @@ def apply_final_ticket_limit_v39_1(pred_df: pd.DataFrame, max_count: int, unit_b
     if "買い目ランク" not in out.columns:
         out["買い目ランク"] = "穴"
     added_mask = pd.Series(False, index=out.index)
-    for col in ["紐抜け対策AI", "ライン30千切れ70", "ライン40千切れ60", "ライン50千切れ50"]:
+    for col in ["紐抜け対策AI", "紐抜け特化v39_3", "ライン30千切れ70", "ライン40千切れ60", "ライン50千切れ50"]:
         if col in out.columns:
             added_mask = added_mask | out[col].astype(str).ne("")
     out.loc[added_mask & out["買い目ランク"].astype(str).eq("抑え"), "買い目ランク"] = "穴"
@@ -2004,10 +2023,16 @@ def add_line50_break50_tickets(
 # =========================================================
 def _score_himo_guard_candidate(profile: dict, appear_count: int = 0, ticket_used_count: int = 0) -> float:
     """
-    2着・3着の紐抜けを拾うための軽い補助スコア。
-    重要: 軸選定には使わない。相手候補だけを薄く追加する。
+    v39.3 紐抜け特化スコア。
+    重要:
+    - 軸選定には使わない
+    - 2着/3着、特に3着で抜けやすい選手を点数内に残すための評価
+    - 3連対率 > 2連対率 > 番手/3番手 > 展開ズレ の順で重視
     """
     point = safe_float(profile.get("得点", 0), 0.0)
+    win_rate = safe_float(profile.get("勝率", 0), 0.0)
+    top2_rate = safe_float(profile.get("2連対率", 0), 0.0)
+    top3_rate = safe_float(profile.get("3連対率", 0), 0.0)
     b = safe_int(profile.get("B", 0), 0)
     h = safe_int(profile.get("H", 0), 0)
     style = str(profile.get("脚質", ""))
@@ -2015,40 +2040,49 @@ def _score_himo_guard_candidate(profile: dict, appear_count: int = 0, ticket_use
     is_single = bool(profile.get("単騎", False))
 
     score = 0.0
-    score += point * 0.55
-    score += appear_count * 5.0
 
-    # v39.2: 番手・3番手は2着3着の紐に残りやすいので強化
+    # 基礎力。ただし紐候補なので得点だけで決めない。
+    score += point * 0.42
+
+    # v39.3: 紐抜け対策は3連対率を最重要視。
+    # 勝率が低くても3着内率が高い選手を残しやすくする。
+    score += top3_rate * 0.58
+    score += top2_rate * 0.34
+    score += win_rate * 0.12
+
+    # 既存AI買い目に出ている車は相性あり。ただし出過ぎは減点。
+    score += min(appear_count, 3) * 5.5
+
+    # v39.3: 番手・3番手をさらに強化。
     if line_pos == 2:
-        score += 13.0
+        score += 19.0
+        if "追" in style:
+            score += 6.0
     elif line_pos == 3:
-        score += 7.5
+        score += 12.0
+        if "追" in style:
+            score += 4.0
     elif line_pos >= 4:
-        score += 2.5
+        score += 4.0
 
-    # 自力・自在・B/Hは3着残りや展開ズレで拾いやすい
-    score += min(b, 16) * 1.00
-    score += min(h, 16) * 0.70
+    # 自力・自在・B/Hは展開ズレや残り目で3着に絡みやすい。
+    score += min(b, 16) * 0.95
+    score += min(h, 16) * 0.62
 
     if "逃" in style or "捲" in style or "両" in style or "自" in style:
-        score += 4.0
-    if "追" in style and line_pos == 2:
-        score += 5.0
-    elif "追" in style and line_pos == 3:
         score += 3.5
 
-    # すでに買い目に多く出ている車は追加しすぎない
-    score -= max(0, ticket_used_count - 2) * 2.5
+    # すでに多く使われすぎている車は追加しすぎない。
+    score -= max(0, ticket_used_count - 3) * 2.2
 
-    # 単騎は維持。ただし弱い単騎を無理に増やさない
+    # 単騎は条件付きで残す。弱い単騎は増やしすぎない。
     if is_single:
-        if point >= 87 or b >= 7 or h >= 7:
-            score += 3.0
+        if top3_rate >= 35 or top2_rate >= 22 or point >= 88 or b >= 7 or h >= 7:
+            score += 4.0
         else:
-            score -= 4.0
+            score -= 4.5
 
     return round(score, 3)
-
 
 def add_himo_guard_tickets_optional(
     pred_df: pd.DataFrame,
@@ -2058,12 +2092,11 @@ def add_himo_guard_tickets_optional(
     max_add: int = 4,
 ) -> Tuple[pd.DataFrame, dict]:
     """
-    紐抜け対策AI。
+    v39.3 紐抜け特化AI。
     - チェックON時だけ呼ぶ
-    - 1着軸は今の買い目から固定
-    - 2着3着の相手候補を穴候補として作る
-    - v39.1では最終出力で指定点数を絶対遵守するため、買い目を増やしっぱなしにしない
-    - BOX保険とは独立
+    - 軸は既存買い目から判断し、無理に1着候補を増やさない
+    - 3連対率・2連対率・番手/3番手を重視して、3着固定の紐穴を点数内に残す
+    - 最終出力では指定点数を守るため、ここで増やした候補は「穴候補」として統合される
     """
     info = {"added": 0, "himo_cars": [], "axis": "", "reason": ""}
     if pred_df is None or pred_df.empty or "買い目" not in pred_df.columns:
@@ -2079,13 +2112,16 @@ def add_himo_guard_tickets_optional(
 
     heads = []
     seconds = []
+    thirds = []
     used_counts = {}
-    for t in base_tickets[:12]:
+    for t in base_tickets[:14]:
         parts = _ticket_parts(t)
         if len(parts) >= 1:
             heads.append(parts[0])
         if len(parts) >= 2:
             seconds.append(parts[1])
+        if len(parts) >= 3:
+            thirds.append(parts[2])
         for p in parts:
             used_counts[p] = used_counts.get(p, 0) + 1
 
@@ -2099,71 +2135,108 @@ def add_himo_guard_tickets_optional(
 
     scored = []
     for car, prof in profiles.items():
-        # 軸は壊さない。1着軸は追加候補から外す。
+        # 1着軸は候補から外す。紐専用。
         if car == axis1:
             continue
         appear_count = used_counts.get(car, 0)
-        score = _score_himo_guard_candidate(prof, appear_count=appear_count, ticket_used_count=appear_count)
+        score = _score_himo_guard_candidate(
+            prof,
+            appear_count=appear_count,
+            ticket_used_count=appear_count,
+        )
         scored.append((car, score))
 
     scored = sorted(scored, key=lambda x: x[1], reverse=True)
-    himo_cars = [c for c, _ in scored[:3]]
+    himo_cars = [c for c, _ in scored[:4]]
     info["himo_cars"] = himo_cars
 
     extra_tickets = []
+
     if str(ticket_type) == "2車単":
-        # 2車単は軸1着固定を優先。薄く裏も1点だけ候補化。
+        # 2車単は軸1着固定を中心に、紐候補を2着へ。
         for h in himo_cars:
             patterns = [f"{axis1}-{h}"]
-            if len(extra_tickets) < 2:
+            # 番手/3連対率が高い選手だけ薄く裏も候補化
+            prof = profiles.get(h, {})
+            if safe_float(prof.get("3連対率", 0), 0.0) >= 35 or safe_int(prof.get("ライン順", 0), 0) == 2:
                 patterns.append(f"{h}-{axis1}")
             for t in patterns:
                 if t not in existing and not _ticket_contains_same_parts(t):
                     extra_tickets.append(t)
     else:
+        # 3連単: 3着抜け対策を最優先。
+        # 既存2着軸がある場合は axis1-axis2-h を厚めに候補化。
         for h in himo_cars:
             patterns = []
             if axis2 and h not in [axis1, axis2]:
-                # 軸はそのまま。3着抜けと2着ズレだけ薄く拾う。
+                # 3着穴固定。最重要。
                 patterns.append(f"{axis1}-{axis2}-{h}")
+
+                # 2着ズレも少し拾う。
                 patterns.append(f"{axis1}-{h}-{axis2}")
+
+                # 既存上位の頭違い・2着軸が強い場合の保険
+                prof_h = profiles.get(h, {})
+                if safe_int(prof_h.get("ライン順", 0), 0) in [2, 3] or safe_float(prof_h.get("3連対率", 0), 0.0) >= 40:
+                    patterns.append(f"{axis2}-{axis1}-{h}")
             else:
-                # axis2が取れない場合は、上位相手を使って3連系の形だけ作る
                 other_candidates = [c for c, _ in scored if c not in [axis1, h]]
                 if other_candidates:
                     o = other_candidates[0]
                     patterns.append(f"{axis1}-{o}-{h}")
+                    patterns.append(f"{axis1}-{h}-{o}")
 
             for t in patterns:
                 if t not in existing and not _ticket_contains_same_parts(t):
                     extra_tickets.append(t)
 
-    # 重複を消して最大2〜4点に制限
-    extra_tickets = list(dict.fromkeys(extra_tickets))[:max(3, min(5, int(max_add) + 1))]
+        # さらに「既存の本線1・2着 + 紐スコア上位」を明示的に補完
+        # 本線の2着までは合っていて3着だけ抜けるケース対策。
+        top_pairs = []
+        for t in base_tickets[:8]:
+            parts = _ticket_parts(t)
+            if len(parts) >= 2:
+                pair = (parts[0], parts[1])
+                if pair not in top_pairs and pair[0] != pair[1]:
+                    top_pairs.append(pair)
+        for a, b2 in top_pairs[:3]:
+            for h in himo_cars[:3]:
+                if h in [a, b2]:
+                    continue
+                t = f"{a}-{b2}-{h}"
+                if t not in existing and not _ticket_contains_same_parts(t):
+                    extra_tickets.append(t)
+
+    # 重複を消して候補数を少し多めに作る。
+    # 最終点数は apply_final_ticket_limit 側で必ず絞る。
+    extra_tickets = list(dict.fromkeys(extra_tickets))[:max(5, min(8, int(max_add) + 4))]
 
     if not extra_tickets:
         info["reason"] = "紐抜け対策AI: 追加候補なし"
         return pred_df, info
 
-    reason = f"紐抜け対策AI: 軸{axis1}固定 / 紐候補={','.join(map(str, himo_cars))}"
+    reason = f"紐抜け対策AI v39.3: 軸{axis1}固定 / 3着紐候補={','.join(map(str, himo_cars))}"
     extra_df = _make_extra_ticket_rows(
         pred_df,
         extra_tickets,
         reason=reason,
-        rank_label="抑え",
+        rank_label="穴",
     )
 
     if extra_df.empty:
         return pred_df, info
 
-    # v39.2: 紐抜けは別枠の抑えではなく、穴候補に統合する。
+    # v39.3: 紐抜けは穴候補として強めに統合する。
     if "買い目ランク" in extra_df.columns:
         extra_df["買い目ランク"] = "穴"
     if "AI評価" in extra_df.columns:
-        extra_df["AI評価"] = 66
+        extra_df["AI評価"] = 72
     if "期待値" in extra_df.columns:
-        extra_df["期待値"] = 105
+        extra_df["期待値"] = 110
+    if "買い目タイプ" in extra_df.columns:
+        extra_df["買い目タイプ"] = "準穴"
     extra_df["紐抜け対策AI"] = "ON"
+    extra_df["紐抜け特化v39_3"] = "ON"
 
     out = pd.concat([pred_df, extra_df], ignore_index=True)
     out = out.drop_duplicates(subset=["買い目"], keep="first").reset_index(drop=True)
