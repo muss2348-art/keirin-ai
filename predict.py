@@ -37,6 +37,26 @@ def normalize_ticket(ticket: str) -> str:
     return str(ticket).replace(" ", "").strip()
 
 
+ORDERED_TICKET_TYPES = {"3連単", "2車単", "2枠単"}
+THREE_NUMBER_TICKET_TYPES = {"3連単", "3連複"}
+FRAME_TICKET_TYPES = {"2枠単", "2枠複"}
+
+
+def car_to_frame(car: int) -> int:
+    """9車立ての車番を枠番へ変換。"""
+    car = safe_int(car, 0)
+    return {1: 1, 2: 2, 3: 3, 4: 4, 5: 4, 6: 5, 7: 5, 8: 6, 9: 6}.get(car, 0)
+
+
+def canonical_ticket(ticket: Tuple[int, ...], ticket_type: str) -> str:
+    values = tuple(int(x) for x in ticket)
+    if ticket_type in FRAME_TICKET_TYPES:
+        values = tuple(car_to_frame(x) for x in values)
+    if ticket_type not in ORDERED_TICKET_TYPES:
+        values = tuple(sorted(values))
+    return "-".join(str(x) for x in values)
+
+
 def prepare_df(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(columns=DEFAULT_COLUMNS)
@@ -314,18 +334,25 @@ def score_ticket(
     line_level = line_info.get("level", "中")
     line_score = safe_float(line_info.get("score", 0))
     n = len(ticket)
+    ordered = ticket_type in ORDERED_TICKET_TYPES
 
     score = 0.0
     reasons = []
 
     # 着順ごとの基礎評価
-    weights = [1.0, 0.72, 0.52] if n == 3 else [1.0, 0.72]
+    if ordered:
+        weights = [1.0, 0.72, 0.52] if n == 3 else [1.0, 0.72]
+    else:
+        weights = [0.78, 0.78, 0.78] if n == 3 else [0.86, 0.86]
     for i, car in enumerate(ticket):
         score += base_scores.get(int(car), 0.0) * weights[i]
 
-    head = int(ticket[0])
-    second = int(ticket[1]) if len(ticket) >= 2 else None
-    third = int(ticket[2]) if len(ticket) >= 3 else None
+    eval_ticket = tuple(ticket)
+    if not ordered:
+        eval_ticket = tuple(sorted(ticket, key=lambda x: base_scores.get(int(x), 0.0), reverse=True))
+    head = int(eval_ticket[0])
+    second = int(eval_ticket[1]) if len(eval_ticket) >= 2 else None
+    third = int(eval_ticket[2]) if len(eval_ticket) >= 3 else None
 
     # ライン素直パターン
     if second is not None and is_same_line(d, head, second):
@@ -453,7 +480,7 @@ def score_ticket(
                 reasons.append("G3三着穴")
 
     # オッズ/期待値
-    ticket_key = "-".join(str(x) for x in ticket)
+    ticket_key = canonical_ticket(ticket, ticket_type)
     odds = safe_float((odds_dict or {}).get(ticket_key, 0.0), 0.0)
 
     if odds > 0:
@@ -660,12 +687,22 @@ def generate_ticket_candidates(
     cars = [int(x) for x in d["車番"].tolist() if int(x) > 0]
 
     candidates = []
-    if ticket_type == "2車単":
+    if ticket_type in ["2車単", "2枠単"]:
         perms = itertools.permutations(cars, 2)
+    elif ticket_type in ["2車複", "ワイド", "2枠複"]:
+        perms = itertools.combinations(cars, 2)
+    elif ticket_type == "3連複":
+        perms = itertools.combinations(cars, 3)
     else:
         perms = itertools.permutations(cars, 3)
 
+    best_by_ticket = {}
+
     for ticket in perms:
+        if ticket_type in FRAME_TICKET_TYPES:
+            frames = [car_to_frame(x) for x in ticket]
+            if 0 in frames:
+                continue
         item = score_ticket(
             d,
             tuple(ticket),
@@ -677,7 +714,12 @@ def generate_ticket_candidates(
             race_type,
             line_info,
         )
-        candidates.append(item)
+        key = str(item.get("ticket", ""))
+        old = best_by_ticket.get(key)
+        if old is None or safe_float(item.get("score", 0)) > safe_float(old.get("score", 0)):
+            best_by_ticket[key] = item
+
+    candidates = list(best_by_ticket.values())
 
     candidates.sort(key=lambda x: (safe_float(x["score"]), safe_float(x["expected_value"])), reverse=True)
     return candidates
@@ -724,7 +766,10 @@ def generate_predictions(
     # 多めに見てから偏り補正
     pre_take = max(top_n * 6, 40)
     ranked = candidates[:pre_take]
-    selected = diversify_tickets(ranked, top_n, d, race_type=race_type)
+    if ticket_type in ["3連単", "2車単"]:
+        selected = diversify_tickets(ranked, top_n, d, race_type=race_type)
+    else:
+        selected = ranked[:top_n]
 
     race_eval = race_decision_from_candidates(selected, d, line_info, race_type)
 
