@@ -34,7 +34,7 @@ st.set_page_config(
     layout="centered",
 )
 
-APP_VERSION = "race-selector-mobile v2.4（市場シンクロAI版）"
+APP_VERSION = "race-selector-mobile v2.5（3連単・上位5人気決着AI版）"
 
 HEADERS = {
     "User-Agent": (
@@ -103,6 +103,14 @@ class RaceScore:
     ai_axis: int
     target_odds_count: int
     market_reason: str
+    top5_score: int
+    top5_judge: str
+    top5_axis: int
+    top5_axis_share: float
+    top5_rider_count: int
+    top5_concentration: float
+    top5_odds_text: str
+    top5_reason: str
     reason: str
     warnings: str
 
@@ -247,6 +255,13 @@ def analyze_market_sync(
         "target_count": 0,
         "reason": "オッズ未取得のため従来ロジックで判定",
         "warning": "",
+        "top5_raw_score": 0,
+        "top5_axis": 0,
+        "top5_axis_share": 0.0,
+        "top5_rider_count": 0,
+        "top5_concentration": 0.0,
+        "top5_odds_text": "",
+        "top5_reason": "3連単オッズ未取得",
     }
     try:
         odds_html, _ = fetch_html(build_odds_url(race_url))
@@ -265,6 +280,87 @@ def analyze_market_sync(
     second = float(top[1]["odds"])
     fifth = float(top[4]["odds"])
     target_count = sum(1 for row in odds_rows if target_min <= float(row["odds"]) <= target_max)
+
+    # ===== 3連単・1〜5番人気決着AI =====
+    top5_rows = odds_rows[:5]
+    top20_rows = odds_rows[:min(20, len(odds_rows))]
+    top5_first_counts: Dict[int, int] = {}
+    top5_riders = set()
+    for row in top5_rows:
+        combo = tuple(int(x) for x in row["combo"])
+        top5_first_counts[combo[0]] = top5_first_counts.get(combo[0], 0) + 1
+        top5_riders.update(combo)
+    top5_axis, top5_axis_count = max(top5_first_counts.items(), key=lambda x: x[1])
+    top5_axis_share = top5_axis_count / 5.0
+    implied_top5 = sum(1.0 / max(1.01, float(row["odds"])) for row in top5_rows)
+    implied_top20 = sum(1.0 / max(1.01, float(row["odds"])) for row in top20_rows)
+    top5_concentration = implied_top5 / implied_top20 if implied_top20 > 0 else 0.0
+    sixth_gap = (
+        float(odds_rows[5]["odds"]) / max(1.01, float(odds_rows[4]["odds"]))
+        if len(odds_rows) >= 6 else 1.0
+    )
+    top5_odds_text = " / ".join(
+        f"{i}人気 {row['combo'][0]}-{row['combo'][1]}-{row['combo'][2]}（{float(row['odds']):.1f}倍）"
+        for i, row in enumerate(top5_rows, start=1)
+    )
+
+    top5_raw_score = 45
+    top5_reasons = []
+    top5_warnings = []
+    if top5_concentration >= 0.70:
+        top5_raw_score += 18
+        top5_reasons.append("上位5人気への集中が非常に強い")
+    elif top5_concentration >= 0.58:
+        top5_raw_score += 12
+        top5_reasons.append("上位5人気への集中が強い")
+    elif top5_concentration >= 0.48:
+        top5_raw_score += 6
+        top5_reasons.append("上位5人気へ適度に集中")
+    else:
+        top5_raw_score -= 10
+        top5_warnings.append("人気が広く分散")
+
+    if top5_axis_share >= 0.80:
+        top5_raw_score += 18
+        top5_reasons.append(f"上位5中{top5_axis_count}通りが{top5_axis}番頭")
+    elif top5_axis_share >= 0.60:
+        top5_raw_score += 12
+        top5_reasons.append(f"上位5中{top5_axis_count}通りが{top5_axis}番頭")
+    elif top5_axis_share >= 0.40:
+        top5_raw_score += 5
+        top5_reasons.append("1着軸はやや集中")
+    else:
+        top5_raw_score -= 8
+        top5_warnings.append("1着軸が分散")
+
+    rider_count5 = len(top5_riders)
+    if rider_count5 <= 4:
+        top5_raw_score += 15
+        top5_reasons.append(f"登場選手が{rider_count5}名に凝縮")
+    elif rider_count5 == 5:
+        top5_raw_score += 9
+        top5_reasons.append("登場選手5名")
+    elif rider_count5 == 6:
+        top5_raw_score += 3
+    else:
+        top5_raw_score -= 8
+        top5_warnings.append(f"登場選手が{rider_count5}名と多い")
+
+    if int(result["ai_axis"] or 0) == top5_axis:
+        top5_raw_score += 12
+        top5_reasons.append(f"AI軸と上位人気軸が{top5_axis}番で一致")
+    elif int(result["ai_axis"] or 0):
+        top5_raw_score -= 8
+        top5_warnings.append("AI軸と上位人気軸が不一致")
+
+    if sixth_gap >= 1.20:
+        top5_raw_score += 7
+        top5_reasons.append("5番人気と6番人気に明確な差")
+    elif sixth_gap >= 1.08:
+        top5_raw_score += 3
+
+    top5_raw_score = int(max(0, min(100, top5_raw_score)))
+    top5_reason = " / ".join((top5_reasons + top5_warnings)[:6])
 
     first_counts: Dict[int, int] = {}
     for row in top[:8]:
@@ -336,6 +432,13 @@ def analyze_market_sync(
         "target_count": target_count,
         "reason": reason_text,
         "warning": " / ".join(warnings[:3]),
+        "top5_raw_score": top5_raw_score,
+        "top5_axis": top5_axis,
+        "top5_axis_share": round(top5_axis_share * 100.0, 1),
+        "top5_rider_count": rider_count5,
+        "top5_concentration": round(top5_concentration * 100.0, 1),
+        "top5_odds_text": top5_odds_text,
+        "top5_reason": top5_reason,
     })
     return result
 
@@ -1014,6 +1117,9 @@ def analyze_race(
         "status": "OFF", "shape": "従来判定", "sync": 0, "delta": 0,
         "favorite_odds": 0.0, "market_axis": 0, "ai_axis": 0,
         "target_count": 0, "reason": "市場シンクロAIはOFF", "warning": "",
+        "top5_raw_score": 0, "top5_axis": 0, "top5_axis_share": 0.0,
+        "top5_rider_count": 0, "top5_concentration": 0.0,
+        "top5_odds_text": "", "top5_reason": "市場シンクロAIはOFF",
     }
     if use_market_sync:
         market = analyze_market_sync(
@@ -1039,6 +1145,23 @@ def analyze_race(
         style = "バランス型"
 
     confidence = int(max(0, min(100, confidence)))
+
+    if market.get("status") == "取得成功":
+        top5_score = int(round(
+            safe_float(market.get("top5_raw_score", 0), 0) * 0.72
+            + confidence * 0.28
+        ))
+    else:
+        top5_score = 0
+    top5_score = int(max(0, min(100, top5_score)))
+    if top5_score >= 82:
+        top5_judge = "🔥 上位5人気決着・最有力"
+    elif top5_score >= 70:
+        top5_judge = "○ 上位5人気決着候補"
+    elif top5_score >= 58:
+        top5_judge = "△ やや分散"
+    else:
+        top5_judge = "見送り"
 
     if confidence >= 76:
         judge = "🔥 勝負"
@@ -1082,6 +1205,14 @@ def analyze_race(
         ai_axis=int(market.get("ai_axis", 0)),
         target_odds_count=int(market.get("target_count", 0)),
         market_reason=str(market.get("reason", "")),
+        top5_score=top5_score,
+        top5_judge=top5_judge,
+        top5_axis=int(market.get("top5_axis", 0)),
+        top5_axis_share=float(market.get("top5_axis_share", 0.0)),
+        top5_rider_count=int(market.get("top5_rider_count", 0)),
+        top5_concentration=float(market.get("top5_concentration", 0.0)),
+        top5_odds_text=str(market.get("top5_odds_text", "")),
+        top5_reason=str(market.get("top5_reason", "")),
         reason=" / ".join(reasons[:5]),
         warnings=" / ".join(warnings[:5]),
     )
@@ -1093,6 +1224,7 @@ def analyze_urls(
     use_market_sync: bool = True,
     target_odds_min: float = 8.0,
     target_odds_max: float = 30.0,
+    top5_mode: bool = False,
 ) -> Tuple[pd.DataFrame, List[str]]:
     rows = []
     errors = []
@@ -1109,6 +1241,15 @@ def analyze_urls(
             # 1R〜12R自動生成時、存在しないレースの404は自然にスキップする。
             if "404" not in msg:
                 errors.append(f"{url}：{e}")
+
+    if top5_mode:
+        rows = sorted(rows, key=lambda r: r.top5_score, reverse=True)
+        for i, row in enumerate(rows, start=1):
+            row.rank = i
+            row.confidence = int(row.top5_score)
+            row.judge = str(row.top5_judge)
+            row.style = "3連単・上位5人気決着狙い"
+        return pd.DataFrame([asdict(r) for r in rows]), errors
 
     rows = sorted(rows, key=lambda r: r.confidence, reverse=True)
 
@@ -1627,6 +1768,14 @@ st.caption(f"{APP_VERSION} / 買い目は出さず、狙うレースだけを選
 
 with st.sidebar:
     st.header("設定")
+    selection_mode = st.radio(
+        "選定モード",
+        options=["通常・市場シンクロ", "3連単・1〜5番人気決着AI"],
+        index=0,
+    )
+    top5_mode = selection_mode == "3連単・1〜5番人気決着AI"
+    if top5_mode:
+        st.caption("3連単の上位5人気内で決着しやすいレースをランキングします。")
     max_races = st.slider("最大チェックレース数", 1, 12, 12)
     min_display_conf = st.slider("一覧に表示する最低勝負度", 0, 100, 45)
     only_hot = st.checkbox("勝負・候補だけ表示", value=False)
@@ -1635,7 +1784,14 @@ with st.sidebar:
     show_mark_table = st.checkbox("指数・印表を表示", value=True)
     st.divider()
     st.subheader("📊 市場シンクロAI")
-    use_market_sync = st.checkbox("現在オッズを選定に使う", value=True)
+    use_market_sync = st.checkbox(
+        "現在オッズを選定に使う",
+        value=True,
+        disabled=top5_mode,
+        help="上位5人気決着AIでは現在オッズが必須です。",
+    )
+    if top5_mode:
+        use_market_sync = True
     target_odds_min = st.number_input(
         "狙い目オッズ下限", min_value=1.0, max_value=999.0, value=8.0, step=1.0
     )
@@ -1699,9 +1855,10 @@ if run:
             use_market_sync=use_market_sync,
             target_odds_min=float(target_odds_min),
             target_odds_max=float(target_odds_max),
+            top5_mode=top5_mode,
         )
 
-    if national_mode and df is not None and not df.empty:
+    if national_mode and not top5_mode and df is not None and not df.empty:
         df = apply_national_relative_judgment(df)
 
     # AIが見たレース形状を保存
@@ -1721,9 +1878,16 @@ if run:
 
     show_df = df[df["confidence"] >= min_display_conf].copy()
     if only_hot:
-        show_df = show_df[show_df["judge"].isin(["🔥 勝負", "○ 候補"])]
+        hot_labels = (
+            ["🔥 上位5人気決着・最有力", "○ 上位5人気決着候補"]
+            if top5_mode else ["🔥 勝負", "○ 候補"]
+        )
+        show_df = show_df[show_df["judge"].isin(hot_labels)]
 
-    st.subheader("🔥 全国勝負候補ランキング" if national_mode else "🔥 今日の勝負候補ランキング")
+    if top5_mode:
+        st.subheader("🎯 全国・上位5人気決着ランキング" if national_mode else "🎯 上位5人気決着ランキング")
+    else:
+        st.subheader("🔥 全国勝負候補ランキング" if national_mode else "🔥 今日の勝負候補ランキング")
 
     if show_df.empty:
         st.warning("表示条件に合うレースがありません。最低勝負度を下げてください。")
@@ -1731,10 +1895,25 @@ if run:
         for _, r in show_df.iterrows():
             with st.container(border=True):
                 st.markdown(f"### {int(r['rank'])}位　{r['race_name']}")
-                st.progress(int(r['confidence']) / 100.0, text=f"勝負度 {int(r['confidence'])}%")
+                progress_label = "上位5人気決着スコア" if top5_mode else "勝負度"
+                st.progress(int(r['confidence']) / 100.0, text=f"{progress_label} {int(r['confidence'])}点")
                 st.write(f"**判定:** {r['judge']}  /  **タイプ:** {r['style']}")
-                st.write(f"**買い材料:** {r['reason']}")
-                st.caption(f"注意点: {r['warnings']}")
+                if top5_mode:
+                    st.write(f"**🎯 上位5人気分析:** {r.get('top5_reason', '')}")
+                    st.write(
+                        f"**共通軸:** {int(r.get('top5_axis', 0))}番 / "
+                        f"頭一致率 {float(r.get('top5_axis_share', 0)):.1f}% / "
+                        f"登場選手 {int(r.get('top5_rider_count', 0))}名 / "
+                        f"上位5集中度 {float(r.get('top5_concentration', 0)):.1f}%"
+                    )
+                    with st.expander("3連単・1〜5番人気の買い目とオッズ"):
+                        for item in str(r.get("top5_odds_text", "")).split(" / "):
+                            if item:
+                                st.write(item)
+                    st.caption(f"展開材料: {r['reason']} / 注意点: {r['warnings']}")
+                else:
+                    st.write(f"**買い材料:** {r['reason']}")
+                    st.caption(f"注意点: {r['warnings']}")
                 if use_market_sync:
                     if str(r.get("market_status", "")) == "取得成功":
                         fav = float(r.get("favorite_odds", 0.0))
@@ -1804,9 +1983,14 @@ if run:
 
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("勝負", int((df["judge"] == "🔥 勝負").sum()))
-    c2.metric("候補", int((df["judge"] == "○ 候補").sum()))
-    c3.metric("軽め", int((df["judge"] == "△ 軽め").sum()))
+    if top5_mode:
+        c1.metric("最有力", int((df["judge"] == "🔥 上位5人気決着・最有力").sum()))
+        c2.metric("候補", int((df["judge"] == "○ 上位5人気決着候補").sum()))
+        c3.metric("やや分散", int((df["judge"] == "△ やや分散").sum()))
+    else:
+        c1.metric("勝負", int((df["judge"] == "🔥 勝負").sum()))
+        c2.metric("候補", int((df["judge"] == "○ 候補").sum()))
+        c3.metric("軽め", int((df["judge"] == "△ 軽め").sum()))
     c4.metric("見送り", int((df["judge"] == "見送り").sum()))
 
     st.subheader("投稿用メモ")
