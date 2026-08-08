@@ -1,6 +1,4 @@
 streamlit
 pandas
-selenium
 requests
 beautifulsoup4
-lxml
