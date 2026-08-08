@@ -34,7 +34,7 @@ st.set_page_config(
     layout="centered",
 )
 
-APP_VERSION = "race-selector-mobile v2.3（指数印表調整版）"
+APP_VERSION = "race-selector-mobile v2.4（市場シンクロAI版）"
 
 HEADERS = {
     "User-Agent": (
@@ -94,6 +94,15 @@ class RaceScore:
     b_data_count: int
     h_data_count: int
     advanced_data_count: int
+    market_status: str
+    market_shape: str
+    market_sync: int
+    market_delta: int
+    favorite_odds: float
+    market_axis: int
+    ai_axis: int
+    target_odds_count: int
+    market_reason: str
     reason: str
     warnings: str
 
@@ -120,6 +129,215 @@ def safe_float(v, default=0.0) -> float:
         return float(str(v).replace(",", "").replace("%", "").strip())
     except Exception:
         return float(default)
+
+
+def build_odds_url(racecard_url: str) -> str:
+    """WINTICKETの出走表URLを同一レースのオッズURLへ変換する。"""
+    return re.sub(r"/racecard/", "/odds/", racecard_url, count=1)
+
+
+def _add_trifecta_odds(
+    store: Dict[Tuple[int, int, int], float],
+    first,
+    second,
+    third,
+    odds,
+) -> None:
+    try:
+        combo = (int(first), int(second), int(third))
+        value = float(str(odds).replace(",", "").strip())
+    except Exception:
+        return
+    if len(set(combo)) != 3 or not all(1 <= x <= 9 for x in combo):
+        return
+    if not (1.0 <= value <= 9999.9):
+        return
+    old = store.get(combo)
+    if old is None or value < old:
+        store[combo] = round(value, 1)
+
+
+def extract_trifecta_odds(html: str) -> List[Dict[str, object]]:
+    """
+    WINTICKETのHTML・埋め込みJSONから3連単の組番とオッズを抽出する。
+    サイト側のキー名や表示区切りの揺れに備えて複数形式を読む。
+    """
+    if not html:
+        return []
+
+    found: Dict[Tuple[int, int, int], float] = {}
+    normalized = html.replace("\\u003e", ">").replace("&gt;", ">")
+
+    # 埋め込みJSON: combination/order/number が配列または文字列の形式。
+    json_patterns = [
+        r'"(?:combination|order|numbers?|selection)"\s*:\s*\[\s*([1-9])\s*,\s*([1-9])\s*,\s*([1-9])\s*\][^{}]{0,220}?"(?:odds|rate|ratio)"\s*:\s*"?([0-9]+(?:\.[0-9]+)?)',
+        r'"(?:combination|order|numbers?|selection)"\s*:\s*"?([1-9])\s*[-=>]\s*([1-9])\s*[-=>]\s*([1-9])"?[^{}]{0,220}?"(?:odds|rate|ratio)"\s*:\s*"?([0-9]+(?:\.[0-9]+)?)',
+        r'"(?:odds|rate|ratio)"\s*:\s*"?([0-9]+(?:\.[0-9]+)?)"?[^{}]{0,220}?"(?:combination|order|numbers?|selection)"\s*:\s*\[\s*([1-9])\s*,\s*([1-9])\s*,\s*([1-9])\s*\]',
+    ]
+    for pattern_idx, pattern in enumerate(json_patterns):
+        for m in re.finditer(pattern, normalized, flags=re.I):
+            if pattern_idx == 2:
+                _add_trifecta_odds(found, m.group(2), m.group(3), m.group(4), m.group(1))
+            else:
+                _add_trifecta_odds(found, m.group(1), m.group(2), m.group(3), m.group(4))
+
+    # 画面本文: 「1-2-3 12.4」「1→2→3 12.4倍」など。
+    text = normalize_text(BeautifulSoup(html, "html.parser").get_text(" "))
+    for m in re.finditer(
+        r'(?<!\d)([1-9])\s*(?:-|>|→)\s*([1-9])\s*(?:-|>|→)\s*([1-9])'
+        r'\s*(?:番人気)?\s*([0-9]{1,4}(?:\.[0-9])?)\s*倍?',
+        text,
+    ):
+        _add_trifecta_odds(found, m.group(1), m.group(2), m.group(3), m.group(4))
+
+    rows = [
+        {"combo": combo, "odds": odds}
+        for combo, odds in found.items()
+    ]
+    return sorted(rows, key=lambda x: float(x["odds"]))
+
+
+def estimate_ai_axis(html: str, lineup: str) -> int:
+    """得点・B/H・ライン位置から、市場と比較するための簡易1着軸を作る。"""
+    players = extract_player_blocks_for_mark_table(html)
+    if not players:
+        return 0
+    line_info = parse_lineup_positions_for_mark(lineup)
+    best_car = 0
+    best_value = -999.0
+    for idx, player in enumerate(players, start=1):
+        info = line_info.get(idx, {})
+        point = safe_float(player.get("race_point", 0), 0)
+        back = int(safe_float(player.get("back", 0), 0))
+        home = int(safe_float(player.get("home", 0), 0))
+        pos = int(info.get("line_pos", 0) or 0)
+        size = int(info.get("line_size", 0) or 0)
+        single = int(info.get("is_single", 0) or 0)
+        value = point + min(back, 14) * 0.28 + min(home, 14) * 0.18
+        if size >= 3:
+            value += 2.0
+        if pos == 1:
+            value += 1.8
+        elif pos == 2:
+            value += 2.5
+        if single:
+            value -= 2.0
+        if value > best_value:
+            best_value = value
+            best_car = idx
+    return best_car
+
+
+def analyze_market_sync(
+    race_url: str,
+    race_html: str,
+    lineup: str,
+    target_min: float,
+    target_max: float,
+) -> Dict[str, object]:
+    """現在オッズの形とAI軸の一致度を分析し、従来の勝負度への補正を返す。"""
+    result: Dict[str, object] = {
+        "status": "未取得",
+        "shape": "従来判定",
+        "sync": 0,
+        "delta": 0,
+        "favorite_odds": 0.0,
+        "market_axis": 0,
+        "ai_axis": estimate_ai_axis(race_html, lineup),
+        "target_count": 0,
+        "reason": "オッズ未取得のため従来ロジックで判定",
+        "warning": "",
+    }
+    try:
+        odds_html, _ = fetch_html(build_odds_url(race_url))
+        odds_rows = extract_trifecta_odds(odds_html)
+    except Exception as exc:
+        result["warning"] = f"オッズ取得失敗: {str(exc)[:45]}"
+        return result
+
+    if len(odds_rows) < 5:
+        result["status"] = "発売前・不足"
+        result["warning"] = "3連単オッズが5通り未満"
+        return result
+
+    top = odds_rows[:min(12, len(odds_rows))]
+    favorite = float(top[0]["odds"])
+    second = float(top[1]["odds"])
+    fifth = float(top[4]["odds"])
+    target_count = sum(1 for row in odds_rows if target_min <= float(row["odds"]) <= target_max)
+
+    first_counts: Dict[int, int] = {}
+    for row in top[:8]:
+        first = int(row["combo"][0])
+        first_counts[first] = first_counts.get(first, 0) + 1
+    market_axis, market_axis_count = max(first_counts.items(), key=lambda x: x[1])
+    axis_share = market_axis_count / max(1, min(8, len(top)))
+    ai_axis = int(result["ai_axis"] or 0)
+
+    delta = 0
+    reasons = []
+    warnings = []
+
+    # 人気がほぼ横並びなら「10倍前後」でも市場が迷っている危険な混戦。
+    is_chaos = second / favorite <= 1.12 and fifth / favorite <= 1.45
+    is_axis_clear = axis_share >= 0.50
+
+    if is_chaos:
+        shape = "人気横並び・大混戦"
+        delta -= 12
+        warnings.append("上位人気が横並び")
+    elif is_axis_clear:
+        shape = "軸集中・着順分散"
+        delta += 6
+        reasons.append("市場の1着軸が明確")
+    else:
+        shape = "適度な分散"
+        delta += 1
+        reasons.append("極端な人気集中なし")
+
+    if ai_axis and ai_axis == market_axis:
+        sync = 100
+        delta += 9
+        reasons.append(f"AI軸と市場軸が{ai_axis}番で一致")
+    elif ai_axis:
+        sync = 35
+        delta -= 8
+        warnings.append(f"AI軸{ai_axis}番と市場軸{market_axis}番が不一致")
+    else:
+        sync = 0
+        warnings.append("AI軸を特定できず")
+
+    if target_min <= favorite <= target_max:
+        delta += 5
+        reasons.append("1番人気が希望オッズ帯")
+    elif favorite < target_min:
+        delta -= 5
+        warnings.append("本命側が希望より低配当")
+    else:
+        delta -= 4
+        warnings.append("1番人気から高く市場混戦")
+
+    if target_count >= 3:
+        delta += 3
+        reasons.append(f"希望帯に{target_count}通り")
+    elif target_count == 0:
+        delta -= 3
+        warnings.append("希望オッズ帯の候補なし")
+
+    delta = int(max(-20, min(20, delta)))
+    reason_text = " / ".join((reasons + warnings)[:5]) or "市場材料は中立"
+    result.update({
+        "status": "取得成功",
+        "shape": shape,
+        "sync": sync,
+        "delta": delta,
+        "favorite_odds": round(favorite, 1),
+        "market_axis": market_axis,
+        "target_count": target_count,
+        "reason": reason_text,
+        "warning": " / ".join(warnings[:3]),
+    })
+    return result
 
 
 def fetch_html(url: str) -> Tuple[str, str]:
@@ -653,7 +871,12 @@ def analyze_bh_strategy(b_counts: List[int], h_counts: List[int]) -> Dict[str, o
     return info
 
 
-def analyze_race(url: str) -> RaceScore:
+def analyze_race(
+    url: str,
+    use_market_sync: bool = True,
+    target_odds_min: float = 8.0,
+    target_odds_max: float = 30.0,
+) -> RaceScore:
     html, final_url = fetch_html(url)
     soup = BeautifulSoup(html, "html.parser")
     title = normalize_text(soup.title.get_text(" ") if soup.title else "")
@@ -787,6 +1010,26 @@ def analyze_race(url: str) -> RaceScore:
         confidence -= 12
         warnings.append("出走情報不足の可能性")
 
+    market = {
+        "status": "OFF", "shape": "従来判定", "sync": 0, "delta": 0,
+        "favorite_odds": 0.0, "market_axis": 0, "ai_axis": 0,
+        "target_count": 0, "reason": "市場シンクロAIはOFF", "warning": "",
+    }
+    if use_market_sync:
+        market = analyze_market_sync(
+            final_url,
+            html,
+            lineup,
+            target_odds_min,
+            target_odds_max,
+        )
+        confidence += int(market.get("delta", 0))
+        if market.get("status") == "取得成功":
+            reasons.append(f"市場補正 {int(market.get('delta', 0)):+d}点")
+        market_warning = str(market.get("warning", ""))
+        if market_warning:
+            warnings.append(market_warning)
+
     # レースタイプ
     if score_gap >= 3.0 and main_line_size >= 2:
         style = "的中率重視向き"
@@ -830,17 +1073,37 @@ def analyze_race(url: str) -> RaceScore:
         b_data_count=b_data_count,
         h_data_count=h_data_count,
         advanced_data_count=advanced_data_count,
+        market_status=str(market.get("status", "未取得")),
+        market_shape=str(market.get("shape", "従来判定")),
+        market_sync=int(market.get("sync", 0)),
+        market_delta=int(market.get("delta", 0)),
+        favorite_odds=float(market.get("favorite_odds", 0.0)),
+        market_axis=int(market.get("market_axis", 0)),
+        ai_axis=int(market.get("ai_axis", 0)),
+        target_odds_count=int(market.get("target_count", 0)),
+        market_reason=str(market.get("reason", "")),
         reason=" / ".join(reasons[:5]),
         warnings=" / ".join(warnings[:5]),
     )
 
 
-def analyze_urls(urls: List[str], max_races: int) -> Tuple[pd.DataFrame, List[str]]:
+def analyze_urls(
+    urls: List[str],
+    max_races: int,
+    use_market_sync: bool = True,
+    target_odds_min: float = 8.0,
+    target_odds_max: float = 30.0,
+) -> Tuple[pd.DataFrame, List[str]]:
     rows = []
     errors = []
     for url in urls[:max_races]:
         try:
-            rows.append(analyze_race(url))
+            rows.append(analyze_race(
+                url,
+                use_market_sync=use_market_sync,
+                target_odds_min=target_odds_min,
+                target_odds_max=target_odds_max,
+            ))
         except Exception as e:
             msg = str(e)
             # 1R〜12R自動生成時、存在しないレースの404は自然にスキップする。
@@ -1370,6 +1633,17 @@ with st.sidebar:
     national_mode = st.checkbox("全国開催を自動取得して比較", value=False)
     max_national_venues = st.slider("全国取得する最大開催数", 1, 12, 6)
     show_mark_table = st.checkbox("指数・印表を表示", value=True)
+    st.divider()
+    st.subheader("📊 市場シンクロAI")
+    use_market_sync = st.checkbox("現在オッズを選定に使う", value=True)
+    target_odds_min = st.number_input(
+        "狙い目オッズ下限", min_value=1.0, max_value=999.0, value=8.0, step=1.0
+    )
+    target_odds_max = st.number_input(
+        "狙い目オッズ上限", min_value=2.0, max_value=9999.0, value=30.0, step=1.0
+    )
+    if target_odds_max <= target_odds_min:
+        st.warning("上限は下限より大きくしてください。")
     st.caption("レース形状ログ: race_selection_log.csv")
     st.divider()
     st.caption("レースURLを1つ入れると、同開催の1R〜12Rを自動チェックします。複数URLもOKです。")
@@ -1387,6 +1661,10 @@ with col_b:
     st.info("買い目は今の完全版/Mobile版で出す前提。ここでは“どのレースを買うか”だけ判定します。")
 
 if run:
+    if use_market_sync and target_odds_max <= target_odds_min:
+        st.error("狙い目オッズ上限を下限より大きくしてください。")
+        st.stop()
+
     input_urls = clean_urls(url_text)
 
     all_urls = []
@@ -1415,7 +1693,13 @@ if run:
         st.caption(f"チェック対象: {len(all_urls)}レース")
 
     with st.spinner("AIがレースを選定中..."):
-        df, errors = analyze_urls(all_urls, max_races=len(all_urls))
+        df, errors = analyze_urls(
+            all_urls,
+            max_races=len(all_urls),
+            use_market_sync=use_market_sync,
+            target_odds_min=float(target_odds_min),
+            target_odds_max=float(target_odds_max),
+        )
 
     if national_mode and df is not None and not df.empty:
         df = apply_national_relative_judgment(df)
@@ -1451,6 +1735,23 @@ if run:
                 st.write(f"**判定:** {r['judge']}  /  **タイプ:** {r['style']}")
                 st.write(f"**買い材料:** {r['reason']}")
                 st.caption(f"注意点: {r['warnings']}")
+                if use_market_sync:
+                    if str(r.get("market_status", "")) == "取得成功":
+                        fav = float(r.get("favorite_odds", 0.0))
+                        st.write(
+                            f"**📊 市場シンクロ:** {r.get('market_shape', '')} / "
+                            f"補正 {int(r.get('market_delta', 0)):+d}点 / "
+                            f"AI軸 {int(r.get('ai_axis', 0))}番・市場軸 {int(r.get('market_axis', 0))}番"
+                        )
+                        st.caption(
+                            f"1番人気 {fav:.1f}倍 / 希望帯 {int(r.get('target_odds_count', 0))}通り / "
+                            f"{r.get('market_reason', '')}"
+                        )
+                    else:
+                        st.caption(
+                            f"📊 市場シンクロ: {r.get('market_status', '未取得')}。"
+                            "オッズ補正なしで従来ロジックを使用"
+                        )
                 st.caption(f"人数 {int(r['riders'])} / 得点差 {r['score_gap']} / ライン数 {int(r['line_count'])} / 単騎 {int(r['solo_count'])}")
                 st.link_button("WINTICKETで開く", r['race_url'], use_container_width=True)
 
