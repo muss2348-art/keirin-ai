@@ -29,7 +29,7 @@ st.set_page_config(
     layout="centered",
 )
 
-st.caption("✅ mobile 一本化版 v39.4（市場シンクロ買い目AI・点数厳守）")
+st.caption("✅ mobile 一本化版 v39.5（全7券種・市場シンクロAI・点数厳守）")
 
 HEADERS = {
     "User-Agent": (
@@ -1127,6 +1127,30 @@ def normalize_ticket(ticket: str) -> str:
     return s
 
 
+ALL_TICKET_TYPES = ["3連単", "3連複", "2車単", "2車複", "ワイド", "2枠単", "2枠複"]
+ORDERED_TICKET_TYPES = {"3連単", "2車単", "2枠単"}
+THREE_NUMBER_TICKET_TYPES = {"3連単", "3連複"}
+FRAME_TICKET_TYPES = {"2枠単", "2枠複"}
+
+
+def car_to_frame(car) -> int:
+    car = safe_int(car, 0)
+    return {1: 1, 2: 2, 3: 3, 4: 4, 5: 4, 6: 5, 7: 5, 8: 6, 9: 6}.get(car, 0)
+
+
+def canonical_ticket_for_type(ticket: str, ticket_type: str) -> str:
+    key = normalize_ticket(ticket)
+    parts = [safe_int(x, 0) for x in key.split("-") if x != ""]
+    expected = 3 if ticket_type in THREE_NUMBER_TICKET_TYPES else 2
+    if len(parts) != expected or any(x <= 0 for x in parts):
+        return ""
+    if ticket_type not in FRAME_TICKET_TYPES and len(set(parts)) != expected:
+        return ""
+    if ticket_type not in ORDERED_TICKET_TYPES:
+        parts = sorted(parts)
+    return "-".join(map(str, parts))
+
+
 def _ticket_head(ticket: str) -> int:
     key = normalize_ticket(ticket)
     m = re.match(r"([1-9])(?:-|$)", key)
@@ -1136,6 +1160,7 @@ def _ticket_head(ticket: str) -> int:
 def apply_market_sync_to_tickets(
     pred_df: pd.DataFrame,
     odds_dict: dict,
+    ticket_type: str = "3連単",
     enabled: bool = True,
     target_min: float = 8.0,
     target_max: float = 30.0,
@@ -1162,7 +1187,7 @@ def apply_market_sync_to_tickets(
     out = pred_df.copy()
     clean_odds = {}
     for key, value in (odds_dict or {}).items():
-        ticket = normalize_ticket(key)
+        ticket = canonical_ticket_for_type(key, ticket_type)
         odd = safe_float(value, 0.0)
         if ticket and odd > 0:
             clean_odds[ticket] = odd
@@ -1187,28 +1212,33 @@ def apply_market_sync_to_tickets(
 
     # 追加AIで作られた候補にも、取得済みオッズを確実に付ける。
     for idx, row in out.iterrows():
-        key = normalize_ticket(row.get("買い目", ""))
+        key = canonical_ticket_for_type(row.get("買い目", ""), ticket_type)
         fetched = safe_float(clean_odds.get(key, 0.0), 0.0)
         current = safe_float(row.get("オッズ", 0.0), 0.0)
         if fetched > 0 or current <= 0:
             out.at[idx, "オッズ"] = fetched
 
-    # AI軸: 上位候補のAI評価を重みにして決定。
+    ordered = ticket_type in ORDERED_TICKET_TYPES
+
+    # AI軸: 単式は1着車、複式・ワイドは上位候補への登場頻度で決定。
     ai_head_scores = {}
     ai_source = out.sort_values("AI評価", ascending=False).head(min(10, len(out)))
     for pos, (_, row) in enumerate(ai_source.iterrows()):
-        head = _ticket_head(row.get("買い目", ""))
-        if head:
-            ai_head_scores[head] = ai_head_scores.get(head, 0.0) + max(1.0, safe_float(row.get("AI評価", 0), 0)) + (10 - pos)
+        key = canonical_ticket_for_type(row.get("買い目", ""), ticket_type)
+        parts = [safe_int(x, 0) for x in key.split("-") if x]
+        axes = parts[:1] if ordered else parts
+        for axis in axes:
+            ai_head_scores[axis] = ai_head_scores.get(axis, 0.0) + max(1.0, safe_float(row.get("AI評価", 0), 0)) + (10 - pos)
     ai_axis = max(ai_head_scores, key=ai_head_scores.get) if ai_head_scores else 0
 
-    # 市場軸: 低オッズ上位12通りの1着出現数を、人気順で重み付け。
+    # 市場軸: 単式は1着、複式・ワイドは上位人気への登場頻度で決定。
     market_top = sorted(clean_odds.items(), key=lambda x: x[1])[:12]
     market_head_scores = {}
     for pos, (ticket, _) in enumerate(market_top):
-        head = _ticket_head(ticket)
-        if head:
-            market_head_scores[head] = market_head_scores.get(head, 0.0) + max(1, 12 - pos)
+        parts = [safe_int(x, 0) for x in ticket.split("-") if x]
+        axes = parts[:1] if ordered else parts
+        for axis in axes:
+            market_head_scores[axis] = market_head_scores.get(axis, 0.0) + max(1, 12 - pos)
     market_axis = max(market_head_scores, key=market_head_scores.get) if market_head_scores else 0
     axis_match = bool(ai_axis and market_axis and ai_axis == market_axis)
 
@@ -1218,19 +1248,21 @@ def apply_market_sync_to_tickets(
     reason_values = []
 
     for idx, row in out.iterrows():
-        ticket = normalize_ticket(row.get("買い目", ""))
-        head = _ticket_head(ticket)
+        ticket = canonical_ticket_for_type(row.get("買い目", ""), ticket_type)
+        parts = [safe_int(x, 0) for x in ticket.split("-") if x]
+        contains_ai_axis = ai_axis in parts if not ordered else bool(parts and parts[0] == ai_axis)
+        contains_market_axis = market_axis in parts if not ordered else bool(parts and parts[0] == market_axis)
         odds = safe_float(out.at[idx, "オッズ"], 0.0)
         delta = 0.0
         reasons = []
 
-        if ai_axis and head == ai_axis:
+        if ai_axis and contains_ai_axis:
             delta += 4.0
             reasons.append("AI軸")
-        if market_axis and head == market_axis:
+        if market_axis and contains_market_axis:
             delta += 5.0
             reasons.append("市場軸")
-        if axis_match and head == ai_axis:
+        if axis_match and contains_ai_axis:
             delta += 5.0
             reasons.append("軸一致")
 
@@ -2638,9 +2670,7 @@ def judge_hit(ticket_type: str, pred_df: pd.DataFrame, result_1: str, result_2: 
             "result_text": "",
         }
 
-    if ticket_type == "2車単":
-        result_ticket = f"{r1}-{r2}"
-    else:
+    if ticket_type in THREE_NUMBER_TICKET_TYPES or ticket_type == "ワイド":
         if not r3:
             return {
                 "status_label": "未結果",
@@ -2648,15 +2678,41 @@ def judge_hit(ticket_type: str, pred_df: pd.DataFrame, result_1: str, result_2: 
                 "hit_ticket": "",
                 "result_text": "",
             }
-        result_ticket = f"{r1}-{r2}-{r3}"
+    cars = [safe_int(r1, 0), safe_int(r2, 0), safe_int(r3, 0)]
+    if cars[0] <= 0 or cars[1] <= 0:
+        return {"status_label": "未結果", "hit_any": False, "hit_ticket": "", "result_text": ""}
 
-    tickets = pred_df["買い目"].astype(str).tolist() if "買い目" in pred_df.columns else []
-    hit_any = result_ticket in tickets
+    winning = []
+    if ticket_type == "3連単":
+        winning = [f"{cars[0]}-{cars[1]}-{cars[2]}"]
+    elif ticket_type == "3連複":
+        winning = ["-".join(map(str, sorted(cars[:3])))]
+    elif ticket_type == "2車単":
+        winning = [f"{cars[0]}-{cars[1]}"]
+    elif ticket_type == "2車複":
+        winning = ["-".join(map(str, sorted(cars[:2])))]
+    elif ticket_type == "ワイド":
+        winning = ["-".join(map(str, pair)) for pair in itertools.combinations(sorted(cars[:3]), 2)]
+    elif ticket_type in FRAME_TICKET_TYPES:
+        frames = [car_to_frame(cars[0]), car_to_frame(cars[1])]
+        if ticket_type == "2枠複":
+            frames = sorted(frames)
+        winning = ["-".join(map(str, frames))]
+    else:
+        winning = [f"{cars[0]}-{cars[1]}"]
+
+    tickets = {
+        canonical_ticket_for_type(x, ticket_type)
+        for x in (pred_df["買い目"].astype(str).tolist() if "買い目" in pred_df.columns else [])
+    }
+    hit_tickets = [x for x in winning if x in tickets]
+    hit_any = bool(hit_tickets)
+    result_ticket = " / ".join(winning)
 
     return {
         "status_label": "的中" if hit_any else "不的中",
         "hit_any": hit_any,
-        "hit_ticket": result_ticket if hit_any else "",
+        "hit_ticket": " / ".join(hit_tickets),
         "result_text": result_ticket,
     }
 
@@ -4541,60 +4597,39 @@ def extract_odds_loose(text: str, ticket_type: str):
     s = normalize_text(text)
     results = {}
 
-    if ticket_type == "2車単":
-        patterns = [
-            re.compile(r'(?<!\d)([1-9])\s*-\s*([1-9])\s+([0-9]+(?:\.[0-9]+)?)(?!\d)'),
-            re.compile(r'"combination"\s*:\s*"([1-9]-[1-9])".{0,80}?"odds"\s*:\s*([0-9]+(?:\.[0-9]+)?)'),
-            re.compile(r'([1-9]-[1-9]).{0,80}?"odds"\s*:\s*([0-9]+(?:\.[0-9]+)?)'),
-            re.compile(r'"odds"\s*:\s*([0-9]+(?:\.[0-9]+)?).{0,80}?([1-9]-[1-9])'),
-        ]
-    else:
-        patterns = [
-            re.compile(r'(?<!\d)([1-9])\s*-\s*([1-9])\s*-\s*([1-9])\s+([0-9]+(?:\.[0-9]+)?)(?!\d)'),
-            re.compile(r'"combination"\s*:\s*"([1-9]-[1-9]-[1-9])".{0,80}?"odds"\s*:\s*([0-9]+(?:\.[0-9]+)?)'),
-            re.compile(r'([1-9]-[1-9]-[1-9]).{0,80}?"odds"\s*:\s*([0-9]+(?:\.[0-9]+)?)'),
-            re.compile(r'"odds"\s*:\s*([0-9]+(?:\.[0-9]+)?).{0,80}?([1-9]-[1-9]-[1-9])'),
-        ]
+    three = ticket_type in THREE_NUMBER_TICKET_TYPES
+    combo_pat = r"([1-9]-[1-9]-[1-9])" if three else r"([1-9]-[1-9])"
+    spaced_pat = (
+        r"(?<!\d)([1-9])\s*-\s*([1-9])\s*-\s*([1-9])\s+([0-9]+(?:\.[0-9]+)?)(?!\d)"
+        if three else
+        r"(?<!\d)([1-9])\s*-\s*([1-9])\s+([0-9]+(?:\.[0-9]+)?)(?!\d)"
+    )
+    patterns = [
+        (re.compile(spaced_pat), "spaced"),
+        (re.compile(r'"combination"\s*:\s*"' + combo_pat + r'".{0,100}?"odds"\s*:\s*([0-9]+(?:\.[0-9]+)?)'), "key_first"),
+        (re.compile(combo_pat + r'.{0,100}?"odds"\s*:\s*([0-9]+(?:\.[0-9]+)?)'), "key_first"),
+        (re.compile(r'"odds"\s*:\s*([0-9]+(?:\.[0-9]+)?).{0,100}?' + combo_pat), "odds_first"),
+    ]
 
-    for pat in patterns:
+    for pat, kind in patterns:
         for m in pat.finditer(s):
             groups = m.groups()
-
-            if ticket_type == "2車単":
-                if len(groups) == 3:
-                    a, b, odds = groups
-                    key = f"{a}-{b}"
-                    val = safe_float(odds, 0.0)
-                elif len(groups) == 2:
-                    if "-" in groups[0]:
-                        key = normalize_ticket(groups[0])
-                        val = safe_float(groups[1], 0.0)
-                    else:
-                        val = safe_float(groups[0], 0.0)
-                        key = normalize_ticket(groups[1])
+            if kind == "spaced":
+                if three:
+                    raw_key = f"{groups[0]}-{groups[1]}-{groups[2]}"
+                    val = safe_float(groups[3], 0.0)
                 else:
-                    continue
-
-                if len(key.split("-")) == 2 and len(set(key.split("-"))) == 2 and val > 0:
-                    results[key] = val
-
+                    raw_key = f"{groups[0]}-{groups[1]}"
+                    val = safe_float(groups[2], 0.0)
+            elif kind == "key_first":
+                raw_key = groups[0]
+                val = safe_float(groups[1], 0.0)
             else:
-                if len(groups) == 4:
-                    a, b, c, odds = groups
-                    key = f"{a}-{b}-{c}"
-                    val = safe_float(odds, 0.0)
-                elif len(groups) == 2:
-                    if "-" in groups[0]:
-                        key = normalize_ticket(groups[0])
-                        val = safe_float(groups[1], 0.0)
-                    else:
-                        val = safe_float(groups[0], 0.0)
-                        key = normalize_ticket(groups[1])
-                else:
-                    continue
-
-                if len(key.split("-")) == 3 and len(set(key.split("-"))) == 3 and val > 0:
-                    results[key] = val
+                val = safe_float(groups[0], 0.0)
+                raw_key = groups[1]
+            key = canonical_ticket_for_type(raw_key, ticket_type)
+            if key and val > 0:
+                results[key] = val
 
     return results
 
@@ -4683,7 +4718,7 @@ def save_result_log(
                 ]
             )
 
-        if ticket_type == "2車単":
+        if ticket_type in ["2車単", "2車複", "2枠単", "2枠複"]:
             result_text = "-".join([x for x in [result_1, result_2] if x])
         else:
             result_text = "-".join([x for x in [result_1, result_2, result_3] if x])
@@ -4792,12 +4827,25 @@ with st.sidebar:
         init_state(num_riders)
         st.rerun()
 
+    ticket_type_options = ALL_TICKET_TYPES if num_riders == 9 else [
+        "3連単", "3連複", "2車単", "2車複", "ワイド"
+    ]
+    ticket_type_default = st.session_state.get("ticket_type", "3連単")
+    if ticket_type_default not in ticket_type_options:
+        ticket_type_default = "3連単"
     ticket_type = st.selectbox(
         "券種",
-        options=["3連単", "2車単"],
-        index=0 if st.session_state.get("ticket_type", "3連単") == "3連単" else 1,
+        options=ticket_type_options,
+        index=ticket_type_options.index(ticket_type_default),
     )
+    previous_ticket_type = st.session_state.get("ticket_type", "3連単")
+    if ticket_type != previous_ticket_type:
+        st.session_state["odds_dict"] = {}
+        st.session_state["odds_debug_info"] = None
+        st.session_state["pred_df"] = None
     st.session_state["ticket_type"] = ticket_type
+    if num_riders != 9:
+        st.caption("※2枠単・2枠複は9車立てで選択できます。")
 
     race_type_options = ["通常", "ガールズ", "G3"]
     race_type_default = st.session_state.get("race_type", "通常")
@@ -4858,6 +4906,7 @@ with st.sidebar:
         "BOX保険を追加する",
         value=st.session_state.get("enable_box_ai", False),
         help="ONの時だけ、AIが選んだ3車BOXを保険として追加します。通常はOFF推奨です。",
+        disabled=ticket_type not in ["3連単", "2車単"],
     )
     st.session_state["enable_box_ai"] = enable_box_ai
 
@@ -4865,8 +4914,11 @@ with st.sidebar:
         "紐抜け対策AIを追加する",
         value=st.session_state.get("enable_himo_guard_ai", True),
         help="ONの時だけ、軸はそのままで2着3着候補を最大2〜4点だけ抑え追加します。",
+        disabled=ticket_type not in ["3連単", "2車単"],
     )
     st.session_state["enable_himo_guard_ai"] = enable_himo_guard_ai
+    if ticket_type not in ["3連単", "2車単"]:
+        st.caption(f"※{ticket_type}は専用の基本予測＋市場シンクロAIで生成します。")
 
     st.divider()
     st.subheader("📊 市場シンクロ買い目AI")
@@ -4876,24 +4928,32 @@ with st.sidebar:
         help="既存AIの候補を作り直さず、AI軸と市場軸の一致・希望オッズ帯で最終順位を補正します。",
     )
     st.session_state["enable_market_sync_ai"] = enable_market_sync_ai
+    market_defaults = {
+        "3連単": (8.0, 30.0), "3連複": (3.0, 15.0),
+        "2車単": (5.0, 20.0), "2車複": (2.0, 10.0),
+        "ワイド": (1.5, 6.0), "2枠単": (4.0, 20.0), "2枠複": (2.0, 10.0),
+    }
+    default_market_min, default_market_max = market_defaults.get(ticket_type, (8.0, 30.0))
     market_target_min = st.number_input(
         "狙い目オッズ下限",
         min_value=1.0,
         max_value=999.0,
-        value=float(st.session_state.get("market_target_min", 8.0)),
-        step=1.0,
+        value=float(st.session_state.get(f"market_target_min_{ticket_type}", default_market_min)),
+        step=0.5,
         disabled=not enable_market_sync_ai,
+        key=f"market_min_widget_{ticket_type}",
     )
     market_target_max = st.number_input(
         "狙い目オッズ上限",
         min_value=2.0,
         max_value=9999.0,
-        value=float(st.session_state.get("market_target_max", 30.0)),
-        step=1.0,
+        value=float(st.session_state.get(f"market_target_max_{ticket_type}", default_market_max)),
+        step=0.5,
         disabled=not enable_market_sync_ai,
+        key=f"market_max_widget_{ticket_type}",
     )
-    st.session_state["market_target_min"] = float(market_target_min)
-    st.session_state["market_target_max"] = float(market_target_max)
+    st.session_state[f"market_target_min_{ticket_type}"] = float(market_target_min)
+    st.session_state[f"market_target_max_{ticket_type}"] = float(market_target_max)
     if enable_market_sync_ai and market_target_max <= market_target_min:
         st.warning("狙い目オッズ上限は下限より大きくしてください。")
 
@@ -5302,16 +5362,20 @@ with p1:
                 selection_info["race_gate_blocked"] = False
             st.session_state["selection_info"] = selection_info
 
-            pred_df, break_single_info = add_single_and_break_pattern_tickets(
-                pred_df,
-                current_df,
-                ticket_type=ticket_type,
-                prediction_style=prediction_style,
-            )
+            advanced_addon_supported = ticket_type in ["3連単", "2車単"]
+            if advanced_addon_supported:
+                pred_df, break_single_info = add_single_and_break_pattern_tickets(
+                    pred_df,
+                    current_df,
+                    ticket_type=ticket_type,
+                    prediction_style=prediction_style,
+                )
+            else:
+                break_single_info = {"added": 0, "reasons": [f"{ticket_type}は基本予測で生成"]}
             selection_info["single_break_added"] = break_single_info.get("added", 0)
             selection_info["single_break_reasons"] = " / ".join(break_single_info.get("reasons", []))
 
-            if st.session_state.get("enable_line50_break50", True):
+            if st.session_state.get("enable_line50_break50", True) and advanced_addon_supported:
                 pred_df, line50_info = add_line50_break50_tickets(
                     pred_df,
                     current_df,
@@ -5327,7 +5391,7 @@ with p1:
                 selection_info["line50_cars"] = ""
                 selection_info["line50_reason"] = "ライン40/千切れ60補正OFF"
 
-            if st.session_state.get("enable_box_ai", False):
+            if st.session_state.get("enable_box_ai", False) and advanced_addon_supported:
                 pred_df, box_info = add_ai_box_tickets(
                     pred_df,
                     current_df,
@@ -5342,7 +5406,7 @@ with p1:
                 selection_info["box_cars"] = ""
                 selection_info["box_reason"] = "BOX保険OFF"
 
-            if st.session_state.get("enable_himo_guard_ai", True):
+            if st.session_state.get("enable_himo_guard_ai", True) and advanced_addon_supported:
                 pred_df, himo_info = add_himo_guard_tickets_optional(
                     pred_df,
                     current_df,
@@ -5361,6 +5425,7 @@ with p1:
             pred_df, market_sync_info = apply_market_sync_to_tickets(
                 pred_df,
                 odds_dict=st.session_state.get("odds_dict", {}),
+                ticket_type=ticket_type,
                 enabled=bool(enable_market_sync_ai),
                 target_min=float(market_target_min),
                 target_max=float(market_target_max),
@@ -5606,8 +5671,10 @@ else:
             result_3 = rr3.text_input("3着", value=str(default_result.get("3着", "")))
             submit_result = st.form_submit_button("この保存レースに結果を保存", use_container_width=True)
 
-        if selected_ticket_type == "2車単":
-            st.caption("2車単判定は 1着-2着 で行います。3着は保存だけされます。")
+        if selected_ticket_type in ["2車単", "2車複", "2枠単", "2枠複"]:
+            st.caption(f"{selected_ticket_type}判定は1着・2着で行います。")
+        elif selected_ticket_type == "ワイド":
+            st.caption("ワイドは1〜3着の3組を判定します。")
 
         if submit_result:
             try:
@@ -5666,8 +5733,10 @@ if pred_df is not None and isinstance(pred_df, pd.DataFrame) and not pred_df.emp
         result_3 = r3.text_input("3着", value="", key="result_3")
         save_now = st.form_submit_button("結果を保存", use_container_width=True)
 
-    if ticket_type == "2車単":
-        st.caption("2車単判定は 1着-2着 で行います。")
+    if ticket_type in ["2車単", "2車複", "2枠単", "2枠複"]:
+        st.caption(f"{ticket_type}判定は1着・2着で行います。")
+    elif ticket_type == "ワイド":
+        st.caption("ワイドは1〜3着の3組を判定します。")
 
     if save_now:
         try:
