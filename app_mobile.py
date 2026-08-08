@@ -29,7 +29,7 @@ st.set_page_config(
     layout="centered",
 )
 
-st.caption("✅ mobile 一本化版 v39.3（紐抜け特化・3連対率重視・番手超強化）")
+st.caption("✅ mobile 一本化版 v39.4（市場シンクロ買い目AI・点数厳守）")
 
 HEADERS = {
     "User-Agent": (
@@ -1125,6 +1125,159 @@ def normalize_ticket(ticket: str) -> str:
     s = s.replace(" ", "")
     s = re.sub(r"[^0-9\-]", "", s)
     return s
+
+
+def _ticket_head(ticket: str) -> int:
+    key = normalize_ticket(ticket)
+    m = re.match(r"([1-9])(?:-|$)", key)
+    return int(m.group(1)) if m else 0
+
+
+def apply_market_sync_to_tickets(
+    pred_df: pd.DataFrame,
+    odds_dict: dict,
+    enabled: bool = True,
+    target_min: float = 8.0,
+    target_max: float = 30.0,
+) -> Tuple[pd.DataFrame, dict]:
+    """
+    v39.4 市場シンクロ買い目AI。
+
+    既存AIが作った候補を作り直さず、現在オッズを使って優先順位だけ補正する。
+    AI候補で多い1着軸と、市場上位で多い1着軸が一致する買い目を優先し、
+    希望オッズ帯の買い目を点数内に残しやすくする。
+    """
+    info = {
+        "enabled": bool(enabled),
+        "status": "OFF" if not enabled else "オッズ未取得",
+        "ai_axis": 0,
+        "market_axis": 0,
+        "axis_match": False,
+        "target_count": 0,
+        "message": "市場シンクロ買い目AIはOFFです。" if not enabled else "オッズ未取得のため従来順位を使用",
+    }
+    if pred_df is None or pred_df.empty or not enabled:
+        return pred_df, info
+
+    out = pred_df.copy()
+    clean_odds = {}
+    for key, value in (odds_dict or {}).items():
+        ticket = normalize_ticket(key)
+        odd = safe_float(value, 0.0)
+        if ticket and odd > 0:
+            clean_odds[ticket] = odd
+
+    if len(clean_odds) < 3:
+        out["市場補正"] = 0
+        out["市場シンクロ理由"] = "オッズ不足のため補正なし"
+        return out, info
+
+    if "買い目" not in out.columns:
+        return out, info
+
+    if "AI評価" not in out.columns:
+        out["AI評価"] = 0.0
+    if "期待値" not in out.columns:
+        out["期待値"] = 0.0
+    if "オッズ" not in out.columns:
+        out["オッズ"] = 0.0
+
+    out["AI評価"] = pd.to_numeric(out["AI評価"], errors="coerce").fillna(0.0)
+    out["期待値"] = pd.to_numeric(out["期待値"], errors="coerce").fillna(0.0)
+
+    # 追加AIで作られた候補にも、取得済みオッズを確実に付ける。
+    for idx, row in out.iterrows():
+        key = normalize_ticket(row.get("買い目", ""))
+        fetched = safe_float(clean_odds.get(key, 0.0), 0.0)
+        current = safe_float(row.get("オッズ", 0.0), 0.0)
+        if fetched > 0 or current <= 0:
+            out.at[idx, "オッズ"] = fetched
+
+    # AI軸: 上位候補のAI評価を重みにして決定。
+    ai_head_scores = {}
+    ai_source = out.sort_values("AI評価", ascending=False).head(min(10, len(out)))
+    for pos, (_, row) in enumerate(ai_source.iterrows()):
+        head = _ticket_head(row.get("買い目", ""))
+        if head:
+            ai_head_scores[head] = ai_head_scores.get(head, 0.0) + max(1.0, safe_float(row.get("AI評価", 0), 0)) + (10 - pos)
+    ai_axis = max(ai_head_scores, key=ai_head_scores.get) if ai_head_scores else 0
+
+    # 市場軸: 低オッズ上位12通りの1着出現数を、人気順で重み付け。
+    market_top = sorted(clean_odds.items(), key=lambda x: x[1])[:12]
+    market_head_scores = {}
+    for pos, (ticket, _) in enumerate(market_top):
+        head = _ticket_head(ticket)
+        if head:
+            market_head_scores[head] = market_head_scores.get(head, 0.0) + max(1, 12 - pos)
+    market_axis = max(market_head_scores, key=market_head_scores.get) if market_head_scores else 0
+    axis_match = bool(ai_axis and market_axis and ai_axis == market_axis)
+
+    target_count = 0
+    market_rank = {ticket: pos + 1 for pos, (ticket, _) in enumerate(market_top)}
+    adjustments = []
+    reason_values = []
+
+    for idx, row in out.iterrows():
+        ticket = normalize_ticket(row.get("買い目", ""))
+        head = _ticket_head(ticket)
+        odds = safe_float(out.at[idx, "オッズ"], 0.0)
+        delta = 0.0
+        reasons = []
+
+        if ai_axis and head == ai_axis:
+            delta += 4.0
+            reasons.append("AI軸")
+        if market_axis and head == market_axis:
+            delta += 5.0
+            reasons.append("市場軸")
+        if axis_match and head == ai_axis:
+            delta += 5.0
+            reasons.append("軸一致")
+
+        if target_min <= odds <= target_max:
+            delta += 7.0
+            target_count += 1
+            reasons.append("希望オッズ帯")
+        elif 0 < odds < target_min:
+            delta -= 4.0
+            reasons.append("低配当")
+        elif odds > target_max:
+            delta -= 3.0
+            reasons.append("希望帯超過")
+            if odds >= max(60.0, target_max * 2.0):
+                delta -= 4.0
+                reasons.append("高オッズ警戒")
+        else:
+            reasons.append("オッズ未取得")
+
+        pop_rank = market_rank.get(ticket, 0)
+        if 1 <= pop_rank <= 5:
+            delta += 2.0
+            reasons.append(f"市場{pop_rank}位")
+
+        delta = round(max(-12.0, min(20.0, delta)), 1)
+        adjustments.append(delta)
+        reason_values.append(" / ".join(reasons[:5]))
+        out.at[idx, "AI評価"] = round(safe_float(out.at[idx, "AI評価"], 0) + delta, 1)
+        out.at[idx, "期待値"] = round(safe_float(out.at[idx, "期待値"], 0) + delta * 0.7, 1)
+
+    out["市場補正"] = adjustments
+    out["市場シンクロ理由"] = reason_values
+    out = out.sort_values(["市場補正", "AI評価", "期待値"], ascending=False).reset_index(drop=True)
+
+    status = "軸一致" if axis_match else "軸不一致"
+    info.update({
+        "status": status,
+        "ai_axis": int(ai_axis),
+        "market_axis": int(market_axis),
+        "axis_match": axis_match,
+        "target_count": int(target_count),
+        "message": (
+            f"市場シンクロAI: {status} / AI軸{ai_axis}番 / 市場軸{market_axis}番 / "
+            f"希望帯{target_count}点"
+        ),
+    })
+    return out, info
 
 
 def format_saved_result(item: dict) -> str:
@@ -4715,6 +4868,35 @@ with st.sidebar:
     )
     st.session_state["enable_himo_guard_ai"] = enable_himo_guard_ai
 
+    st.divider()
+    st.subheader("📊 市場シンクロ買い目AI")
+    enable_market_sync_ai = st.checkbox(
+        "現在オッズで買い目を再評価する",
+        value=st.session_state.get("enable_market_sync_ai", True),
+        help="既存AIの候補を作り直さず、AI軸と市場軸の一致・希望オッズ帯で最終順位を補正します。",
+    )
+    st.session_state["enable_market_sync_ai"] = enable_market_sync_ai
+    market_target_min = st.number_input(
+        "狙い目オッズ下限",
+        min_value=1.0,
+        max_value=999.0,
+        value=float(st.session_state.get("market_target_min", 8.0)),
+        step=1.0,
+        disabled=not enable_market_sync_ai,
+    )
+    market_target_max = st.number_input(
+        "狙い目オッズ上限",
+        min_value=2.0,
+        max_value=9999.0,
+        value=float(st.session_state.get("market_target_max", 30.0)),
+        step=1.0,
+        disabled=not enable_market_sync_ai,
+    )
+    st.session_state["market_target_min"] = float(market_target_min)
+    st.session_state["market_target_max"] = float(market_target_max)
+    if enable_market_sync_ai and market_target_max <= market_target_min:
+        st.warning("狙い目オッズ上限は下限より大きくしてください。")
+
     unit_bet = st.number_input("1点あたり金額", min_value=100, max_value=10000, step=100, value=100)
 
     st.caption("厚張り基準")
@@ -4998,6 +5180,8 @@ p1, p2 = st.columns([1, 1])
 with p1:
     if st.button("買い目を出す", type="primary", use_container_width=True):
         try:
+            if enable_market_sync_ai and market_target_max <= market_target_min:
+                raise ValueError("狙い目オッズ上限は下限より大きくしてください。")
             pred_df = generate_predictions_compat(
                 current_df=current_df,
                 detected_mode=detected_mode,
@@ -5174,6 +5358,15 @@ with p1:
                 selection_info["himo_guard_cars"] = ""
                 selection_info["himo_guard_reason"] = "紐抜け対策AI OFF"
 
+            pred_df, market_sync_info = apply_market_sync_to_tickets(
+                pred_df,
+                odds_dict=st.session_state.get("odds_dict", {}),
+                enabled=bool(enable_market_sync_ai),
+                target_min=float(market_target_min),
+                target_max=float(market_target_max),
+            )
+            selection_info["market_sync"] = market_sync_info
+
             st.session_state["selection_info"] = selection_info
 
             pred_df = apply_rank_based_amounts(pred_df, unit_bet)
@@ -5249,6 +5442,14 @@ if st.session_state.get("selection_info"):
             st.warning("レース選別AI: 見送り寄りです。ただし買い目は表示しています。")
             if si.get("gate_reason"):
                 st.caption(f"理由: {si.get('gate_reason')}")
+        market_si = si.get("market_sync") or {}
+        if market_si.get("enabled"):
+            if market_si.get("status") == "軸一致":
+                st.success(f"📊 {market_si.get('message', '')}")
+            elif market_si.get("status") == "軸不一致":
+                st.warning(f"📊 {market_si.get('message', '')}")
+            else:
+                st.info(f"📊 {market_si.get('message', '')}")
 
 if st.session_state.get("race_assessment"):
     ra = st.session_state.get("race_assessment")
@@ -5268,7 +5469,7 @@ if pred_df is not None and isinstance(pred_df, pd.DataFrame) and not pred_df.emp
         c for c in [
             "レース判定", "的中率評価", "レース評価点", "判定理由", "見送りAIコメント",
             "予想スタイル", "買い目ランク", "買い目", "AI評価", "期待値", "学習補正", "学習理由",
-            "オッズ", "厚張り指数", "賭け金AI係数", "賭け金AI理由", "購入金額", "期待回収額(目安)"
+            "オッズ", "市場補正", "市場シンクロ理由", "厚張り指数", "賭け金AI係数", "賭け金AI理由", "購入金額", "期待回収額(目安)"
         ]
         if c in show_df.columns
     ]
